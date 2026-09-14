@@ -26,6 +26,7 @@ A federated sequential recommendation system that combines a Transformer backbon
 - [Outputs & Deliverables](#outputs--deliverables)
 - [Reproducibility](#reproducibility)
 - [Hardware Requirements](#hardware-requirements)
+- [Build Order](#build-order)
 - [Specifications & Steering](#specifications--steering)
 - [Key Design Decisions](#key-design-decisions)
 - [Strict Rules](#strict-rules)
@@ -494,6 +495,22 @@ The complete resolved configuration (including any CLI overrides) is saved to `o
 **Dtype:** BF16 everywhere on both platforms. No FP16 autocast, no GradScaler.
 
 **Fail-fast policy:** The MPS smoke test fails immediately if FlexAttention cannot execute. The H100 final run fails immediately if FlashAttention-4 cannot initialize. Silent fallback to vanilla attention is forbidden.
+
+---
+
+## Build Order
+
+The full 22-phase implementation sequence with test gates is in [`specs/BUILD_ORDER.md`](specs/BUILD_ORDER.md). Each step maps to specific spec tasks. Key blocking gates:
+
+| Phase | Gate | Blocks |
+|---|---|---|
+| 0 | Environment validates | Everything |
+| 3 | Sequence/pool/candidate tests pass | All model training |
+| 5 | One-batch forward+backward smoke test | Multi-epoch training |
+| 11 | **One-batch + one-epoch T-Small smoke tests** | **Full MovieLens-20M training** |
+| 13 | H100 FlashAttention-4 self-test (if CUDA) | H100 training |
+
+**Dependency chain:** data-pipeline → transformer-backbone → moe-routing → loss-functions → training-pipeline → personalization-federated → evaluation-diagnostics → ablations-cli
 
 ---
 
