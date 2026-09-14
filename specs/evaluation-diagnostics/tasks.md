@@ -4,15 +4,15 @@ Ordered tasks. Depends on training-pipeline (for pretrained models and routing b
 
 ## Phase 1: Core Metrics
 
-- [ ] **T1.1: Implement metric functions in `evaluation/metrics.py`** — `compute_metrics(scores, target_idx, k=10)` returning dict with ndcg, mrr, recall, precision per the single-target formulas. `aggregate_metrics(per_example_metrics)` returning mean ± std. (FR-3, AC-02)
+- [x] **T1.1: Implement metric functions in `evaluation/metrics.py`** — `compute_metrics(scores, target_idx, k=10)` returning dict with ndcg, mrr, recall, precision per the single-target formulas. `aggregate_metrics(per_example_metrics)` returning mean ± std. (FR-3, AC-02)
 
-- [ ] **T1.2: Implement evaluation loop in `evaluation/metrics.py`** — `evaluate_model(model, dataset, candidate_sets, config)`: for each example, load pre-stored candidate set, score via full model serving path (including MoE routing with e_next when applicable), compute metrics, aggregate. Use `eval_user_history` for filtering. (FR-1)
+- [x] **T1.2: Implement evaluation loop in `evaluation/metrics.py`** — `evaluate_model(model, dataset, candidate_sets, config)`: for each example, load pre-stored candidate set, score via full model serving path (including MoE routing with e_next when applicable), compute metrics, aggregate. Use `eval_user_history` for filtering. (FR-1)
 
-- [ ] **T1.3: Implement ANN retrieval path** — When `use_ann=True`: retrieve `ann_candidates` items from `models/ann_retrieval.py`, filter invalid/seen, force-include target (replace lowest if needed), rerank with full model. Report force-inclusion fraction. (FR-2)
+- [x] **T1.3: Implement ANN retrieval path** — When `use_ann=True`: retrieve `ann_candidates` items from `models/ann_retrieval.py`, filter invalid/seen, force-include target (replace lowest if needed), rerank with full model. Report force-inclusion fraction. (FR-2)
 
-- [ ] **T1.4: Implement calibration support** — When `use_logit_calibration=True` and temperature != 1.0: divide logits by temperature before scoring. Temperature fit on validation only. Default: disabled. (FR-10)
+- [x] **T1.4: Implement calibration support** — When `use_logit_calibration=True` and temperature != 1.0: divide logits by temperature before scoring. Temperature fit on validation only. Default: disabled. (FR-10)
 
-- [ ] **T1.5: Test metrics** — Unit test: known ranking → verify exact NDCG/MRR/Recall/Precision values. Edge cases: target at rank 1, rank 10, rank 11 (miss). (AC-02)
+- [x] **T1.5: Test metrics** — Unit test: known ranking → verify exact NDCG/MRR/Recall/Precision values. Edge cases: target at rank 1, rank 10, rank 11 (miss). (AC-02)
 
 ## Phase 2: Cold-Start Evaluation
 
@@ -36,21 +36,21 @@ Ordered tasks. Depends on training-pipeline (for pretrained models and routing b
 
 ## Phase 5: Routing Diagnostics
 
-- [ ] **T5.1: Implement `routing_entropy` in `evaluation/routing_diagnostics.py`** — `-(r * log(r.clamp(1e-12))).sum(dim=-1)`. Report mean overall, per-objective, per-moe-variant. (FR-8)
+- [x] **T5.1: Implement `routing_entropy` in `evaluation/routing_diagnostics.py`** — `-(r * log(r.clamp(1e-12))).sum(dim=-1)`. Report mean overall, per-objective, per-moe-variant. (FR-8)
 
-- [ ] **T5.2: Implement `expert_utilization`** — `r.mean(dim=0)` → per-expert mass fraction. (FR-8)
+- [x] **T5.2: Implement `expert_utilization`** — `r.mean(dim=0)` → per-expert mass fraction. (FR-8)
 
-- [ ] **T5.3: Implement `objective_routing_diff`** — Pairwise cosine similarity and KL divergence on mean routing distributions per objective. (FR-8)
+- [x] **T5.3: Implement `objective_routing_diff`** — Pairwise cosine similarity and KL divergence on mean routing distributions per objective. (FR-8)
 
-- [ ] **T5.4: Implement collapse tests** — Fraction near-uniform (CV < threshold), fraction single-expert dominated (max > threshold). Per-objective utilization mean/std. (FR-8)
+- [x] **T5.4: Implement collapse tests** — Fraction near-uniform (CV < threshold), fraction single-expert dominated (max > threshold). Per-objective utilization mean/std. (FR-8)
 
 - [ ] **T5.5: Implement routing diagnostics report and plots** — Save `outputs/logs/routing_diagnostics_{model}.json`. Generate: routing_entropy bar chart, expert_utilization bar chart with 1/K line, objective_expert_heatmap (T × K matrix). (FR-8, AC-06)
 
 ## Phase 6: Gradient Diagnostics
 
-- [ ] **T6.1: Implement `gradient_cosine_similarity` in `evaluation/gradient_diagnostics.py`** — `(T, T)` matrix using `torch.autograd.grad` with `retain_graph=True, allow_unused=True`. Flatten per-objective gradients, compute pairwise cosine sim. (FR-9, AC-07)
+- [x] **T6.1: Implement `gradient_cosine_similarity` in `evaluation/gradient_diagnostics.py`** — `(T, T)` matrix using `torch.autograd.grad` with `retain_graph=True, allow_unused=True`. Flatten per-objective gradients, compute pairwise cosine sim. (FR-9, AC-07)
 
-- [ ] **T6.2: Implement `per_objective_grad_norms`** — Norm of flattened gradients per objective + coefficient of variation. (FR-9)
+- [x] **T6.2: Implement `per_objective_grad_norms`** — Norm of flattened gradients per objective + coefficient of variation. (FR-9)
 
 - [ ] **T6.3: Implement gradient diagnostics execution** — Run every `grad_diag_interval_steps` on `grad_diag_num_batches` freshly-drawn batches (not optimizer-step batches). For each moe_variant under comparison. (FR-9)
 
@@ -60,8 +60,8 @@ Ordered tasks. Depends on training-pipeline (for pretrained models and routing b
 
 - [ ] **T7.1: Test candidate set consistency** — Load candidate sets from two "different model" evaluation calls → verify sets are identical. (AC-01)
 
-- [ ] **T7.2: Test routing diagnostics correctness** — Uniform routing → max entropy. Delta routing → zero entropy. Verify heatmap shape `(T, K)`. (AC-06)
+- [x] **T7.2: Test routing diagnostics correctness** — Uniform routing → max entropy. Delta routing → zero entropy. Verify heatmap shape `(T, K)`. (AC-06)
 
-- [ ] **T7.3: Test gradient cosine symmetry** — Verify matrix is symmetric with 1s on diagonal. (AC-07)
+- [x] **T7.3: Test gradient cosine symmetry** — Verify matrix is symmetric with 1s on diagonal. (AC-07)
 
 - [ ] **T7.4: Test long-tail bucket partition** — Verify head ∪ mid ∪ tail = all_items, all disjoint, correct percentiles. (AC-04)

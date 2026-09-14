@@ -4,23 +4,23 @@ Ordered tasks. Depends on training-pipeline (pretrained checkpoints) and all mod
 
 ## Phase 1: LoRA Implementation
 
-- [ ] **T1.1: Implement `LoRALinear` in `models/lora.py`** — Wraps existing `nn.Linear`. Stores frozen `weight` and `bias` from original. Adds `A = nn.Parameter(randn(d_in, rank) * 0.02)`, `B = nn.Parameter(zeros(rank, d_out))`. Forward: `F.linear(x, weight, bias) + x @ A @ B`. (FR-1)
+- [x] **T1.1: Implement `LoRALinear` in `models/lora.py`** — Wraps existing `nn.Linear`. Stores frozen `weight` and `bias` from original. Adds `A = nn.Parameter(randn(d_in, rank) * 0.02)`, `B = nn.Parameter(zeros(rank, d_out))`. Forward: `F.linear(x, weight, bias) + x @ A @ B`. (FR-1)
 
-- [ ] **T1.2: Implement `inject_lora`** — Traverse model attention layers. Replace Q and V projections with `LoRALinear`. Freeze all params (`requires_grad=False`). Unfreeze LoRA A and B only (`requires_grad=True`). (FR-1)
+- [x] **T1.2: Implement `inject_lora`** — Traverse model attention layers. Replace Q and V projections with `LoRALinear`. Freeze all params (`requires_grad=False`). Unfreeze LoRA A and B only (`requires_grad=True`). (FR-1)
 
-- [ ] **T1.3: Implement `get_lora_state_dict`** — Filter model state dict by name patterns (`lora_`, `.A`, `.B`). Explicitly exclude keys starting with `moe.router`, `moe.experts`, `moe.objective_embeddings`, `moe.gates`. (FR-1, FR-2)
+- [x] **T1.3: Implement `get_lora_state_dict`** — Filter model state dict by name patterns (`lora_`, `.A`, `.B`). Explicitly exclude keys starting with `moe.router`, `moe.experts`, `moe.objective_embeddings`, `moe.gates`. (FR-1, FR-2)
 
-- [ ] **T1.4: Implement `load_lora_state_dict` and `count_lora_parameters`** — Load: restore LoRA params from dict. Count: sum of all LoRA parameter elements. (FR-1)
+- [x] **T1.4: Implement `load_lora_state_dict` and `count_lora_parameters`** — Load: restore LoRA params from dict. Count: sum of all LoRA parameter elements. (FR-1)
 
 ## Phase 2: LoRA Testing
 
-- [ ] **T2.1: Test LoRA injection** — Verify Q and V wrapped, other layers unchanged. Verify forward output changes after LoRA training step. (AC-01)
+- [x] **T2.1: Test LoRA injection** — Verify Q and V wrapped, other layers unchanged. Verify forward output changes after LoRA training step. (AC-01)
 
-- [ ] **T2.2: Test LoRA state dict filtering** — Verify no MoE/router/expert/embedding keys. Verify only LoRA-pattern keys present. (AC-02)
+- [x] **T2.2: Test LoRA state dict filtering** — Verify no MoE/router/expert/embedding keys. Verify only LoRA-pattern keys present. (AC-02)
 
-- [ ] **T2.3: Test parameter count** — Verify count matches expected: `2 * num_attention_layers * (d_in * rank + rank * d_out)`. (AC-03)
+- [x] **T2.3: Test parameter count** — Verify count matches expected: `2 * num_attention_layers * (d_in * rank + rank * d_out)`. (AC-03)
 
-- [ ] **T2.4: Test freeze enforcement** — After injection, assert zero trainable backbone parameters. Verify only LoRA params have `requires_grad=True`. (AC-04)
+- [x] **T2.4: Test freeze enforcement** — After injection, assert zero trainable backbone parameters. Verify only LoRA params have `requires_grad=True`. (AC-04)
 
 ## Phase 3: Local Personalization
 
