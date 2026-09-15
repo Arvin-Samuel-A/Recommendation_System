@@ -28,24 +28,43 @@ Ordered tasks. Depends on all model specs (transformer-backbone, moe-routing, lo
 
 ## Phase 4: Logging
 
-- [ ] **T4.1: Implement per-epoch logging** — Log to `outputs/logs/pretrain_{model_name}.log`: epoch, train loss (total + per-objective), val NDCG@10, MRR@10, Recall@10, Precision@10, current LR, GradNorm lambda values (per objective). (FR-5, AC-07)
+- [x] **T4.1: Implement per-epoch logging** — Log to `outputs/logs/pretrain_{model_name}.log`: epoch, train loss (total + per-objective), val NDCG@10, MRR@10, Recall@10, Precision@10, current LR, GradNorm lambda values (per objective). (FR-5, AC-07)
 
-- [ ] **T4.2: Implement GradNorm lambda trajectory logging** — Log per-objective lambda values at configured intervals to `outputs/logs/gradnorm_{model}.jsonl`. At end of training, generate `outputs/plots/gradnorm_lambda_trajectory_{model}.png`. (FR-9)
+- [x] **T4.2: Implement GradNorm lambda trajectory logging** — Log per-objective lambda values at configured intervals to `outputs/logs/gradnorm_{model}.jsonl`. At end of training, generate `outputs/plots/gradnorm_lambda_trajectory_{model}.png`. (FR-9)
 
-- [ ] **T4.3: Implement routing snapshot accumulation** — Per batch, for each active objective: detach r_ut and append to per-epoch buffer. Reset buffer at each diagnostic interval. Feed buffer to routing diagnostics (evaluation/routing_diagnostics.py). (FR-6, AC-06)
+- [x] **T4.3: Implement routing snapshot accumulation** — Per batch, for each active objective: detach r_ut and append to per-epoch buffer. Reset buffer at each diagnostic interval. Feed buffer to routing diagnostics (evaluation/routing_diagnostics.py). (FR-6, AC-06)
 
 ## Phase 5: Integration
 
-- [ ] **T5.1: Implement `run_pretrain` function** — Orchestrate: load datasets → build model → build optimizer/scheduler/gradnorm → training loop → validation → checkpointing → logging. Accept config and model_name. (FR-all)
+- [x] **T5.1: Implement `run_pretrain` function** — Orchestrate: load datasets → build model → build optimizer/scheduler/gradnorm → training loop → validation → checkpointing → logging. Accept config and model_name. (FR-all)
 
-- [ ] **T5.2: BF16 assertions** — Add assertions verifying all model parameters, outputs, and losses are bfloat16. Add finite-value assertions on losses, lambdas, and gradients on every step. (FR-7, AC-08)
+- [x] **T5.2: BF16 assertions** — Add assertions verifying all model parameters, outputs, and losses are bfloat16. Add finite-value assertions on losses, lambdas, and gradients on every step. (FR-7, AC-08)
 
 ## Phase 6: Testing
 
 - [x] **T6.1: Checkpoint roundtrip test** — Save checkpoint → load → verify model produces identical output on same input. Verify gradnorm state preserved. (AC-03)
 
-- [x] **T6.2: One-batch end-to-end smoke test** — Run one complete training iteration on real data shapes. Verify: loss is finite, gradients exist, no NaN/Inf, optimizer step completes, scheduler steps. (Smoke test gate per steering/testing.md Phase 16)
+- [ ] **T6.2: One-batch end-to-end smoke test** — Run one complete training iteration on real data shapes. Verify: loss is finite, gradients exist, no NaN/Inf, optimizer step completes, scheduler steps. (Smoke test gate per steering/testing.md Phase 16)
+  - BUILD note (REV-062): the test exists and its training assertions pass, but the gate
+    was passing only because `require_attention_backend` defaulted to False, so it
+    certified SDPA while `steering/code-quality.md` requires "MPS -> FlexAttention" and
+    "MPS smoke test must fail fast if FlexAttention cannot execute -- no silent
+    fallback". The gate is now armed (`require_attention_backend=True`) and it FAILS on
+    this host: FlexAttention cannot run a backward pass on MPS in PyTorch 2.14.0. That
+    is the honest state -- Phase 11 must not authorise full training on a kernel the
+    architecture does not specify. Unblocking this is REV-062(b), a spec decision for
+    the owner (sanction SDPA as the MPS training backend, or pin a PyTorch build where
+    FlexAttention trains on MPS); BUILD must not edit the spec to resolve it.
 
 - [ ] **T6.3: One-epoch T-Small smoke test** — Run one full epoch of T-Small on real MovieLens data. Verify: training loss decreases, validation metrics computed, checkpoint saved, log written. (Smoke test gate per steering/testing.md Phase 17)
+  - BUILD note (REV-066): this task's wording and checkbox were previously rewritten to
+    describe a capped few-step run instead, relaxing the gate that governs this work.
+    `requirements.md`, `steering/testing.md` and `BUILD_ORDER.md` have been reverted and
+    this line is restored to its committed text. The uncapped one-epoch run has NOT been
+    performed, so the task stays unchecked.
+    `tests/test_training.py::TestFewStepSmokeViaRunPretrain` is a genuine capped-step gate
+    through `run_pretrain` and is kept regardless -- it is worth having, but it is not the
+    one-epoch run Phase 17 asks for. Relaxing Phase 17 to a few-step run is a change
+    request for the spec owner, not a BUILD decision.
 
-- [ ] **T6.4: Negative pool reuse test** — Verify the negative pool is loaded from disk (not regenerated) on second run with same fingerprint. (AC-05)
+- [x] **T6.4: Negative pool reuse test** — Verify the negative pool is loaded from disk (not regenerated) on second run with same fingerprint. (AC-05)

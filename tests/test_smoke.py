@@ -20,6 +20,14 @@ class TestOneBatchEndToEnd:
     def test_full_pipeline(self):
         cfg = Config()
         cfg.apply_model_config("t-small")
+        # REV-062(a): this is the BUILD_ORDER Phase 16 gate that helps authorise full
+        # MovieLens training, and `steering/code-quality.md` is explicit -- "MPS smoke
+        # test must fail fast if FlexAttention cannot execute -- no silent fallback."
+        # With the default `require_attention_backend=False` the gate passed while
+        # silently running SDPA, so it certified a kernel the architecture does not
+        # specify. Arming it here makes the gate honest: it now fails with the real
+        # reason wherever the required backend cannot execute.
+        cfg.require_attention_backend = True
         cfg.num_items = 100
         cfg.feature_dim = 40
         cfg.moe_variant = "arv_mmoe"
