@@ -101,8 +101,66 @@ def save_routing_diagnostics(
 
     log_dir = config.log_dir
     os.makedirs(log_dir, exist_ok=True)
-    path = os.path.join(log_dir, f"routing_diagnostics_{model_name}.json")
+    # conventions.md: CLI model names are "t-small", file names are "t_small".
+    # The plots already normalized; the JSON report did not, so the two halves of
+    # the same report landed under different spellings.
+    mn = model_name.replace("-", "_")
+    path = os.path.join(log_dir, f"routing_diagnostics_{mn}.json")
     with open(path, "w") as f:
         json.dump(report, f, indent=2)
 
+    plot_routing_diagnostics(report, config, model_name)
     return report
+
+
+def plot_routing_diagnostics(report: dict, config, model_name: str) -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    os.makedirs(config.plot_dir, exist_ok=True)
+    mn = model_name.replace("-", "_")
+
+    per_obj = report.get("per_objective", {})
+    if per_obj:
+        names = list(per_obj.keys())
+        entropies = [per_obj[n]["entropy_mean"] for n in names]
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.bar(names, entropies)
+        ax.set_ylabel("Mean Entropy")
+        ax.set_title("Routing Entropy by Objective")
+        fig.tight_layout()
+        fig.savefig(os.path.join(config.plot_dir, f"routing_entropy_{mn}.png"), dpi=config.plot_dpi)
+        plt.close(fig)
+
+    utilization = report.get("overall_utilization", [])
+    if utilization:
+        K = len(utilization)
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.bar(range(K), utilization)
+        ax.axhline(y=1.0 / K, color="red", linestyle="--", label=f"1/K = {1.0/K:.3f}")
+        ax.set_xlabel("Expert")
+        ax.set_ylabel("Utilization")
+        ax.set_title("Expert Utilization")
+        ax.legend()
+        fig.tight_layout()
+        fig.savefig(os.path.join(config.plot_dir, f"expert_utilization_{mn}.png"), dpi=config.plot_dpi)
+        plt.close(fig)
+
+    heatmap = report.get("heatmap")
+    if heatmap:
+        hm = np.array(heatmap)
+        fig, ax = plt.subplots(figsize=(8, 5))
+        im = ax.imshow(hm, aspect="auto", cmap="YlOrRd")
+        ax.set_xlabel("Expert")
+        ax.set_ylabel("Objective")
+        obj_names = [n for n in OBJECTIVE_ORDER if n in per_obj]
+        ax.set_yticks(range(len(obj_names)))
+        ax.set_yticklabels(obj_names)
+        ax.set_xticks(range(hm.shape[1]))
+        ax.set_title("Objective-Expert Heatmap")
+        fig.colorbar(im)
+        fig.tight_layout()
+        fig.savefig(os.path.join(config.plot_dir, f"objective_expert_heatmap_{mn}.png"), dpi=config.plot_dpi)
+        plt.close(fig)
