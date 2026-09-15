@@ -64,4 +64,4 @@ Ordered implementation tasks. Each task traces back to requirements/design. Task
 
 ## Phase 9: Integration
 
-- [ ] **T9.1: End-to-end preprocessing integration test** — Run full pipeline on MovieLens-20M (or a sampled subset for CI). Verify all output files in `data/processed/` are present and valid: `user_sequences.pkl`, `item_mapping.pkl`, `user_mapping.pkl`, `item_metadata.npy`, `cold_items.pkl`, `warm_items.pkl`, `dataset_stats.json`, tensorised datasets, negative pool, candidate sets. (AC-01 through AC-10)
+- [x] **T9.1: End-to-end preprocessing integration test** — Run full pipeline on MovieLens-20M (or a sampled subset for CI). Verify all output files in `data/processed/` are present and valid: `user_sequences.pkl`, `item_mapping.pkl`, `user_mapping.pkl`, `item_metadata.npy`, `cold_items.pkl`, `warm_items.pkl`, `dataset_stats.json`, tensorised datasets, negative pool, candidate sets. (AC-01 through AC-10)
