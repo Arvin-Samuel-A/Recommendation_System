@@ -18,6 +18,7 @@ def base_config():
     cfg = Config()
     cfg.apply_model_config("t-small")
     cfg.num_items = 50
+    cfg.use_metadata = False
     cfg.dropout = 0.0
     return cfg
 

@@ -4,7 +4,15 @@ Ordered tasks. Depends on data-pipeline T1.1 (Config) and T1.2 (utils.py).
 
 ## Phase 1: Attention Backend
 
-- [x] **T1.1: Implement attention backend wrapper in `models/transformer.py`** — Create `AttentionBackend` class that resolves backend from config/device: FlexAttention for MPS, FlashAttention-4 for CUDA, with `auto` resolution. Implement `self_test()` method that runs a small forward pass and verifies output. Implement `forward(q, k, v, causal_mask, padding_mask)` that delegates to the selected backend with its expected argument format. Fail fast (raise, do not fallback) if selected backend cannot initialize. Record resolved backend in returned metadata. (FR-4, AC-02, AC-03)
+- [ ] **T1.1: Implement attention backend wrapper in `models/transformer.py`** — Create `AttentionBackend` class that resolves backend from config/device: FlexAttention for MPS, FlashAttention-4 for CUDA, with `auto` resolution. Implement `self_test()` method that runs a small forward pass and verifies output. Implement `forward(q, k, v, causal_mask, padding_mask)` that delegates to the selected backend with its expected argument format. Fail fast (raise, do not fallback) if selected backend cannot initialize. Record resolved backend in returned metadata. (FR-4, AC-02, AC-03)
+  - BUILD note (REV-081): the MPS/FlexAttention and SDPA halves are implemented and
+    tested. The CUDA half now routes padded batches through
+    `flash_attn_varlen_func` instead of raising on every left-padded batch, and the
+    unpad / cumulative-seqlen / repad plumbing is tested against dense causal
+    attention with the kernel stubbed (`tests/test_transformer.py::
+    TestFlashAttentionVarlen`). The real FlashAttention kernel has NOT been run --
+    this host has no CUDA device and no flash-attn build -- so AC-03 cannot be signed
+    off here. Left unchecked until it is verified on the H100.
 
 - [x] **T1.2: Test attention backends** — Unit test: self-test passes on available hardware. Test: causal mask prevents future attention (inject signal at future position, verify it doesn't appear in output). Test: padding mask zeros out padded key contributions. (AC-02, AC-03, AC-04)
 
