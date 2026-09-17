@@ -112,7 +112,12 @@ class TestAttentionBackend:
 class TestAttentionBackendGate:
     """REV-062: `require_attention_backend=True` must turn an unavailable preferred
     backend into a hard failure, as `steering/code-quality.md` requires ("no silent
-    fallback"). The gate exists and works; nothing covered it."""
+    fallback"). The gate exists and works; nothing covered it.
+
+    The sanctioned preferred kernel is now SDPA on MPS/CPU and FlashAttention-4 on CUDA
+    (FR-4, design D2b). These tests force `_probe` to fail rather than naming a kernel,
+    so they exercise the gate itself and are unaffected by which backend is preferred.
+    """
 
     def test_require_backend_raises_when_preferred_is_unavailable(self, base_config, monkeypatch):
         from models.transformer import AttentionBackendError
@@ -129,18 +134,23 @@ class TestAttentionBackendGate:
 
     def test_fallback_is_recorded_when_not_required(self, base_config, monkeypatch):
         """Without the flag the fallback is permitted -- but never silent: the resolved
-        backend and the reason must both be reportable into the run manifest."""
-        preferred_calls = {"n": 0}
+        backend and the reason must both be reportable into the run manifest.
+
+        T1.3: the preferred kernel is pinned to FA4 here rather than left to the host.
+        MPS and CPU now both PREFER sdpa, so relying on the host's preference would make
+        the fallback path unreachable and the test vacuous -- it would assert that no
+        fallback happened while claiming to test that one was recorded.
+        """
         real_probe = AttentionBackend._probe
 
         def fail_preferred(self, backend):
             if backend != "sdpa":
-                preferred_calls["n"] += 1
                 return False, "probe forced to fail for this test"
             return real_probe(self, backend)
 
         base_config.attention_backend = "auto"
         base_config.require_attention_backend = False
+        monkeypatch.setattr(AttentionBackend, "_preferred_backend", lambda self: "flash_attention_4")
         monkeypatch.setattr(AttentionBackend, "_probe", fail_preferred)
 
         backend = AttentionBackend(base_config)
@@ -148,6 +158,9 @@ class TestAttentionBackendGate:
         assert result["backend"] == "sdpa"
         assert result["requested_backend"] == "auto"
         assert result["fallback_reason"], "the fallback reason must be recorded"
+        assert "flash_attention_4" in result["fallback_reason"], (
+            "the reason must name the kernel that was substituted for"
+        )
 
     def test_explicit_unavailable_backend_raises(self, base_config, monkeypatch):
         from models.transformer import AttentionBackendError
@@ -161,6 +174,76 @@ class TestAttentionBackendGate:
         monkeypatch.setattr(AttentionBackend, "_probe", always_fails)
         with pytest.raises(AttentionBackendError, match="Refusing to fall back"):
             AttentionBackend(base_config)
+
+
+class TestNarrowedBackendSurface:
+    """T1.4 / AC-09 / AC-02: FlexAttention is gone from the backend surface.
+
+    It has no backward pass on MPS in the pinned PyTorch build, so with the MPS gate
+    armed it could never satisfy the training gates on the declared dev host. Rather than
+    keep a selectable backend that provably cannot train, `flex_attention` is rejected by
+    config validation and no code path remains (FR-4 rationale, design D2b).
+    """
+
+    def test_flex_attention_is_rejected_by_config_validation(self):
+        """AC-09: rejected, with a message naming ONLY the supported choices."""
+        cfg = Config()
+        cfg.attention_backend = "flex_attention"
+        with pytest.raises(ValueError) as exc:
+            cfg.validate()
+
+        message = str(exc.value)
+        assert "flex" not in message.split("'flex_attention'")[-1], (
+            "the error message still offers flex_attention as a choice"
+        )
+        for choice in ("auto", "flash_attention_4", "sdpa"):
+            assert choice in message, f"the message does not name '{choice}'"
+
+    def test_flex_attention_is_not_a_resolvable_backend(self, base_config):
+        """AC-09: not in the enum, and not reachable through the dispatcher."""
+        from models.transformer import VALID_BACKENDS
+
+        assert "flex_attention" not in VALID_BACKENDS
+        assert not hasattr(AttentionBackend, "_flex_attention"), (
+            "the FlexAttention kernel is still present on the class"
+        )
+
+        base_config.attention_backend = "flex_attention"
+        with pytest.raises(ValueError, match="Unknown attention_backend"):
+            AttentionBackend(base_config)
+
+    def test_cpu_prefers_sdpa(self, base_config):
+        base_config.device = "cpu"
+        backend = AttentionBackend(base_config)
+        assert backend.backend_name == "sdpa"
+        assert backend.fallback_reason is None
+
+    @pytest.mark.skipif(
+        not torch.backends.mps.is_available(), reason="requires an MPS device"
+    )
+    def test_mps_auto_resolves_to_sdpa_with_the_gate_armed(self, base_config):
+        """AC-02: the armed gate passes on MPS, and nothing was substituted.
+
+        This is the gate that used to fail: `auto` preferred FlexAttention, whose probe
+        raised `NotImplementedError: FlexAttention does not support backward on MPS`, and
+        `require_attention_backend=True` correctly refused to fall back.
+        """
+        base_config.device = "mps"
+        base_config.attention_backend = "auto"
+        base_config.require_attention_backend = True
+
+        backend = AttentionBackend(base_config)
+        assert backend.backend_name == "sdpa"
+        assert backend.fallback_reason is None, (
+            "a fallback reason was recorded, so SDPA was reached by substitution rather "
+            "than by being the preferred kernel"
+        )
+
+        result = backend.self_test()
+        assert result["status"] == "passed"
+        assert result["backend"] == "sdpa"
+        assert result["fallback_reason"] is None
+        assert result["device"].startswith("mps")
 
 
 class TestModelShapes:

@@ -115,6 +115,21 @@ def _build_federated_fixture(dest, n_users=6, n_val=32):
     with open(os.path.join(processed, "test_examples.pkl"), "wb") as f:
         pickle.dump(subset, f)
 
+    # REV-111: this rewrites `test_examples.pkl` with a SCATTERED set of original rows,
+    # while `_build_subset_processed_dir` wrote `test_candidates.npy` as the first
+    # n_test rows -- so example i and candidate row i no longer described the same
+    # example. Nothing cross-checked them while personalization built its own
+    # candidates; now that it scores the stored rows by index, the fixture has to be
+    # self-consistent the way a real `data/processed` is. Take the SAME rows from the
+    # source matrix and re-fingerprint.
+    from data.sequence_generator import save_eval_candidates
+
+    src_cand = np.load(os.path.join("data", "processed", "test_candidates.npy"), mmap_mode="r")
+    save_eval_candidates(
+        [np.asarray(src_cand[i]) for i in idx],
+        os.path.join(processed, "test_candidates.npy"),
+    )
+
     cfg = Config()
     cfg.apply_model_config("t-small")
     cfg.pretrain_epochs = 1
@@ -255,6 +270,142 @@ class TestFederatedConvergence:
         assert result["round_logs"]
 
 
+class TestFederatedValidationProtocol:
+    """REV-112: the federated validation pass must reuse the STORED candidate sets and
+    must not score the whole validation split on every round.
+
+    (a) `run_federated` rebuilt the entire validation candidate matrix on each call via
+        `generate_eval_candidates` with no `seed=`, so it silently used that function's
+        default of 42 -- a `--seed 123` run evaluated against seed-42 candidates while
+        every other stage used 123 -- and did ~1M sequential `filter_negatives` calls to
+        reproduce a matrix `val_candidates.npy` already holds, fingerprinted.
+    (b) `evaluate_model` was called on the full split inside the round loop, i.e. once
+        per `federated_rounds`, which dominated the stage's cost.
+    """
+
+    @staticmethod
+    def _spy_evaluate(monkeypatch):
+        """Record the sequences/candidates handed to each per-round evaluation."""
+        import training.federated as fed_mod
+
+        seen = []
+        real = fed_mod.evaluate_model
+
+        def spy(model, sequences, candidates, config, **kwargs):
+            seen.append((sequences.detach().cpu().clone(), candidates.detach().cpu().clone()))
+            return real(model, sequences, candidates, config, **kwargs)
+
+        monkeypatch.setattr(fed_mod, "evaluate_model", spy)
+        return seen
+
+    @pytest.mark.slow
+    def test_scores_stored_candidates_and_bounds_each_round(self, tmp_path, monkeypatch):
+        import numpy as np
+
+        from data.sequence_generator import load_eval_candidates
+        from training.federated import run_federated
+
+        cfg, _ = _build_federated_fixture(str(tmp_path), n_val=32)
+        cfg.federated_rounds = 2
+        cfg.clients_per_round = 2
+        cfg.local_epochs = 1
+        cfg.federated_eval_examples = 8
+
+        stored = load_eval_candidates(
+            os.path.join(cfg.processed_data_dir, "val_candidates.npy")
+        )
+        assert cfg.federated_eval_examples < stored.shape[0], (
+            "fixture must have more validation examples than the per-round bound, "
+            "or the bounding half of this test proves nothing"
+        )
+
+        seen = self._spy_evaluate(monkeypatch)
+        result = run_federated(cfg, "t-small")
+        logs = result["round_logs"]
+
+        # REV-117: two bounded per-round passes, plus ONE extra full-split pass on the
+        # final round for the headline number.
+        assert len(seen) == 3, (
+            f"expected one bounded evaluation per round plus one final full-split pass, "
+            f"got {len(seen)}"
+        )
+
+        # (b) EVERY round -- the last one included -- scores exactly the bounded prefix.
+        # REV-117: the final round used to be exempted, so rounds 0..N-2 and round N-1
+        # were computed over different user populations and plotted as one series.
+        per_round = seen[:-1]
+        for round_idx, (_, cands) in enumerate(per_round):
+            assert len(cands) == cfg.federated_eval_examples, (
+                f"round {round_idx} scored {len(cands)} examples, expected the bounded "
+                f"{cfg.federated_eval_examples}"
+            )
+            assert np.array_equal(
+                cands.numpy(), stored[: cfg.federated_eval_examples]
+            ), (
+                f"round {round_idx} must score a PREFIX of the stored rows, so the "
+                f"round-over-round curve stays comparable"
+            )
+
+        # ... and the final round additionally scores the full split, once.
+        full_seqs, full_cands = seen[-1]
+        assert len(full_cands) == stored.shape[0], (
+            f"the final full-split pass scored {len(full_cands)} examples, expected the "
+            f"full {stored.shape[0]}-example split"
+        )
+
+        # (a) the rows scored are the STORED rows, not a regenerated matrix.
+        assert np.array_equal(full_cands.numpy(), stored), (
+            "run_federated scored candidates that are not the stored val_candidates.npy "
+            "rows -- federated NDCG is on a different candidate protocol from every "
+            "other stage"
+        )
+
+        # REV-117: every point the convergence figure plots comes from the same number of
+        # examples. This is the assertion that makes the curve readable.
+        scored = {log["val_examples_scored"] for log in logs}
+        assert scored == {cfg.federated_eval_examples}, (
+            f"the plotted series mixes evaluation populations: {scored}"
+        )
+        assert all(log["is_final_round"] is False for log in logs[:-1])
+        assert logs[-1]["is_final_round"] is True
+
+        # The headline number is the final round's full-split score, reported separately.
+        assert logs[-1]["val_examples_scored_full"] == stored.shape[0]
+        assert "val_ndcg_full" in logs[-1]
+        assert "val_ndcg_full" not in logs[0], (
+            "only the final round runs the full split"
+        )
+        assert result["final_val_ndcg"] == logs[-1]["val_ndcg_full"], (
+            "the headline federated NDCG must be the full-split score, not the "
+            "0.5%-user prefix the curve plots"
+        )
+
+    @pytest.mark.slow
+    def test_zero_means_full_split_every_round(self, tmp_path, monkeypatch):
+        from training.federated import run_federated
+
+        cfg, _ = _build_federated_fixture(str(tmp_path), n_val=32)
+        cfg.federated_rounds = 2
+        cfg.clients_per_round = 2
+        cfg.local_epochs = 1
+        cfg.federated_eval_examples = 0
+
+        seen = self._spy_evaluate(monkeypatch)
+        run_federated(cfg, "t-small")
+
+        sizes = {len(c) for _, c in seen}
+        assert len(sizes) == 1, (
+            f"federated_eval_examples=0 must score the same full split every round, "
+            f"got sizes {sizes}"
+        )
+        # REV-117: when the prefix already IS the full split there is nothing extra to
+        # run, so the final round must not pay for a second identical pass.
+        assert len(seen) == 2, (
+            f"federated_eval_examples=0 must not add a redundant final-round pass; "
+            f"got {len(seen)} evaluations for 2 rounds"
+        )
+
+
 class TestPersonalizationEntryPoint:
     """T5.2 / REV-026a: call `run_local_personalization` rather than performing one
     manual Adam step on a `.sum()` loss."""
@@ -274,6 +425,90 @@ class TestPersonalizationEntryPoint:
         for key in ("with_lora", "without_lora", "gain"):
             assert key in report, f"report missing '{key}'"
             assert np.isfinite(report[key]["mean"]), f"{key} mean is not finite"
+
+
+class TestPersonalizationNegativeSampling:
+    """REV-111: negatives must come from a run-scoped RNG, and the per-user evaluation
+    must score the stored candidate rows.
+
+    Both `filter_negatives` call sites in `local_train.py` omitted `rng=`, so the
+    function fell back to a RandomState seeded from the TARGET ITEM. In `train_user_lora`
+    that made the adapter see the identical negatives for a given target on every one of
+    `local_epochs` passes -- the contrastive signal on passes 2 and 3 duplicated pass 1 --
+    and in the candidate loop it put personalization NDCG on a different candidate
+    protocol from `test_metrics_{model}.json`.
+    """
+
+    @pytest.mark.slow
+    def test_training_negatives_are_run_scoped_and_evaluation_uses_stored_rows(
+        self, tmp_path, monkeypatch
+    ):
+        import numpy as np
+
+        import training.local_train as lt
+        from data.sequence_generator import load_eval_candidates
+
+        cfg, _ = _build_federated_fixture(str(tmp_path))
+        cfg.personalization_eval_users = 3
+        cfg.local_epochs = 3
+
+        stored = load_eval_candidates(
+            os.path.join(cfg.processed_data_dir, "test_candidates.npy")
+        )
+
+        # --- record every training negative draw ---
+        real_filter = lt.filter_negatives
+        draws = []
+
+        def filter_spy(pool, target, history_set, num_negatives, *args, **kwargs):
+            out = real_filter(pool, target, history_set, num_negatives, *args, **kwargs)
+            draws.append((int(target), kwargs.get("rng"), tuple(int(x) for x in out)))
+            return out
+
+        monkeypatch.setattr(lt, "filter_negatives", filter_spy)
+
+        # --- record the candidate sets each user is actually scored against ---
+        real_eval_user = lt.evaluate_user
+        scored = []
+
+        def eval_spy(model, moe, seqs, targets, candidate_sets, config, **kwargs):
+            scored.append([c.detach().cpu().numpy().copy() for c in candidate_sets])
+            return real_eval_user(model, moe, seqs, targets, candidate_sets, config, **kwargs)
+
+        monkeypatch.setattr(lt, "evaluate_user", eval_spy)
+
+        lt.run_local_personalization(cfg, "t-small")
+
+        assert draws, "no negatives were drawn -- the fixture trained no user"
+        assert all(rng is not None for _, rng, _ in draws), (
+            "a filter_negatives call site still omits rng=, so its draw is seeded from "
+            "the target item rather than the run seed"
+        )
+
+        # A target seen on several passes must not receive byte-identical negatives.
+        by_target = {}
+        for target, _, negs in draws:
+            by_target.setdefault(target, []).append(negs)
+        repeated = {t: v for t, v in by_target.items() if len(v) > 1}
+        assert repeated, (
+            "fixture drew every target once; raise local_epochs so the repeat-draw "
+            "property is actually exercised"
+        )
+        assert any(len(set(v)) > 1 for v in repeated.values()), (
+            "every repeated target received the identical negative set -- the draw is "
+            "still a function of the target, not of the run RNG"
+        )
+
+        # Every scored candidate row is one of the stored rows.
+        assert scored, "no user was evaluated"
+        stored_rows = {tuple(int(x) for x in row) for row in stored}
+        for user_sets in scored:
+            for row in user_sets:
+                assert tuple(int(x) for x in row) in stored_rows, (
+                    "personalization scored a candidate row that is not in the stored "
+                    "test_candidates.npy -- its NDCG is on a different protocol from "
+                    "the headline test metrics"
+                )
 
 
 class TestLocalTrainingSourceIsNotTheEvaluationSplit:

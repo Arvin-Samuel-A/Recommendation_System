@@ -123,6 +123,14 @@ class Config:
     personalization_eval_users: int = 1000
     use_weighted_fedavg: bool = True
 
+    # REV-112(b): examples scored in the per-round validation pass. The validation split
+    # is ~993k examples and the round loop runs `federated_rounds` times, so a full-split
+    # pass per round dominated the stage and made `--stage federated` intractable. Every
+    # round scores the SAME prefix, so the round-over-round convergence curve stays
+    # comparable; the final round additionally runs the full split, which is the number
+    # AC-06 is judged on. Set to 0 to score the full split every round.
+    federated_eval_examples: int = 5000
+
     # --- Negative Sampling ---
     num_sampled_negatives: int = 100
     # REV-025: `pool_size` is the configured value; `resolve_pool_size()` applies the
@@ -144,11 +152,13 @@ class Config:
     warmup_runs: int = 20
     timed_runs: int = 100
 
-    # Cap on optimizer steps per epoch. 0 = uncapped (the production setting). The
-    # few-step dev-host smoke gate (training-pipeline T6.3) sets this so `run_pretrain`
-    # itself is exercised end-to-end -- scheduler, validation, checkpointing, logging --
-    # without a full pass over MovieLens-20M. The one-epoch gate runs uncapped on the
-    # training host (BUILD_ORDER Phase 18).
+    # Cap on optimizer steps per epoch. 0 = uncapped (the production setting, used by
+    # full training in BUILD_ORDER Phase 14). The few-step smoke gate
+    # (training-pipeline T6.3, settable from the CLI as `--max_steps`) sets this so
+    # `run_pretrain` itself is exercised end-to-end -- scheduler, validation,
+    # checkpointing, logging -- without a full pass over MovieLens-20M. Owner decision
+    # (2026-09-17): a capped run on real data IS the Phase 11/17 gate; the uncapped full
+    # epoch is no longer required to authorise training.
     max_steps_per_epoch: int = 0
 
     # Ablation H (FR-13) selects a system-level evaluation per arm. H3-H6 previously
@@ -284,10 +294,14 @@ class Config:
                 f"Unknown local_train_source '{self.local_train_source}'. "
                 "Choose from 'train', 'val'. The test split is never a training source."
             )
-        if self.attention_backend not in ("auto", "flex_attention", "flash_attention_4", "sdpa"):
+        # T1.3 / AC-09: `flex_attention` is NOT a sanctioned value. It has no backward
+        # pass on MPS in the pinned PyTorch build, so it can never satisfy the training
+        # gates on the dev host; a selectable backend that provably cannot train is a
+        # trap (FR-4 rationale, design D2b). The message names only supported choices.
+        if self.attention_backend not in ("auto", "flash_attention_4", "sdpa"):
             raise ValueError(
                 f"Unknown attention_backend '{self.attention_backend}'. "
-                "Choose from 'auto', 'flex_attention', 'flash_attention_4', 'sdpa'"
+                "Choose from 'auto', 'flash_attention_4', 'sdpa'"
             )
         if not 0.0 < self.cold_start_ratio < 1.0:
             raise ValueError(

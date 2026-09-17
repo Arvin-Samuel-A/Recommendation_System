@@ -27,7 +27,7 @@ from training.losses import (
     normalize_item_table,
 )
 from training.gradnorm import (
-    GradNormController, get_anchor_layer_params, probe_double_backward,
+    GradNormController, get_anchor_layer_params,
 )
 from data.augmentation import augment_sequence
 from data.sequence_generator import (
@@ -303,7 +303,7 @@ def train_one_step(
 
     if gradnorm is not None:
         anchor_params = get_anchor_layer_params(model, config)
-        gradnorm.update(active_losses, anchor_params, model=model)
+        gradnorm.update(active_losses, anchor_params)
 
     trainable = list(model.parameters()) + list(moe.parameters())
     for fn in loss_fns.values():
@@ -709,11 +709,6 @@ def run_pretrain(config: Config, model_name: str) -> Dict[str, float]:
         gradnorm = GradNormController(config.gradnorm_alpha, config.gradnorm_lr)
         gradnorm.log_lambdas = torch.nn.Parameter(gradnorm.log_lambdas.data.to(device=device))
         gradnorm.optimizer = torch.optim.Adam([gradnorm.log_lambdas], lr=config.gradnorm_lr)
-        # REV-092: GradNorm needs a double-backward through the anchor block's attention
-        # kernel, which not every backend implements (SDPA on CPU does not). Probe it
-        # here -- before the dataset load -- so an unsupported combination fails at
-        # second zero with a legible message instead of on the first optimizer step.
-        probe_double_backward(model, config)
 
     # AC-05: loaded once, outside the epoch loop, never regenerated per epoch.
     neg_pool_path = os.path.join(processed, "global_negative_pool.npy")
@@ -836,8 +831,10 @@ def run_pretrain(config: Config, model_name: str) -> Dict[str, float]:
         avg_losses = {name: sum(vals) / len(vals) for name, vals in epoch_losses.items()}
 
         # AC-04 / REV-005: record the first- and last-window means of the per-batch total
-        # loss so a one-epoch run can be checked for an actual decrease. Without this the
-        # only observable was the whole-epoch mean, which cannot show a trend.
+        # loss so a run can be checked for an actual decrease. Without this the only
+        # observable was the whole-epoch mean, which cannot show a trend. Note that over
+        # a few-step gate run this window is dominated by LR warmup and is NOT evidence
+        # for or against AC-04 -- that criterion needs real multi-epoch training.
         totals = epoch_losses.get("total", [])
         if totals:
             window = max(1, len(totals) // 5)

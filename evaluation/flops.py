@@ -9,6 +9,7 @@ import torch
 
 from configs.config import Config
 from models.lora import count_lora_parameters
+from data.sequence_generator import load_metadata_matrix
 from models.moe import MoELayer
 from utils import get_device
 
@@ -26,6 +27,7 @@ def benchmark_latency(
     model: torch.nn.Module,
     moe_layer: Optional[MoELayer],
     config: Config,
+    metadata_matrix: Optional[torch.Tensor] = None,
 ) -> Dict[str, float]:
     device = get_device(config)
     model.eval()
@@ -49,12 +51,29 @@ def benchmark_latency(
         # No vocabulary resolved yet. Item ID 1 is still a valid, non-padding token, so
         # the timed path stays the serving path.
         dummy_seq = torch.ones(1, config.max_seq_length, dtype=torch.long, device=device)
+    # REV-110: this was `torch.zeros(...)`. A real request gathers `metadata_matrix[seq]`,
+    # whose rows are dense genome-relevance floats; an all-zero block is exactly what a
+    # metadata-FREE model produces, which left the timed input ambiguous between the two
+    # configurations on a path FR-6 calls the "full serving path". Gather from the real
+    # matrix when one is available and fall back to noise otherwise -- never zeros. The
+    # matmul shape is unchanged either way, so `mean_ms` is not materially affected; the
+    # point is that the timed input is the serving input.
     dummy_meta = None
+    metadata_source = None
     if config.use_metadata and config.feature_dim > 0:
-        dummy_meta = torch.zeros(
-            1, config.max_seq_length, config.feature_dim,
-            dtype=torch.bfloat16, device=device,
-        )
+        if metadata_matrix is None:
+            metadata_matrix = load_metadata_matrix(config.processed_data_dir, config)
+        if metadata_matrix is not None:
+            gathered = metadata_matrix[dummy_seq.to(metadata_matrix.device)]
+            dummy_meta = gathered.to(device=device, dtype=torch.bfloat16)
+            metadata_source = "item_metadata"
+        else:
+            generator = torch.Generator().manual_seed(config.seed)
+            dummy_meta = torch.randn(
+                1, config.max_seq_length, config.feature_dim,
+                generator=generator, dtype=torch.float32,
+            ).to(device=device, dtype=torch.bfloat16)
+            metadata_source = "randn"
 
     for _ in range(config.warmup_runs):
         with torch.no_grad():
@@ -97,6 +116,9 @@ def benchmark_latency(
         "timed_sequence_length": int(dummy_seq.shape[1]),
         "timed_padding_positions": int((dummy_seq == 0).sum().item()),
         "timed_with_metadata": dummy_meta is not None,
+        # REV-110: which metadata the numbers describe -- real gathered rows or the
+        # noise fallback when `item_metadata.npy` is not on disk.
+        "timed_metadata_source": metadata_source,
     }
 
 

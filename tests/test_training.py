@@ -191,9 +191,12 @@ class TestFewStepSmokeViaRunPretrain:
     never ran validation, never wrote a log and never checked that the loss decreases.
     All four of T6.3's verifications are made here, through the real orchestrator.
 
-    The step budget is capped via `config.max_steps_per_epoch` so this runs on the dev
-    host; the UNCAPPED one-epoch run is the training-host gate (BUILD_ORDER Phase 18) and
-    is deliberately not attempted here.
+    The step budget is capped via `config.max_steps_per_epoch` and the dataset is a
+    subset of the real `data/processed`, so this runs inside the suite. Owner decision
+    (2026-09-17): a few hundred steps is what Phase 17 gates on, so the CLI form of this
+    same check (`--stage pretrain --model t-small --epochs 1 --max_steps N` against the
+    FULL processed dataset) is the gate BUILD runs by hand; the uncapped full epoch is no
+    longer required by BUILD_ORDER Phase 11.
     """
 
     @pytest.mark.slow
@@ -209,10 +212,12 @@ class TestFewStepSmokeViaRunPretrain:
 
         cfg = Config()
         cfg.apply_model_config("t-small")
-        # REV-062(a): the smoke gate that authorises full training must not certify a
-        # kernel the architecture does not specify. `steering/code-quality.md`: "MPS
-        # smoke test must fail fast if FlexAttention cannot execute -- no silent
-        # fallback." With the default this gate passed while running SDPA.
+        # REV-062 (resolved, T5.2): the smoke gate that authorises full training must not
+        # certify a kernel other than the one the manifest records.
+        # `steering/code-quality.md`: "MPS smoke test must fail fast if SDPA cannot
+        # execute -- no silent fallback." SDPA is now the sanctioned MPS/CPU kernel
+        # (FR-4, design D2b); the arming is unchanged and the gate passes because the
+        # preferred backend genuinely executes.
         cfg.require_attention_backend = True
         cfg.pretrain_epochs = 1
         cfg.batch_size = 64
@@ -281,9 +286,10 @@ class TestFewStepSmokeViaRunPretrain:
 class TestFewStepsSmoke:
     """T6.2: one-batch / few-step T-Small gate on real MovieLens data.
 
-    REV-005: this test was previously mislabelled as the T6.3 one-epoch gate. It runs 4
-    optimizer steps over a 256-example subset with a flat LR -- a legitimate one-batch
-    smoke test, and nothing more. The real one-epoch gate is `TestOneEpochSmoke`.
+    REV-005: this test was previously mislabelled as the T6.3 gate. It runs 4 optimizer
+    steps over a 256-example subset with a flat LR -- a legitimate one-batch smoke test,
+    and nothing more. The T6.3 gate is `TestFewStepSmokeViaRunPretrain`, which goes
+    through `run_pretrain` itself.
     """
 
     @pytest.mark.slow

@@ -1,9 +1,12 @@
+import json
+import os
 import pytest
 from unittest.mock import patch, MagicMock
 
 from configs.config import Config
 from main import parse_args, apply_cli_overrides, STAGE_MAP, run_all_pipeline
 from training.ablation_runner import resolve_study_configs, STUDY_CONFIGS
+from models.transformer import TransformerModel
 
 
 class TestCLIParsing:
@@ -26,6 +29,26 @@ class TestCLIParsing:
         apply_cli_overrides(config, args)
         assert config.pretrain_epochs == 5
         assert config.batch_size == 32
+
+    def test_max_steps_override(self):
+        """The Phase 17 few-step gate must be runnable without editing source.
+
+        Owner decision (2026-09-17): the smoke gate is a capped run of `run_pretrain` on
+        real data, so `max_steps_per_epoch` needs a CLI surface -- `conventions.md`
+        ("Config-Driven Design") forbids requiring a source edit to run an experiment.
+        """
+        config = Config()
+        apply_cli_overrides(config, parse_args(["--stage", "pretrain"]))
+        assert config.max_steps_per_epoch == 0, "uncapped must stay the default"
+
+        args = parse_args(
+            ["--stage", "pretrain", "--model", "t-small", "--epochs", "1",
+             "--max_steps", "200"]
+        )
+        config = Config()
+        apply_cli_overrides(config, args)
+        assert config.max_steps_per_epoch == 200
+        assert config.pretrain_epochs == 1
 
     def test_gradnorm_override(self):
         args = parse_args(["--stage", "pretrain", "--no_gradnorm"])
@@ -113,6 +136,169 @@ class TestAblationConfigResolution:
         assert configs[0].use_masked_lm is False
         assert configs[3].moe_variant == "arv_mmoe"
         assert configs[4].use_gradnorm is True
+
+    def test_study_A_final_arm_is_federated(self):
+        """REV-100: FR-6 ends A's progression at "+federated"; T2.2 names arm 6
+        "federated ARV-MMoE+GradNorm+LoRA".
+
+        The arm was `personalization_mode="lora"` with no `system_eval`, so nothing in
+        study A ever reached `run_federated` -- the progression's final point was
+        labelled as the federated system while measuring single-machine LoRA
+        personalization. Those are different experiments: federated adds FedAvg across
+        `clients_per_round` clients and the communication cost RQ4 is about.
+        """
+        arm = resolve_study_configs("A", Config())[5]
+        assert arm.system_eval == "communication", (
+            "study A's final arm must route into run_federated"
+        )
+        assert arm.personalization_mode == "lora", "T2.2 names LoRA as well"
+        assert arm.moe_variant == "arv_mmoe"
+        assert arm.use_gradnorm is True
+
+    def test_federated_arm_reuses_the_gradnorm_arm_backbone(self):
+        """`system_eval` is post-training-only, so REV-100's fix must not add a
+        28th-plus training run to `--study all`."""
+        from training.ablation_runner import _training_fingerprint
+
+        arms = resolve_study_configs("A", Config())
+        assert _training_fingerprint(arms[4]) == _training_fingerprint(arms[5]), (
+            "arms 5 and 6 differ only in post-training fields, so they must share "
+            "one trained backbone"
+        )
+
+
+class TestCoreTradeoffPlotAxes:
+    """REV-101: two of FR-14's four figures plotted a different quantity from the one
+    the requirement names.
+
+    (a) FR-14: "`accuracy_vs_model_size.png`: Size MB vs NDCG@10" -- the code plotted
+        `total_parameters` under an axis labelled "Total Parameters".
+    (b) FR-14: "`accuracy_vs_communication.png`: Comm cost/round vs NDCG@10" -- the code
+        plotted the CUMULATIVE cost summed over every round, so the ratio between two
+        models changed with how many rounds each happened to run.
+    These are paper figures: a reader taking the x-axis at face value against the
+    requirement's wording would read a per-round cost off a cumulative axis.
+    """
+
+    @staticmethod
+    def _write_inputs(log_dir, per_round_kb=64.0, n_rounds=4):
+        os.makedirs(log_dir, exist_ok=True)
+        with open(os.path.join(log_dir, "test_metrics_t_small.json"), "w") as f:
+            json.dump({"ndcg": {"mean": 0.21}}, f)
+        with open(os.path.join(log_dir, "efficiency_t_small.json"), "w") as f:
+            json.dump({
+                "total_parameters": 12_000_000,
+                "model_size_bf16_mb": 22.5,
+                "model_size_fp32_mb": 45.0,
+                "flops_per_inference": 1.5e9,
+            }, f)
+        rounds = [
+            {"round": i, "val_ndcg": 0.10 + 0.01 * i, "val_examples_scored": 5000,
+             "total_round_kb": per_round_kb, "upload_kb": per_round_kb / 8}
+            for i in range(n_rounds)
+        ]
+        rounds[-1]["val_ndcg_full"] = 0.17
+        rounds[-1]["val_examples_scored_full"] = 993_372
+        with open(os.path.join(log_dir, "federated_rounds_t_small.json"), "w") as f:
+            json.dump(rounds, f)
+
+    def _run(self, tmp_path):
+        from main import run_plots_stage
+
+        config = Config()
+        config.log_dir = str(tmp_path / "logs")
+        config.plot_dir = str(tmp_path / "plots")
+        self._write_inputs(config.log_dir)
+        run_plots_stage(config, MagicMock(model="t-small"))
+        return config
+
+    def test_model_size_axis_is_megabytes(self, tmp_path):
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        captured = []
+        real_subplots = plt.subplots
+
+        def spy(*args, **kwargs):
+            fig, ax = real_subplots(*args, **kwargs)
+            captured.append(fig)
+            return fig, ax
+
+        plt.subplots = spy
+        try:
+            self._run(tmp_path)
+        finally:
+            plt.subplots = real_subplots
+
+        size_ax = captured[0].axes[0]
+        assert "MB" in size_ax.get_xlabel(), (
+            f"FR-14 specifies size in MB; axis reads {size_ax.get_xlabel()!r}"
+        )
+        xs = size_ax.collections[0].get_offsets()[:, 0].tolist()
+        assert xs == [22.5], f"expected model_size_bf16_mb on the x axis, got {xs}"
+
+    def test_communication_axis_is_per_round(self, tmp_path):
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        captured = []
+        real_subplots = plt.subplots
+
+        def spy(*args, **kwargs):
+            fig, ax = real_subplots(*args, **kwargs)
+            captured.append(fig)
+            return fig, ax
+
+        plt.subplots = spy
+        try:
+            self._run(tmp_path)
+        finally:
+            plt.subplots = real_subplots
+
+        comm_ax = captured[1].axes[0]
+        label = comm_ax.get_xlabel().lower()
+        assert "round" in label and "cumulative" not in label, (
+            f"FR-14 specifies comm cost PER ROUND; axis reads {comm_ax.get_xlabel()!r}"
+        )
+        offsets = comm_ax.collections[0].get_offsets()
+        xs = offsets[:, 0].tolist()
+        assert xs == [64.0], (
+            f"expected the per-round cost (64.0 KB), got {xs} -- 256.0 would be the "
+            f"cumulative sum across 4 rounds"
+        )
+        # REV-117: the headline y value is the final round's FULL-SPLIT score, not the
+        # bounded prefix the convergence curve plots.
+        ys = offsets[:, 1].tolist()
+        assert ys == [0.17], f"expected val_ndcg_full on the y axis, got {ys}"
+
+
+class TestAblationNoTrainFlag:
+    """REV-115: `run_ablation(train=...)` had no CLI surface.
+
+    `conventions.md` ("Config-Driven Design") requires that no ablation need source
+    edits, and `train=False` -- which records `status: "skipped_no_checkpoint"` for arms
+    with no checkpoint and evaluates the rest -- was reachable only by editing
+    `run_ablation_stage`.
+    """
+
+    def test_defaults_to_training(self):
+        args = parse_args(["--stage", "ablation", "--study", "A"])
+        assert args.no_train is False
+
+    def test_flag_is_plumbed_through_to_run_ablation(self):
+        from main import run_ablation_stage
+
+        config = Config()
+        for flag, expected_train in ((["--no_train"], False), ([], True)):
+            args = parse_args(["--stage", "ablation", "--study", "C"] + flag)
+            with patch("training.ablation_runner.run_ablation") as fake:
+                run_ablation_stage(config, args)
+            assert fake.call_args.kwargs["train"] is expected_train, (
+                f"--no_train={bool(flag)} must reach run_ablation as "
+                f"train={expected_train}"
+            )
 
 
 class TestMissingCheckpoint:
@@ -242,6 +428,27 @@ class TestNamedAblationFigures:
             for i, m in enumerate(["ndcg", "mrr", "recall", "precision"])
         }
 
+    @staticmethod
+    def _real_parameters(moe_variant):
+        """A real `count_parameters` dict, exactly as `_run_single_config` stores it.
+
+        REV-099: this fixture used to hand-feed `{"total": ...}`, a key
+        `evaluation/flops.py::count_parameters` has never returned. The plotting code
+        read that invented key, so it silently plotted zeros on a green suite. Driving
+        the fixture from the production function is what makes a future rename fail here.
+        """
+        from evaluation.flops import count_parameters
+        from models.moe import MoELayer
+
+        cfg = Config()
+        cfg.apply_model_config("t-small")
+        cfg.use_metadata = False
+        cfg.num_items = 50
+        cfg.moe_variant = moe_variant
+        model = TransformerModel(cfg)
+        moe = MoELayer(cfg) if moe_variant != "none" else None
+        return {k: float(v) for k, v in count_parameters(model, moe).items()}
+
     def test_G_gathers_latency_for_the_twin_axis_chart(self):
         from training.ablation_runner import STUDY_EXTRAS
 
@@ -269,7 +476,7 @@ class TestNamedAblationFigures:
                 {
                     "label": label,
                     "metrics": self._metrics(0.12 + 0.01 * i),
-                    "parameters": {"total": 4.2e6 + i * 1e6},
+                    "parameters": self._real_parameters(label),
                     "latency": {"mean_ms": 11.0 + i * 2},
                 }
                 for i, label in enumerate(["mmoe", "arv_mmoe"])
@@ -360,6 +567,69 @@ class TestNamedAblationFigures:
         xdata = list(left.lines[0].get_xdata())
         assert xdata == sorted(xdata), f"arms not ordered by K: {xdata}"
 
+    def test_mmoe_comparison_plots_real_parameter_values(self, tmp_path):
+        """REV-099: FR-8's cost panel must plot the parameter counts that exist.
+
+        The panel read `parameters["total"]`, which `count_parameters` never returns, so
+        `.get("total", 0.0)` made BOTH arms' bars zero-height -- in the figure whose job
+        is to substantiate moe-routing FR-6's parameter-matched claim ("Never claim
+        'parameter-matched' without the report backing it"). FR-8 names three parameter
+        quantities; all three are asserted here against the real dict.
+        """
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from training.ablation_runner import _plot_mmoe_comparison
+
+        config = Config()
+        config.plot_dir = str(tmp_path)
+        results = [
+            {
+                "label": label,
+                "metrics": self._metrics(0.12 + 0.01 * i),
+                "parameters": self._real_parameters(label),
+                "latency": {"mean_ms": 11.0 + i * 2},
+            }
+            for i, label in enumerate(["mmoe", "arv_mmoe"])
+        ]
+        for r in results:
+            for key in ("total_parameters", "expert_parameters", "router_parameters"):
+                assert r["parameters"].get(key, 0.0) > 0, (
+                    f"fixture precondition: {key} must be non-zero for {r['label']}, "
+                    f"or this test cannot detect a zeroed bar"
+                )
+
+        captured = {}
+        real_subplots = plt.subplots
+
+        def spy(*args, **kwargs):
+            fig, axes = real_subplots(*args, **kwargs)
+            captured["fig"] = fig
+            return fig, axes
+
+        plt.subplots = spy
+        try:
+            _plot_mmoe_comparison(config, "t-base", results)
+        finally:
+            plt.subplots = real_subplots
+
+        cost_ax = captured["fig"].axes[1]
+        heights = [patch.get_height() for patch in cost_ax.patches]
+        assert heights, "the cost panel drew no bars at all"
+        assert all(h > 0 for h in heights), (
+            f"the cost panel plotted a zero-height parameter bar: {heights}"
+        )
+
+        # Each of FR-8's three parameter quantities is plotted, in millions, for
+        # every arm -- so a key rename cannot silently zero one series.
+        for r in results:
+            for key in ("total_parameters", "expert_parameters", "router_parameters"):
+                expected = r["parameters"][key] / 1e6
+                assert any(abs(h - expected) < 1e-9 for h in heights), (
+                    f"{key} for {r['label']} ({expected:.6f}M) is not among the "
+                    f"plotted bar heights {heights}"
+                )
+
     def test_named_figures_are_empty_safe(self, tmp_path):
         """A study with no usable arms must warn and skip, never abort the run."""
         from training.ablation_runner import _STUDY_PLOTS
@@ -380,7 +650,7 @@ class TestNamedAblationFigures:
             {"user_id": 2, "ndcg_with_lora": 0.3, "ndcg_without_lora": 0.25,
              "gain": 0.05, "is_cold": True},
         ]
-        report = _build_report(results, num_skipped=0)
+        report = _build_report(results, num_users_skipped=0)
 
         assert "per_user_gains" in report, "the spec-mandated array must be kept"
         scores = report["per_user_scores"]

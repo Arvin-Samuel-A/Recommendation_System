@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import torch
 import pytest
 
@@ -11,6 +13,7 @@ from training.losses import (
     apply_masking,
     static_weighted_sum,
 )
+import training.gradnorm
 from training.gradnorm import GradNormController, get_anchor_layer_params
 from models.transformer import TransformerModel
 from utils import get_device, resolve_dtype
@@ -514,14 +517,14 @@ class TestFiniteAssertionsActuallyFire:
             )
 
 
-class TestDoubleBackwardDiagnostic:
-    """REV-092: an attention kernel without double-backward must fail legibly.
+class TestFirstOrderGradNorm:
+    """AC-10: the GradNorm path performs no second-order differentiation.
 
-    `config.device` defaults to "auto" (CUDA > MPS > CPU), so any CPU-only host -- a CI
-    runner, a container without an accelerator -- hits this on the first optimizer step
-    of the default `use_gradnorm=True` configuration. The raw error names an ATen symbol
-    (`aten::_scaled_dot_product_flash_attention_for_cpu_backward`) rather than the
-    actual problem.
+    REV-120 / design D7: `G_t` is built as `lambda_t * ||grad_W L_t||` with the norm
+    detached, so the lambda gradient is first-order. The CPU case is the reference: SDPA
+    on CPU implements only a first-order backward
+    (`aten::_scaled_dot_product_flash_attention_for_cpu_backward` has no derivative), so
+    a full `update()` there is the regression guard that keeps this fixed.
     """
 
     @staticmethod
@@ -534,44 +537,124 @@ class TestDoubleBackwardDiagnostic:
         cfg.device = "cpu"
         return TransformerModel(cfg), cfg
 
-    def test_probe_reports_the_backend_and_a_remedy(self):
-        from training.gradnorm import DoubleBackwardUnsupportedError, probe_double_backward
+    def test_create_graph_true_absent_from_the_controller(self):
+        source = Path(training.gradnorm.__file__).read_text()
+        assert "create_graph=True" not in source, (
+            "AC-10 forbids second-order differentiation in the GradNorm path"
+        )
 
-        model, cfg = self._cpu_model()
-        with pytest.raises(DoubleBackwardUnsupportedError) as exc:
-            probe_double_backward(model, cfg)
-        message = str(exc.value)
-        assert "cpu" in message
-        assert "use_gradnorm=False" in message, "the error must name a remedy"
-        assert "sdpa" in message, "the error must name the attention backend that failed"
-
-    def test_update_raises_the_same_diagnostic(self):
-        from training.gradnorm import DoubleBackwardUnsupportedError
-
+    def test_full_update_runs_on_cpu(self):
         model, cfg = self._cpu_model()
         model.train()
         B, S = 2, cfg.max_seq_length
         seq = torch.randint(1, 30, (B, S))
         pooled = model(seq, return_all_hidden=True)[:, -1, :]
         logits = pooled @ model.item_emb_weight.T
-        loss = torch.nn.functional.cross_entropy(
-            logits.float(), torch.randint(1, 50, (B,))
-        )
+        losses = {}
+        for name in ["next_item", "masked_item"]:
+            losses[name] = torch.nn.functional.cross_entropy(
+                logits.float(), torch.randint(1, 50, (B,))
+            )
 
         gn = GradNormController(alpha=1.5, lr=1e-2)
-        with pytest.raises(DoubleBackwardUnsupportedError):
-            gn.update({"next_item": loss}, get_anchor_layer_params(model), model=model)
+        gn.weighted_sum(losses).backward(retain_graph=True)
+        gradnorm_loss = gn.update(losses, get_anchor_layer_params(model))
 
-    def test_probe_passes_on_a_backend_that_supports_it(self):
-        """Non-vacuity: the probe must not reject a working configuration."""
-        from training.gradnorm import probe_double_backward
+        assert gradnorm_loss is not None
+        assert torch.isfinite(gradnorm_loss).all()
+        assert next(model.parameters()).device.type == "cpu"
 
+
+class TestLambdaGradientEquivalence:
+    """AC-11: the shipped lambda gradient equals the closed form, and carries no graph.
+
+    The closed form `d(L_grad)/d(log lambda_t) = sign(G_t - G*_t) * G_t` is computed here
+    independently of the controller, so this is a real cross-check of the shipped
+    `torch.autograd.grad` path rather than a restatement of it.
+    """
+
+    @staticmethod
+    def _model_and_losses(num_active):
         cfg = Config()
         cfg.apply_model_config("t-small")
         cfg.use_metadata = False
         cfg.num_items = 50
-        cfg.feature_dim = 0
-        model = TransformerModel(cfg)  # device="auto" -> MPS/CUDA here
-        if next(model.parameters()).device.type == "cpu":
-            pytest.skip("no accelerator on this host; the CPU path is covered above")
-        probe_double_backward(model, cfg)
+        cfg.dropout = 0.0
+        device = get_device(cfg)
+        model = TransformerModel(cfg)
+        model.train()
+
+        B, S = 4, cfg.max_seq_length
+        seq = torch.randint(1, 30, (B, S), device=device)
+        pooled = model(seq, return_all_hidden=True)[:, -1, :]
+
+        losses = {}
+        for i, name in enumerate(OBJECTIVE_ORDER[:num_active]):
+            logits = (pooled @ model.item_emb_weight.T) * (1.0 + 0.5 * i)
+            targets = torch.randint(1, 50, (B,), device=device)
+            losses[name] = torch.nn.functional.cross_entropy(logits.float(), targets)
+        return model, losses, get_anchor_layer_params(model)
+
+    @staticmethod
+    def _closed_form(gn, losses, anchor_params):
+        """sign(G_t - G*_t) * G_t, recomputed from scratch at the pre-update lambdas."""
+        names = list(losses.keys())
+        lambdas = gn.lambdas.detach()
+        G_t = []
+        for name in names:
+            grads = torch.autograd.grad(
+                losses[name].float(), anchor_params,
+                retain_graph=True, create_graph=False,
+            )
+            norm = torch.cat([g.flatten() for g in grads]).norm(p=2).detach()
+            G_t.append(lambdas[OBJECTIVE_ORDER.index(name)] * norm)
+        G_t = torch.stack(G_t)
+
+        # First call to update(): L0 == L, so Lhat == 1 and r_t == 1.
+        Lhat = torch.ones(len(names), device=G_t.device)
+        r_t = Lhat / (Lhat.mean() + 1e-12)
+        G_star = G_t.mean() * (r_t ** gn.alpha)
+        return torch.sign(G_t - G_star) * G_t
+
+    @pytest.mark.parametrize("num_active", [4, 2, 1])
+    def test_matches_closed_form(self, num_active):
+        """num_active=1 is the `G_t == G*_t` subgradient boundary: expect exactly zero."""
+        model, losses, anchor_params = self._model_and_losses(num_active)
+        gn = GradNormController(alpha=1.5, lr=1e-2)
+
+        expected = self._closed_form(gn, losses, anchor_params)
+
+        gn.weighted_sum(losses).backward(retain_graph=True)
+        gn.update(losses, anchor_params)
+
+        indices = [OBJECTIVE_ORDER.index(n) for n in losses]
+        shipped = gn.log_lambdas.grad[indices]
+        # The controller holds `log_lambdas` on CPU until `run_pretrain` moves it; the
+        # anchor gradients are on the accelerator. Compare on one device.
+        expected = expected.to(shipped.device)
+        assert torch.allclose(shipped, expected, atol=1e-5, rtol=1e-4), (
+            f"shipped {shipped.tolist()} != closed form {expected.tolist()}"
+        )
+
+        inactive = [i for i in range(len(OBJECTIVE_ORDER)) if i not in indices]
+        if inactive:
+            assert torch.all(gn.log_lambdas.grad[inactive] == 0.0), (
+                "inactive objectives must receive no lambda gradient"
+            )
+        if num_active == 1:
+            assert torch.all(shipped == 0.0), (
+                "with one active objective G_t == G*_t, so the subgradient is zero"
+            )
+
+    def test_grad_carries_no_autograd_graph(self):
+        model, losses, anchor_params = self._model_and_losses(3)
+        gn = GradNormController(alpha=1.5, lr=1e-2)
+        gn.weighted_sum(losses).backward(retain_graph=True)
+        gn.update(losses, anchor_params)
+
+        assert gn.log_lambdas.grad is not None
+        assert gn.log_lambdas.grad.requires_grad is False, (
+            "assigning a graph-carrying tensor to .grad is silently accepted by PyTorch "
+            "and pins that graph alive across steps (design D7)"
+        )
+        assert gn.log_lambdas.grad.grad_fn is None

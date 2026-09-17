@@ -10,7 +10,10 @@ from utils import get_device, resolve_dtype
 
 logger = logging.getLogger(__name__)
 
-VALID_BACKENDS = ("auto", "flex_attention", "flash_attention_4", "sdpa")
+# T1.3 / AC-09: exactly two sanctioned kernels plus "auto". `flex_attention` is
+# deliberately absent -- it has no backward pass on MPS in the pinned PyTorch build, so
+# it cannot train on the declared dev host (FR-4 rationale, design D2b).
+VALID_BACKENDS = ("auto", "flash_attention_4", "sdpa")
 
 
 class AttentionBackendError(RuntimeError):
@@ -26,10 +29,14 @@ class AttentionBackend:
     """Dispatches attention to a real kernel and reports the kernel that actually ran.
 
     REV-043: the previous implementation resolved a backend *name* but always executed
-    `F.scaled_dot_product_attention`, so run manifests recorded FlexAttention/FA4 while
-    SDPA ran. Every backend below is now genuinely invoked, `self_test` exercises the
-    selected implementation (forward *and* backward, since training needs both), and an
-    explicitly requested backend that cannot execute raises instead of falling back.
+    `F.scaled_dot_product_attention`, so run manifests recorded a kernel that never ran.
+    Every backend below is now genuinely invoked, `self_test` exercises the selected
+    implementation (forward *and* backward, since training needs both), and an explicitly
+    requested backend that cannot execute raises instead of falling back.
+
+    REV-062 / T1.3: the resolvable backends are `sdpa` (MPS/CPU) and `flash_attention_4`
+    (CUDA). SDPA is the sanctioned local/dev training kernel, not a degraded fallback.
+    FlexAttention is not resolvable and not selectable -- see `VALID_BACKENDS`.
     """
 
     def __init__(self, config: Config):
@@ -51,8 +58,8 @@ class AttentionBackend:
     def _preferred_backend(self) -> str:
         if self.device.type == "cuda":
             return "flash_attention_4"
-        if self.device.type == "mps":
-            return "flex_attention"
+        # T1.3: MPS and CPU both resolve to SDPA. MPS used to prefer FlexAttention, which
+        # could not run a backward pass here, so the armed gate failed on the dev host.
         return "sdpa"
 
     def _resolve_backend(self, backend: str) -> str:
@@ -134,8 +141,6 @@ class AttentionBackend:
         padding_mask: Optional[torch.Tensor],
         is_causal: bool,
     ) -> torch.Tensor:
-        if backend == "flex_attention":
-            return self._flex_attention(q, k, v, padding_mask, is_causal)
         if backend == "flash_attention_4":
             return self._flash_attention_4(q, k, v, padding_mask, is_causal)
         if backend == "sdpa":
@@ -143,38 +148,6 @@ class AttentionBackend:
                 return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=False)
             return F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
         raise ValueError(f"Unknown attention backend '{backend}'")
-
-    @staticmethod
-    def _flex_attention(
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        padding_mask: Optional[torch.Tensor],
-        is_causal: bool,
-    ) -> torch.Tensor:
-        from torch.nn.attention.flex_attention import create_block_mask, flex_attention
-
-        B, H, S, _ = q.shape
-
-        if padding_mask is None:
-            def mask_mod(b, h, q_idx, kv_idx):
-                return q_idx >= kv_idx if is_causal else q_idx == q_idx
-            block_mask = create_block_mask(
-                mask_mod, B=None, H=None, Q_LEN=S, KV_LEN=S, device=q.device,
-            )
-        else:
-            pad = padding_mask
-
-            def mask_mod(b, h, q_idx, kv_idx):  # noqa: F811
-                allowed = pad[b, kv_idx]
-                if is_causal:
-                    allowed = allowed & (q_idx >= kv_idx)
-                return allowed
-
-            block_mask = create_block_mask(
-                mask_mod, B=B, H=None, Q_LEN=S, KV_LEN=S, device=q.device,
-            )
-        return flex_attention(q, k, v, block_mask=block_mask)
 
     @staticmethod
     def _flash_attention_4(

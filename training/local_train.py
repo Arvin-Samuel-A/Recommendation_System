@@ -24,6 +24,7 @@ from training.pretrain import build_model, load_checkpoint
 from evaluation.metrics import evaluate_model, score_candidates, compute_metrics
 from data.sequence_generator import (
     filter_negatives, generate_sliding_window_examples, load_metadata_matrix,
+    load_or_build_eval_candidates,
 )
 from utils import get_device, resolve_dtype
 
@@ -104,6 +105,7 @@ def train_user_lora(
     config: Config,
     device: torch.device,
     metadata_matrix: Optional[torch.Tensor] = None,
+    rng: Optional[np.random.RandomState] = None,
 ) -> None:
     assert _get_trainable_backbone_count(model) == 0, "Backbone params must not be trainable"
 
@@ -120,9 +122,17 @@ def train_user_lora(
     for epoch in range(config.local_epochs):
         model.train()
         for seq, target in zip(user_sequences, user_targets):
+            # REV-111: without an explicit `rng`, `filter_negatives` falls back to a
+            # RandomState seeded from the TARGET ITEM, so the adapter met the identical
+            # 100 negatives for a given target on every one of `local_epochs` passes --
+            # the sampled-softmax signal on passes 2 and 3 was a duplicate of pass 1 --
+            # and every user sharing that target trained against the same set. A
+            # run-scoped RandomState varies the draw per call while keeping the run
+            # reproducible from `config.seed`.
             neg_ids_np = filter_negatives(
                 neg_pool, target, user_history_set,
                 config.num_sampled_negatives, padding_id=0, mask_id=mask_id,
+                rng=rng,
             )
             neg_ids = torch.tensor(neg_ids_np, dtype=torch.long, device=device)
             target_t = torch.tensor([target], dtype=torch.long, device=device)
@@ -200,7 +210,6 @@ def run_local_personalization(
         return {}
 
     neg_pool = np.load(os.path.join(processed, "global_negative_pool.npy"))
-    mask_id = config.num_items + 1
 
     with open(os.path.join(processed, "train_user_history.pkl"), "rb") as f:
         train_user_history = pickle.load(f)
@@ -228,6 +237,22 @@ def run_local_personalization(
         for i, uid in enumerate(val_examples["user_ids"]):
             user_val_map.setdefault(uid, []).append(i)
 
+    # REV-111: one run-scoped RandomState for every negative draw in this stage, so the
+    # draws vary per call and the whole run still reproduces from `config.seed`.
+    neg_rng = np.random.RandomState(config.seed)
+
+    # REV-111: the per-user evaluation built its own candidate sets, which put the
+    # personalization NDCG on a different candidate protocol from the headline
+    # `test_metrics_{model}.json` -- so `with_lora`/`without_lora` could not be quoted
+    # alongside it. Score the SAME stored rows every other stage scores; `user_test_map`
+    # indexes `test_examples`, so a test-example index addresses its candidate row
+    # directly.
+    cand_matrix = load_or_build_eval_candidates(
+        os.path.join(processed, "test_candidates.npy"),
+        test_examples, neg_pool, eval_user_history, config,
+        expected_rows=len(test_examples["targets"]),
+    )
+
     all_user_ids = sorted(set(test_examples["user_ids"]))
     rng = random.Random(config.seed)
     n_sample = min(config.personalization_eval_users, len(all_user_ids))
@@ -249,12 +274,12 @@ def run_local_personalization(
     pristine_lora = {k: v.detach().clone() for k, v in get_lora_state_dict(model).items()}
 
     results = []
-    num_skipped = 0
+    num_users_skipped = 0
 
     for user_id in sampled_users:
         test_indices = user_test_map.get(user_id, [])
         if not test_indices:
-            num_skipped += 1
+            num_users_skipped += 1
             continue
 
         test_seqs = [test_examples["sequences"][i] for i in test_indices]
@@ -262,10 +287,14 @@ def run_local_personalization(
         history_set = set(train_user_history.get(user_id, []))
 
         candidate_sets = []
-        for target in test_targets:
-            negs = filter_negatives(neg_pool, target, history_set, config.num_sampled_negatives, 0, mask_id)
-            cands = torch.tensor(np.concatenate([[target], negs]), dtype=torch.long, device=device)
-            candidate_sets.append(cands)
+        for row_idx, target in zip(test_indices, test_targets):
+            row = cand_matrix[row_idx]
+            assert int(row[0]) == int(target), (
+                f"stored candidate row {row_idx} has target {int(row[0])} but the test "
+                f"example has {int(target)}; test_candidates.npy is not aligned with "
+                f"test_examples.pkl -- re-run --stage preprocess"
+            )
+            candidate_sets.append(torch.as_tensor(np.asarray(row), dtype=torch.long, device=device))
 
         test_seq_tensors = [torch.tensor(s, dtype=torch.long) if not isinstance(s, torch.Tensor) else s for s in test_seqs]
 
@@ -290,12 +319,12 @@ def run_local_personalization(
         if not train_seq_tensors:
             # Nothing to adapt on -- report the user as skipped rather than falling back
             # to their evaluation examples, which is the defect this replaces.
-            num_skipped += 1
+            num_users_skipped += 1
             continue
 
         train_user_lora(
             model, moe, train_seq_tensors, train_tgts, neg_pool, history_set,
-            config, device, metadata_matrix=metadata_matrix,
+            config, device, metadata_matrix=metadata_matrix, rng=neg_rng,
         )
 
         metrics_with = evaluate_user(
@@ -319,16 +348,20 @@ def run_local_personalization(
             "is_cold": is_cold,
         })
 
-    report = _build_report(results, num_skipped)
+    report = _build_report(results, num_users_skipped)
     _save_report(config, model_name, report)
     _plot_personalization(config, model_name, results)
 
     return report
 
 
-def _build_report(results: List[Dict], num_skipped: int) -> Dict:
+def _build_report(results: List[Dict], num_users_skipped: int) -> Dict:
+    # REV-113: the emitted key is `num_users_skipped`, the name FR-4 gives it literally.
+    # It was `num_skipped`, which `personalization_gain_{model}.json` is a declared
+    # artifact of, so the rename keeps the file readable by anything written against the
+    # requirement rather than against the implementation.
     if not results:
-        return {"num_users_evaluated": 0, "num_skipped": num_skipped}
+        return {"num_users_evaluated": 0, "num_users_skipped": num_users_skipped}
 
     with_vals = [r["ndcg_with_lora"] for r in results]
     without_vals = [r["ndcg_without_lora"] for r in results]
@@ -336,7 +369,7 @@ def _build_report(results: List[Dict], num_skipped: int) -> Dict:
 
     return {
         "num_users_evaluated": len(results),
-        "num_skipped": num_skipped,
+        "num_users_skipped": num_users_skipped,
         "with_lora": {"mean": np.mean(with_vals), "std": np.std(with_vals)},
         "without_lora": {"mean": np.mean(without_vals), "std": np.std(without_vals)},
         "gain": {"mean": np.mean(gains), "std": np.std(gains), "min": np.min(gains), "max": np.max(gains)},

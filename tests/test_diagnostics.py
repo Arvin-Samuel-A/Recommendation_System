@@ -404,19 +404,29 @@ class TestCandidateSetConsistency:
         run_cold_start_evaluation(model, moe, cfg, "t-small")
 
         lt_rows = torch.cat([rows for rows, _ in lt_seen]).numpy()
-        cs_rows = torch.cat([rows for rows, _ in cs_seen]).numpy()
-        # cold-start scores every batch twice (metadata ON and OFF).
-        cs_rows = cs_rows[: len(stored)]
+
+        # Cold-start scores each batch twice -- metadata ON then OFF -- so the recorded
+        # calls interleave per batch (b0,b0,b1,b1,...), not as two whole passes back to
+        # back. Split them by the arm the spy captured; truncating the concatenation to
+        # len(stored) would only line up if every example fitted in one batch.
+        assert len(lt_seen) > 1, (
+            "the fixture must span more than one batch for this to test anything -- "
+            "raise N_EXAMPLES or lower eval_batch_size"
+        )
+        cs_on = torch.cat([rows for rows, meta in cs_seen if meta is not None]).numpy()
+        cs_off = torch.cat([rows for rows, meta in cs_seen if meta is None]).numpy()
 
         assert np.array_equal(lt_rows, stored), (
             "run_longtail_evaluation scored candidates that are not the stored "
             "test_candidates.npy rows -- the long-tail numbers are on a different "
             "candidate protocol from the headline test metrics"
         )
-        assert np.array_equal(cs_rows, stored), (
-            "run_cold_start_evaluation scored candidates that are not the stored rows"
-        )
-        assert np.array_equal(lt_rows, cs_rows), (
+        for arm, cs_rows in (("meta_on", cs_on), ("meta_off", cs_off)):
+            assert np.array_equal(cs_rows, stored), (
+                f"run_cold_start_evaluation's {arm} arm scored candidates that are not "
+                f"the stored test_candidates.npy rows"
+            )
+        assert np.array_equal(lt_rows, cs_on), (
             "the two entry points disagree on the candidate set for the same examples"
         )
 
@@ -518,6 +528,88 @@ class TestLatencyBenchmarkPath:
 
         assert report["timed_padding_positions"] == 0
         assert report["mean_ms"] > 0
+
+
+class TestLatencyBenchmarkMetadata:
+    """REV-110: the timed request must carry real metadata, never an all-zero block.
+
+    `dummy_meta` was `torch.zeros(1, S, feature_dim)`. A real request gathers
+    `metadata_matrix[seq]`, whose rows are dense genome-relevance floats, and an all-zero
+    block is precisely what a metadata-FREE model produces -- so the timed input could
+    not be told apart from the `use_metadata=False` configuration on the one path FR-6
+    calls the "full serving path".
+    """
+
+    @staticmethod
+    def _config(tmp_path):
+        from configs.config import Config
+
+        config = Config()
+        config.apply_model_config("t-small")
+        config.num_items = 60
+        config.vocab_size = 62
+        config.use_metadata = True
+        config.feature_dim = 8
+        config.warmup_runs = 1
+        config.timed_runs = 2
+        config.device = "cpu"
+        config.processed_data_dir = str(tmp_path / "processed")
+        return config
+
+    def test_gathers_real_metadata_rows(self, tmp_path):
+        import torch
+
+        from evaluation.flops import benchmark_latency
+        from training.pretrain import build_model
+
+        config = self._config(tmp_path)
+        model, moe = build_model(config)
+
+        torch.manual_seed(0)
+        matrix = torch.randn(config.vocab_size, config.feature_dim)
+
+        seen = []
+        original = type(model).forward
+
+        def spy(self, seq, metadata=None, **kwargs):
+            seen.append(None if metadata is None else metadata.detach().cpu().clone())
+            return original(self, seq, metadata=metadata, **kwargs)
+
+        type(model).forward = spy
+        try:
+            report = benchmark_latency(model, moe, config, metadata_matrix=matrix)
+        finally:
+            type(model).forward = original
+
+        assert report["timed_with_metadata"] is True
+        assert report["timed_metadata_source"] == "item_metadata"
+        assert seen and seen[0] is not None, "no metadata reached the model"
+        block = seen[0].float()
+        assert block.abs().sum().item() > 0, (
+            "the timed metadata block is all zeros -- that is the metadata-free input, "
+            "not the serving input"
+        )
+        # Every timed row must be an actual row of the matrix, i.e. a real gather. The
+        # serving path casts to bfloat16, so compare against the matrix under the same
+        # cast rather than against full float32 precision.
+        cast = matrix.to(torch.bfloat16).float()
+        rows = {tuple(r) for r in cast.tolist()}
+        for row in block[0].tolist():
+            assert tuple(row) in rows, (
+                "a timed metadata row is not a row of the metadata matrix"
+            )
+
+    def test_falls_back_to_noise_not_zeros(self, tmp_path):
+        """With no `item_metadata.npy` on disk the block must still be non-degenerate."""
+        from evaluation.flops import benchmark_latency
+        from training.pretrain import build_model
+
+        config = self._config(tmp_path)
+        model, moe = build_model(config)
+
+        report = benchmark_latency(model, moe, config)
+        assert report["timed_with_metadata"] is True
+        assert report["timed_metadata_source"] == "randn"
 
 
 class TestGradientDiagnosticsRestoresTrainingMode:

@@ -25,7 +25,14 @@ STUDY_CONFIGS = {
         {"label": "arv_mmoe_gradnorm", "use_masked_lm": True, "use_multi_step": True, "use_contrastive": True, "moe_variant": "arv_mmoe", "use_gradnorm": True, "personalization_mode": "none"},
         # The final arm of the progression adds LoRA personalization. It used to be
         # byte-identical to the arm above it, so the two could never differ.
-        {"label": "arv_mmoe_gradnorm_lora", "use_masked_lm": True, "use_multi_step": True, "use_contrastive": True, "moe_variant": "arv_mmoe", "use_gradnorm": True, "personalization_mode": "lora"},
+        # REV-100: FR-6 ends the progression at "+federated" and T2.2 spells arm 6 out as
+        # "(6) federated ARV-MMoE+GradNorm+LoRA", but the arm ran `run_local_personalization`
+        # only -- nothing in study A ever called `run_federated`, so the progression's
+        # final point was labelled as the federated system while measuring single-machine
+        # LoRA. `system_eval="communication"` routes `_run_single_config` into
+        # `run_federated` (rounds, final val NDCG, cumulative KB); `personalization_mode`
+        # stays "lora" because T2.2 names both, and federated training here IS LoRA-based.
+        {"label": "arv_mmoe_gradnorm_lora", "use_masked_lm": True, "use_multi_step": True, "use_contrastive": True, "moe_variant": "arv_mmoe", "use_gradnorm": True, "personalization_mode": "lora", "system_eval": "communication"},
     ],
     "B": [
         {"label": "objective_conditioned", "moe_variant": "arv_mmoe", "router_conditioning": "objective_conditioned"},
@@ -635,20 +642,37 @@ def _plot_mmoe_comparison(config: Config, model_name: str, results: List[Dict]) 
 
     # C requests "efficiency" extras, so parameters and latency are available. Both are
     # on their own axes because they differ by orders of magnitude.
+    # REV-099: this read `parameters.total`, a key `evaluation/flops.py::count_parameters`
+    # has never returned -- the real key is `total_parameters` -- so `.get("total", 0.0)`
+    # silently evaluated to 0.0 and BOTH arms' parameter bars were plotted at zero height,
+    # in the figure whose job is to substantiate the parameter-matched claim. FR-8 also
+    # names expert params and router/gate params, both already in the same dict and
+    # neither previously plotted.
     ax_p = ax_c
     ax_l = ax_c.twinx()
     cx = np.arange(len(usable))
-    params = [r.get("parameters", {}).get("total", 0.0) / 1e6 for r in usable]
+    param_series = [
+        ("total_parameters", "Total params (M)", "tab:blue"),
+        ("expert_parameters", "Expert params (M)", "tab:cyan"),
+        ("router_parameters", "Router/gate params (M)", "tab:purple"),
+    ]
     latency = [r.get("latency", {}).get("mean_ms", 0.0) for r in usable]
-    ax_p.bar(cx - 0.18, params, 0.36, color="tab:blue", label="Parameters (M)")
-    ax_l.bar(cx + 0.18, latency, 0.36, color="tab:orange", label="Latency (ms)")
+    offsets = [-0.30, -0.10, 0.10]
+    for (key, series_label, color), offset in zip(param_series, offsets):
+        vals = [r.get("parameters", {}).get(key, 0.0) / 1e6 for r in usable]
+        ax_p.bar(cx + offset, vals, 0.19, color=color, label=series_label)
+    ax_l.bar(cx + 0.30, latency, 0.19, color="tab:orange", label="Latency (ms)")
     ax_p.set_xticks(cx)
     ax_p.set_xticklabels(labels, rotation=15, ha="right")
     ax_p.set_ylabel("Parameters (millions)", color="tab:blue")
     ax_l.set_ylabel("Mean latency (ms)", color="tab:orange")
     ax_p.set_title("Cost")
     handles = ax_p.get_legend_handles_labels()[0] + ax_l.get_legend_handles_labels()[0]
-    ax_p.legend(handles, ["Parameters (M)", "Latency (ms)"], loc="upper left")
+    ax_p.legend(
+        handles,
+        [label for _, label, _ in param_series] + ["Latency (ms)"],
+        loc="upper left", fontsize="small",
+    )
 
     fig.suptitle(f"Ablation C: MMoE vs ARV-MMoE -- {model_name}")
     fig.tight_layout()

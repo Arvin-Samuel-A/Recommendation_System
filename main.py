@@ -40,7 +40,26 @@ def parse_args(argv=None):
     parser.add_argument("--use_gradnorm", action="store_true", default=None)
     parser.add_argument("--no_gradnorm", action="store_true", default=False)
     parser.add_argument("--study", default="all", help="Ablation study letter (A-H) or 'all'")
+    # REV-115: `run_ablation(train=...)` existed but had no CLI surface, so evaluating
+    # already-trained arms meant editing source -- which conventions.md's "Config-Driven
+    # Design" forbids ("No ablation requires commenting/uncommenting code or manually
+    # editing source files"). An arm with no checkpoint records
+    # `status: "skipped_no_checkpoint"` and the study continues.
+    parser.add_argument(
+        "--no_train", action="store_true", default=False,
+        help="Ablations only: evaluate existing per-arm checkpoints instead of training "
+             "each arm. Arms with no checkpoint are skipped, not failed.",
+    )
     parser.add_argument("--seed", type=int, default=None)
+    # Owner decision (2026-09-17): Phase 17's gate is a few-step run of `run_pretrain` on
+    # REAL data, not a full epoch. `max_steps_per_epoch` already existed as a Config
+    # field but had no CLI surface, so running the gate meant editing source -- which
+    # conventions.md's "Config-Driven Design" forbids.
+    parser.add_argument(
+        "--max_steps", type=int, default=None,
+        help="Cap training steps per epoch (0 = uncapped). The Phase 17 few-step smoke "
+             "gate uses this to exercise run_pretrain end to end on real data.",
+    )
     return parser.parse_args(argv)
 
 
@@ -74,6 +93,11 @@ def apply_cli_overrides(config: Config, args) -> None:
     if args.seed is not None:
         overrides.append(("seed", config.seed, args.seed))
         config.seed = args.seed
+    if getattr(args, "max_steps", None) is not None:
+        overrides.append(
+            ("max_steps_per_epoch", config.max_steps_per_epoch, args.max_steps)
+        )
+        config.max_steps_per_epoch = args.max_steps
 
     for name, old, new in overrides:
         logger.info(f"CLI override: {name} {old} -> {new}")
@@ -506,13 +530,18 @@ def run_gradient_diagnostics_stage(config, args):
 
 def run_ablation_stage(config, args):
     from training.ablation_runner import run_ablation
-    return run_ablation(config, args.model, args.study)
+    # REV-115: `--no_train` reaches the `train` parameter that already existed here.
+    return run_ablation(
+        config, args.model, args.study, train=not getattr(args, "no_train", False),
+    )
 
 
 def run_plots_stage(config, args):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+
+    from training.federated import final_val_ndcg
 
     os.makedirs(config.plot_dir, exist_ok=True)
     logger.info("Generating core tradeoff plots from completed evaluation results...")
@@ -534,14 +563,19 @@ def run_plots_stage(config, args):
 
     models = list(results.keys())
     ndcgs = [results[m].get("ndcg", {}).get("mean", 0.0) for m in models]
-    sizes = [results[m].get("total_parameters", 0) for m in models]
+    # REV-101(a): FR-14 specifies "Size MB vs NDCG@10" for this figure, and the
+    # implementation plotted `total_parameters` under an axis labelled "Total
+    # Parameters" -- a different quantity from the requirement's. `model_size_bf16_mb`
+    # is BF16 because that is the dtype the models are trained and served in
+    # (transformer-backbone AC-08), so it is the size a reader would act on.
+    sizes = [results[m].get("model_size_bf16_mb", 0.0) for m in models]
 
     if any(s > 0 for s in sizes):
         fig, ax = plt.subplots(figsize=(8, 5))
         ax.scatter(sizes, ndcgs)
         for m, s, n in zip(models, sizes, ndcgs):
             ax.annotate(m, (s, n))
-        ax.set_xlabel("Total Parameters")
+        ax.set_xlabel("Model size (MB, BF16)")
         ax.set_ylabel("NDCG@10")
         ax.set_title("Accuracy vs Model Size")
         fig.tight_layout()
@@ -560,8 +594,14 @@ def run_plots_stage(config, args):
             rounds = json.load(f)
         if not rounds:
             continue
-        cumulative_kb = sum(r.get("total_round_kb", 0.0) for r in rounds)
-        comm_points.append((model_name, cumulative_kb, rounds[-1].get("val_ndcg", 0.0)))
+        # REV-101(b): FR-14 specifies "Comm cost/round vs NDCG@10". This summed
+        # `total_round_kb` across every round and labelled the axis "Cumulative
+        # communication (KB)", so the ratio between two models changed with how many
+        # rounds each happened to run. `total_round_kb` is already the per-round figure.
+        per_round_kb = rounds[-1].get("total_round_kb", 0.0)
+        # REV-117: the headline federated number is the final round's FULL-SPLIT score,
+        # not the bounded per-round prefix the convergence curve plots.
+        comm_points.append((model_name, per_round_kb, final_val_ndcg(rounds)))
 
     if comm_points:
         fig, ax = plt.subplots(figsize=(8, 5))
@@ -570,7 +610,7 @@ def run_plots_stage(config, args):
         ax.scatter(xs, ys)
         for name, c, n in comm_points:
             ax.annotate(name, (c, n))
-        ax.set_xlabel("Cumulative communication (KB)")
+        ax.set_xlabel("Communication per round (KB)")
         ax.set_ylabel("Final federated NDCG@10")
         ax.set_title("Accuracy vs Communication Cost")
         fig.tight_layout()
