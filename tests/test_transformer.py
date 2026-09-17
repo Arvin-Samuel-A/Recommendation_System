@@ -564,3 +564,144 @@ class TestFlashAttentionVarlen:
             AttentionBackend._flash_attention_4_varlen(
                 q, k, v, padding_mask, is_causal=True,
             )
+
+
+class TestCausalIntentReachesEveryBackend:
+    """REV-122: causality must survive the trip from the layer to whichever kernel runs.
+
+    `CausalSelfAttention.forward` used to hardcode `is_causal=False` on the padded branch
+    and encode causality in an additive mask instead. SDPA reads that mask, so MPS was
+    correct; the FA4 branch discards it and takes causality only from the flag, so on CUDA
+    every left-padded batch -- i.e. every training batch -- attended BIDIRECTIONALLY.
+
+    These tests go through `CausalSelfAttention.forward`, which is the whole point. The
+    four `TestFlashAttentionVarlen` tests call the private helpers directly with
+    `is_causal=True`, so none of them could fail on this defect; that is why it survived
+    two reviews.
+    """
+
+    @staticmethod
+    def _backend(backend_name, monkeypatch=None):
+        """An `AttentionBackend` pinned to `backend_name`, on cpu in fp32.
+
+        Construction probes `sdpa` (which runs here), then the name is overridden so
+        `_dispatch` routes to the branch under test.
+        """
+        cfg = Config()
+        cfg.device = "cpu"
+        cfg.attention_backend = "sdpa"
+        backend = AttentionBackend(cfg)
+        backend.backend_name = backend_name
+        backend.dtype = torch.float32
+        return backend
+
+    @staticmethod
+    def _attention(backend, D=8, H=2):
+        from models.transformer import CausalSelfAttention
+
+        torch.manual_seed(0)
+        attn = CausalSelfAttention(D, H, 0.0, backend).to(dtype=torch.float32)
+        attn.eval()
+        return attn
+
+    @staticmethod
+    def _left_padded_input(B=1, S=8, D=8, n_pad=3):
+        torch.manual_seed(1)
+        x = torch.randn(B, S, D, dtype=torch.float32)
+        x[:, :n_pad, :] = 0.0
+        padding_mask = torch.ones(B, S, dtype=torch.bool)
+        padding_mask[:, :n_pad] = False
+        return x, padding_mask, n_pad
+
+    @pytest.mark.parametrize("backend_name", ["sdpa", "flash_attention_4"])
+    def test_future_token_cannot_reach_earlier_positions(self, backend_name, monkeypatch):
+        """Perturbing position S-1 must leave every earlier position bit-identical.
+
+        This is the exact probe that measured the defect: under the old code the FA4
+        branch shifted real positions 3-6 by ~0.13 when only position 7 changed.
+        """
+        if backend_name == "flash_attention_4":
+            TestFlashAttentionVarlen._install_reference_flash_attn(monkeypatch)
+
+        backend = self._backend(backend_name)
+        attn = self._attention(backend)
+        x, padding_mask, n_pad = self._left_padded_input()
+        S = x.shape[1]
+
+        with torch.no_grad():
+            base = attn(x, padding_mask)
+            perturbed_in = x.clone()
+            perturbed_in[:, S - 1, :] += 1.0
+            perturbed = attn(perturbed_in, padding_mask)
+
+        delta = (perturbed - base).abs().amax(dim=-1)[0]
+        for pos in range(n_pad, S - 1):
+            assert delta[pos].item() == 0.0, (
+                f"[{backend_name}] position {pos} moved by {delta[pos].item():.6f} when "
+                f"only position {S - 1} changed -- attention is not causal"
+            )
+        # Non-vacuity: the perturbed position itself must actually move, otherwise the
+        # assertions above would hold for a layer that ignores its input entirely.
+        assert delta[S - 1].item() > 0.0
+
+    def test_flash_attention_kernel_receives_causal_true_on_padded_batches(self, monkeypatch):
+        """The flag itself, not only its effect: FA4 takes causality ONLY from here."""
+        import sys
+        import types
+
+        import torch.nn.functional as F
+
+        TestFlashAttentionVarlen._install_reference_flash_attn(monkeypatch)
+        seen = []
+
+        flash_attn = sys.modules["flash_attn"]
+        real_varlen = flash_attn.flash_attn_varlen_func
+        real_dense = flash_attn.flash_attn_func
+
+        def spy_varlen(*args, causal=False, **kwargs):
+            seen.append(causal)
+            return real_varlen(*args, causal=causal, **kwargs)
+
+        def spy_dense(q, k, v, causal=False):
+            seen.append(causal)
+            return real_dense(q, k, v, causal=causal)
+
+        monkeypatch.setattr(flash_attn, "flash_attn_varlen_func", spy_varlen)
+        monkeypatch.setattr(flash_attn, "flash_attn_func", spy_dense)
+
+        backend = self._backend("flash_attention_4")
+        attn = self._attention(backend)
+        x, padding_mask, _ = self._left_padded_input()
+
+        with torch.no_grad():
+            attn(x, padding_mask)          # padded -> varlen
+            attn(x, None)                  # unpadded -> dense
+
+        assert seen, "the stubbed FlashAttention kernel was never reached"
+        assert all(seen), (
+            f"FlashAttention received causal={seen}; every call from CausalSelfAttention "
+            f"must be causal. `causal=False` here is silent label leakage on CUDA."
+        )
+
+    def test_probe_covers_the_padded_branch(self, base_config):
+        """REV-122: the startup gate must exercise the branch training actually takes.
+
+        `_probe` previously attended an unpadded input only, so the H100 self-test would
+        have passed while training ran non-causally.
+        """
+        backend = AttentionBackend(base_config)
+        seen = []
+        original = backend._dispatch
+
+        def spy(backend_name, q, k, v, padding_mask, is_causal):
+            seen.append(padding_mask)
+            return original(backend_name, q, k, v, padding_mask, is_causal)
+
+        backend._dispatch = spy
+        ok, reason = backend._probe(backend.backend_name)
+
+        assert ok, reason
+        assert any(m is None for m in seen), "probe never exercised the unpadded branch"
+        padded = [m for m in seen if m is not None]
+        assert padded, "probe never exercised the PADDED branch"
+        assert not padded[0].all(), "probe's 'padded' mask has no padded positions"

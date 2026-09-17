@@ -296,6 +296,32 @@ class TestEvalCandidates:
         assert fingerprint == hashlib.sha256(in_memory.tobytes()).hexdigest()[:16]
         assert np.array_equal(load_eval_candidates(path), in_memory)
 
+        # REV-119: the memory-mapped read must be the SAME rows, verified the same way.
+        # `run_local_personalization` addresses a few thousand rows of an 856 MB matrix,
+        # so it reads this way; FR-1's "one candidate protocol" depends on the two paths
+        # being indistinguishable in content.
+        mapped = load_eval_candidates(path, mmap=True)
+        assert isinstance(mapped, np.memmap), "mmap=True must not materialise the matrix"
+        assert np.array_equal(np.asarray(mapped), in_memory)
+        assert np.array_equal(mapped[1], in_memory[1]), "row slicing must agree"
+        # Fingerprint verification must run -- and pass -- over the memmap too, otherwise
+        # the mapped path would silently skip the integrity check the eager path enforces.
+        with pytest.raises(RuntimeError, match="fingerprint mismatch"):
+            import json as _json
+            meta_path = path + ".meta.json"
+            with open(meta_path) as f:
+                meta = _json.load(f)
+            good = meta["fingerprint"]
+            meta["fingerprint"] = "0" * 16
+            with open(meta_path, "w") as f:
+                _json.dump(meta, f)
+            try:
+                load_eval_candidates(path, mmap=True)
+            finally:
+                meta["fingerprint"] = good
+                with open(meta_path, "w") as f:
+                    _json.dump(meta, f)
+
     def test_block_fingerprint_matches_whole_matrix_digest(self):
         """REV-087: block-wise hashing must reproduce the digest byte-for-byte."""
         import numpy as np

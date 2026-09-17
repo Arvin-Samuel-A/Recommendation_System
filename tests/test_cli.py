@@ -50,6 +50,62 @@ class TestCLIParsing:
         assert config.max_steps_per_epoch == 200
         assert config.pretrain_epochs == 1
 
+    def test_smoke_gate_overrides(self):
+        """REV-131: the owner's reduced personalization/federated gate needs three flags.
+
+        AC-05 and AC-06 were reduced on 2026-09-17 to pipeline-integrity gates at
+        `personalization_eval_users = 10`, `clients_per_round = 10`, `local_epochs = 1`.
+        Without a CLI surface, running that gate means editing `configs/config.py` --
+        which `conventions.md` forbids and which would silently change the configured
+        values every later run inherits. Same shape as `--no_train` (REV-115) and
+        `--max_steps`.
+        """
+        # Absent flags leave the CONFIGURED values authoritative -- Phase 14 runs these.
+        config = Config()
+        apply_cli_overrides(config, parse_args(["--stage", "personalize"]))
+        assert config.personalization_eval_users == 1000
+        assert config.clients_per_round == 100
+        assert config.local_epochs == 3
+
+        config = Config()
+        apply_cli_overrides(config, parse_args(
+            ["--stage", "personalize", "--model", "t-small",
+             "--eval_users", "10", "--local_epochs", "1"]
+        ))
+        assert config.personalization_eval_users == 10
+        assert config.local_epochs == 1
+        assert config.clients_per_round == 100, "untouched flag must not move"
+
+        config = Config()
+        apply_cli_overrides(config, parse_args(
+            ["--stage", "federated", "--model", "t-small",
+             "--clients_per_round", "10", "--epochs", "3"]
+        ))
+        assert config.clients_per_round == 10
+        assert config.federated_rounds == 3, "--epochs maps to rounds for federated"
+        assert config.personalization_eval_users == 1000
+
+    def test_smoke_gate_overrides_are_logged(self, caplog):
+        """code-quality.md: every CLI override logs original -> new."""
+        import logging
+
+        config = Config()
+        args = parse_args(
+            ["--stage", "federated", "--model", "t-small",
+             "--eval_users", "10", "--clients_per_round", "10", "--local_epochs", "1"]
+        )
+        with caplog.at_level(logging.INFO):
+            apply_cli_overrides(config, args)
+        text = caplog.text
+        for field, original, new in (
+            ("personalization_eval_users", 1000, 10),
+            ("clients_per_round", 100, 10),
+            ("local_epochs", 3, 1),
+        ):
+            assert f"CLI override: {field} {original} -> {new}" in text, (
+                f"{field} override was applied but not logged"
+            )
+
     def test_gradnorm_override(self):
         args = parse_args(["--stage", "pretrain", "--no_gradnorm"])
         config = Config()
@@ -316,6 +372,55 @@ class TestMissingCheckpoint:
         run_evaluate_stage(config, args)
 
         assert any("Checkpoint not found" in r.message for r in caplog.records)
+
+
+class TestLoadTrainedModelResolvesItsNames:
+    """`_load_trained_model` must not reference a name it never imported.
+
+    It called `load_metadata_matrix` while importing only `build_model`,
+    `load_checkpoint`, `_build_loss_fns` and `get_device`. Both call sites
+    (`run_routing_diagnostics_stage`, `run_gradient_diagnostics_stage`) import
+    `load_metadata_matrix` into THEIR OWN function scope, which does not reach the
+    helper -- so `--stage gradient_diagnostics` and `--stage routing_diagnostics` died
+    with `NameError: name 'load_metadata_matrix' is not defined` before touching a model.
+    Found while running the REV-129 / REV-128 verification, which needs these stages.
+
+    No existing test reached this line: `TestMissingCheckpoint` returns at the checkpoint
+    guard ABOVE it, and every other CLI test stops at argument parsing.
+    """
+
+    def test_reaches_model_construction_without_a_name_error(self, tmp_path):
+        import json as _json
+
+        from main import _load_trained_model
+
+        config = Config()
+        config.processed_data_dir = str(tmp_path / "processed")
+        config.checkpoint_dir = str(tmp_path / "ckpt")
+        os.makedirs(config.processed_data_dir, exist_ok=True)
+        with open(os.path.join(config.processed_data_dir, "dataset_stats.json"), "w") as f:
+            _json.dump({"num_items": 100, "num_users": 10, "MASK_ID": 101}, f)
+
+        args = MagicMock()
+        args.model = "t-small"
+        config.apply_model_config("t-small")
+        os.makedirs(config.model_checkpoint_dir(), exist_ok=True)
+        with open(os.path.join(config.model_checkpoint_dir(), "best.pt"), "wb") as f:
+            f.write(b"checkpoint")
+
+        sentinel_model, sentinel_moe = MagicMock(), MagicMock()
+        with patch("training.pretrain.build_model",
+                   return_value=(sentinel_model, sentinel_moe)), \
+                patch("training.pretrain._build_loss_fns", return_value={}), \
+                patch("training.pretrain.load_checkpoint"), \
+                patch("data.sequence_generator.load_metadata_matrix", return_value=None):
+            loaded = _load_trained_model(config, args)
+
+        assert loaded is not None, "the checkpoint exists, so this must not skip"
+        model, moe, _, metadata_matrix, _, processed = loaded
+        assert model is sentinel_model and moe is sentinel_moe
+        assert metadata_matrix is None
+        assert processed == config.processed_data_dir
 
 
 class TestOverrideLogging:

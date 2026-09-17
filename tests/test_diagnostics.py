@@ -94,9 +94,26 @@ class TestGradientCosineSimilarity:
         cos_sim = gradient_cosine_similarity(losses, anchor)
         T = len(losses)
         assert cos_sim.shape == (T, T)
+        # REV-128: tightened from `< 0.01`, which was wide enough to accept the bf16
+        # diagonal of 1.0039 that reached the real artifact. fp32 measurement puts a
+        # vector's similarity with itself at 1.0 to well within 1e-4.
         for i in range(T):
-            assert abs(cos_sim[i, i].item() - 1.0) < 0.01
-        assert abs(cos_sim[0, 1].item() - cos_sim[1, 0].item()) < 0.01
+            assert abs(cos_sim[i, i].item() - 1.0) < 1e-4, (
+                f"diagonal entry {i} is {cos_sim[i, i].item():.6f}; a gradient's cosine "
+                f"with itself must be 1.0 -- measure in fp32, not bf16"
+            )
+        # A cosine similarity cannot exceed 1. The bf16 diagonal did, at three of four
+        # entries (max 1.00391), and a heatmap reading 1.004 is a paper figure inviting
+        # the wrong question. Assert the RANGE so the violation cannot come back silently.
+        # FP32_ULP absorbs fp32 round-off (measured 5e-7 here) while staying four orders
+        # of magnitude tighter than the bf16 excursion this guards against.
+        FP32_ULP = 1e-5
+        assert cos_sim.max().item() <= 1.0 + FP32_ULP, (
+            f"cosine similarity matrix contains {cos_sim.max().item():.6f}, which exceeds "
+            f"1.0 by more than fp32 round-off -- it is being measured in a lower precision"
+        )
+        assert cos_sim.min().item() >= -1.0 - FP32_ULP
+        assert abs(cos_sim[0, 1].item() - cos_sim[1, 0].item()) < 1e-6
 
 
 class TestGradNorms:

@@ -110,17 +110,61 @@ class TestMultiStepLoss:
         loss = loss_fn(hidden, targets_k, item_emb)
         assert loss.item() == 0.0
 
-    def test_correct_position_usage(self, device, dtype):
-        B, S, D, V, K = 1, 5, 8, 20, 2
+    def test_every_step_reads_position_S_minus_1(self, device, dtype):
+        """REV-105 / amended FR-3 + AC-03: all k projections read the SAME position.
+
+        The test this replaces asserted only that the loss was finite, so it held under
+        either position rule and could not distinguish them. Assert the property that is
+        true of `pos = S-1` and false of `pos = S-1-step`: the loss depends on position
+        S-1 alone, so arbitrarily changing every EARLIER position must leave it exactly
+        unchanged.
+        """
+        B, S, D, V, K = 2, 6, 8, 20, 3
+        torch.manual_seed(0)
         loss_fn = MultiStepLoss(D, K).to(device=device, dtype=dtype)
-        hidden = torch.zeros(B, S, D, device=device, dtype=dtype)
-        hidden[0, S-1, :] = 1.0
-        hidden[0, S-2, :] = -1.0
-        targets_k = torch.tensor([[5, 10]], device=device)
+        loss_fn.eval()
+        hidden = torch.randn(B, S, D, device=device, dtype=dtype)
+        targets_k = torch.randint(1, V, (B, K), device=device)
         item_emb = torch.randn(V, D, device=device, dtype=dtype)
 
-        loss = loss_fn(hidden, targets_k, item_emb)
-        assert torch.isfinite(loss)
+        baseline = loss_fn(hidden, targets_k, item_emb)
+
+        scrambled = hidden.clone()
+        scrambled[:, : S - 1, :] = torch.randn(
+            B, S - 1, D, device=device, dtype=dtype,
+        )
+        rewritten = loss_fn(scrambled, targets_k, item_emb)
+
+        assert rewritten.item() == baseline.item(), (
+            "multi-step loss moved when only positions < S-1 changed, so at least one "
+            "step is reading a position other than S-1 (the superseded S-1-step rule)"
+        )
+
+        # Non-vacuity: changing position S-1 -- the one position every step reads --
+        # must change the loss, otherwise the equality above is trivially true.
+        moved = hidden.clone()
+        moved[:, S - 1, :] += 1.0
+        assert loss_fn(moved, targets_k, item_emb).item() != baseline.item()
+
+    def test_all_k_steps_contribute_distinct_projections(self, device, dtype):
+        """Reading one position must not collapse the k steps into one prediction.
+
+        Each step keeps its own bias-free projection (unchanged by REV-105), so the k
+        steps still produce different logits from the shared input vector.
+        """
+        B, S, D, V, K = 1, 6, 8, 20, 3
+        torch.manual_seed(0)
+        loss_fn = MultiStepLoss(D, K).to(device=device, dtype=dtype)
+        loss_fn.eval()
+        hidden = torch.randn(B, S, D, device=device, dtype=dtype)
+        shared = hidden[:, S - 1, :]
+
+        outs = [loss_fn.step_projections[i](shared) for i in range(K)]
+        for i in range(1, K):
+            assert not torch.allclose(outs[0], outs[i]), (
+                f"step 0 and step {i} produced identical projections of the shared "
+                f"position-S-1 vector"
+            )
 
 
 class TestInfoNCE:
@@ -298,11 +342,14 @@ class TestGradNormAnchorResolution:
 class TestGradNormGradientIsolation:
     """REV-057: `GradNormController.update` must write into `log_lambdas.grad` only.
 
-    The GradNorm loss is built from `torch.autograd.grad(..., create_graph=True)`, so a
-    plain `.backward()` on it propagates second-order gradients into every model
-    parameter in that graph. `train_one_step` calls `update()` between `L_total.backward()`
-    and `optimizer.step()`, so those second-order terms would be stepped on by the main
-    AdamW. FR-5 requires the two optimizers to be separated.
+    REV-124: this used to justify the requirement in terms of the second-order
+    implementation -- `torch.autograd.grad(..., create_graph=True)` and the double-backward
+    graph it built. T3.6 removed both (see the AC-10 test one class away, which asserts
+    `create_graph=True` appears nowhere in the controller). The isolation requirement
+    survives that change unchanged, on first-order grounds: `update()` runs between
+    `L_total.backward()` and `optimizer.step()`, so a plain `.backward()` on
+    `gradnorm_loss` would accumulate into the very model `.grad` buffers the main AdamW is
+    about to step on. FR-5 requires the two optimizers to stay separated.
     """
 
     def _setup(self):
