@@ -60,7 +60,7 @@ User interaction sequence
 ┌─────────────────────────────────────┐
 │  Transformer Backbone (Pre-LN)      │
 │  Causal Self-Attention (BF16)       │
-│  FlexAttention (MPS) or FA4 (H100) │
+│  SDPA (MPS) or FA4 (H100)           │
 │  3–5 layers depending on variant    │
 └──────────────┬──────────────────────┘
                │
@@ -488,13 +488,13 @@ The complete resolved configuration (including any CLI overrides) is saved to `o
 
 | Stage | Hardware | Attention Backend | Notes |
 |---|---|---|---|
-| Smoke testing | Apple Silicon Mac (MPS) | FlexAttention | One-batch and one-epoch T-Small tests |
-| Development | Apple Silicon Mac (MPS) | FlexAttention | Full T-Small training feasible |
+| Smoke testing | Apple Silicon Mac (MPS) | SDPA | One-batch and few-step T-Small tests on real data |
+| Development | Apple Silicon Mac (MPS) | SDPA | Full T-Small training feasible |
 | Final experiments | NVIDIA H100 (CUDA) | FlashAttention-4 | All model sizes, all seeds, all ablations |
 
 **Dtype:** BF16 everywhere on both platforms. No FP16 autocast, no GradScaler.
 
-**Fail-fast policy:** The MPS smoke test fails immediately if FlexAttention cannot execute. The H100 final run fails immediately if FlashAttention-4 cannot initialize. Silent fallback to vanilla attention is forbidden.
+**Fail-fast policy:** The MPS smoke test fails immediately if SDPA cannot execute. The H100 final run fails immediately if FlashAttention-4 cannot initialize. Silent fallback to vanilla attention is forbidden.
 
 ---
 
@@ -507,7 +507,7 @@ The full 22-phase implementation sequence with test gates is in [`specs/BUILD_OR
 | 0 | Environment validates | Everything |
 | 3 | Sequence/pool/candidate tests pass | All model training |
 | 5 | One-batch forward+backward smoke test | Multi-epoch training |
-| 11 | **One-batch + one-epoch T-Small smoke tests** | **Full MovieLens-20M training** |
+| 11 | **One-batch + few-step T-Small smoke tests (real data)** | **Full MovieLens-20M training** |
 | 13 | H100 FlashAttention-4 self-test (if CUDA) | H100 training |
 
 **Dependency chain:** data-pipeline → transformer-backbone → moe-routing → loss-functions → training-pipeline → personalization-federated → evaluation-diagnostics → ablations-cli

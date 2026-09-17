@@ -4,209 +4,299 @@
 
 **CHANGES_REQUIRED**
 
+(Downgraded from the prior `PASS_WITH_WARNINGS`. One new CRITICAL finding, REV-122, on
+the CUDA/H100 attention path. Everything the prior review verified still holds — this is
+a defect the prior review did not reach, not a regression.)
+
 ## Feature
 
-`specs/transformer-backbone` — `models/transformer.py`: `AttentionBackend`, `CausalSelfAttention`, `TransformerBlock`, `TransformerModel`, the size variants, metadata projection, and embedding normalization.
+`specs/transformer-backbone` — `models/transformer.py` (`AttentionBackend`,
+`CausalSelfAttention`, `TransformerBlock`, `TransformerModel`, size factory), plus the
+`attention_backend` surface in `configs/config.py`.
 
 ## Review Scope
 
-- Spec directory: `specs/transformer-backbone/` (requirements.md, design.md, tasks.md)
-- Steering: `steering/architecture.md`, `code-quality.md`, `conventions.md`, `testing.md`
-- Baseline: working tree vs `HEAD` = `32b0904` on `master`. All feature work is uncommitted.
-- Files inspected: `models/transformer.py` (457 lines, modified), `tests/test_transformer.py` (453 lines, modified), `configs/config.py`, `utils.py`, and the scoring call sites in `evaluation/metrics.py` and `training/losses.py`
-- Hardware: Apple Silicon, MPS, PyTorch 2.14.0 — the dev host `steering/architecture.md` names
-- Re-review of the prior `review.md`. `transformer.py` (21:51) and `tests/test_transformer.py` (21:52) were both modified after it.
-- Date: 2026-09-15
+- Spec directory: `specs/transformer-backbone/` (requirements.md, design.md, tasks.md) —
+  all three were edited by the owner/BUILD since the review before last (the SDPA
+  decision); unchanged since the last review.
+- Steering: `steering/architecture.md`, `code-quality.md`, `conventions.md`, `testing.md`.
+- Baseline: working tree vs `HEAD` = `d438950` on `master`; `origin/master` at the same
+  commit. 38 tracked files modified, no untracked files.
+- Files inspected: `models/transformer.py` (443 lines, modified `-55/+22`),
+  `configs/config.py`, `tests/test_transformer.py` (modified, `+91`), `tests/test_smoke.py`,
+  `tests/test_training.py`, `README.md`.
+- Verification was executed, not inferred: the full suite was run, backend resolution and
+  config rejection were exercised directly on this host (MPS, torch 2.14.0), and the FA4
+  path was driven end-to-end through `TransformerModel` with the CUDA kernel replaced by
+  an exact SDPA reference.
+- Re-review. Prior findings carried in: REV-062 (HIGH, RESOLVED), REV-080 (RESOLVED),
+  REV-102 (RESOLVED), REV-082 (INFO, OPEN), REV-103 (INFO, NOT_APPLICABLE).
+- Date: 2026-09-17
 
 ## Summary
 
-REV-081 is genuinely fixed: the FlashAttention-4 path now routes left-padded batches through `flash_attn_varlen_func` with unpad/cu_seqlens/repad plumbing, and `TestFlashAttentionVarlen` exercises that plumbing against dense causal attention with the kernel stubbed. The masking implementation itself is correct — I verified directly that padded key positions contribute exactly zero to every real query position.
+The REV-062 resolution holds up under re-inspection, and it was done the right way. SDPA
+is the sanctioned MPS/CPU kernel, `flex_attention` is gone from the enum and the class,
+and — the part that mattered — the gate was not disarmed to achieve it:
+`require_attention_backend = True` is still set in both smoke tests and no assertion was
+altered. Re-measured here: `VALID_BACKENDS == ('auto', 'flash_attention_4', 'sdpa')`;
+`Config(attention_backend="flex_attention").validate()` raises with a message offering
+only the three supported values; `auto` on MPS resolves to `sdpa` with
+`fallback_reason is None` and `self_test()` returns `status: 'passed'`;
+`hasattr(AttentionBackend, "_flex_attention")` is `False`.
 
-Two things are not resolved. **REV-062** has moved from "silently wrong" to "honestly blocked": the gate is now armed in the two smoke tests, and they FAIL on this host because FlexAttention has no backward pass on MPS in PyTorch 2.14.0. BUILD handled this correctly — it left T1.1, T6.2 and T6.3 unchecked and escalated rather than editing the spec — but the repository's test suite does not pass, and the decision (sanction SDPA, or pin a PyTorch build where FlexAttention trains on MPS) is the owner's. **REV-080** is still open: the test named for padding masking compares a tensor against *itself*, so AC-04's padding half remains unverified by the suite even though the property holds.
+What the prior review did not reach is the branch none of the tests exercise end-to-end.
+**`CausalSelfAttention.forward` hardcodes `is_causal=False` on the padded path**, relying
+on the additive `attn_mask` to carry causality. The SDPA branch reads that mask, so MPS
+is correct. The FA4 branch **ignores `attn_mask` entirely** and takes causality only from
+the `is_causal` flag — so on CUDA, every left-padded batch runs *bidirectional*
+attention. Measured directly (REV-122): changing only the last token of a left-padded
+sequence shifts the hidden states at four earlier real positions by ~0.13, which must be
+exactly zero under a causal mask. Since every training batch is left-padded, this is the
+H100 production path, and it breaks AC-04 and FR-4's "changes only the backend, not the
+mathematical operation".
+
+The existing `TestFlashAttentionVarlen` tests cannot catch it: all four call
+`_flash_attention_4` / `_flash_attention_4_varlen` **directly with `is_causal=True`**,
+never through `CausalSelfAttention.forward`, which is the only place the flag is set to
+`False`. The self-test probe likewise passes `is_causal=True` with no mask, so the armed
+gate stays green.
 
 ## Git Changes
 
-| File | State |
+| File | Change |
 |---|---|
-| `models/transformer.py` | modified (+~320 lines vs `32b0904`) |
-| `tests/test_transformer.py` | modified (+~330 lines) |
-| `configs/config.py` | modified — `require_attention_backend`, `"sdpa"` in the `attention_backend` enum |
-| `specs/transformer-backbone/tasks.md` | modified (BUILD notes on T1.1) |
-| `specs/transformer-backbone/review.md` | untracked (this file) |
+| `models/transformer.py` | `-55/+22`: `VALID_BACKENDS` narrowed, `_flex_attention` kernel and its `_dispatch` branch deleted, `_preferred_backend()` returns `sdpa` for every non-CUDA device, class docstring rewritten |
+| `configs/config.py` | `attention_backend` validation list and error message narrowed to three values |
+| `tests/test_transformer.py` | `+91`: FlexAttention-rejection tests, the REV-080 padding test, the REV-102 metadata tests |
+| `README.md`, `tests/test_smoke.py`, `tests/test_training.py` | documentation/comment sync (T5.1, T5.2) |
 
-**Scope assessment:** in scope. No new runtime dependencies — `flash_attn` is imported lazily inside the CUDA path and is not required to import the module.
+**Scope assessment:** proportionate to T1.3/T1.4/T5.1/T5.2 and nothing more. I checked
+specifically that the smoke-test edits are comment-only, since "BUILD must not disarm the
+flag to make the suite green" was the load-bearing clause of REV-062 — `git diff HEAD --
+tests/test_smoke.py tests/test_training.py` confirms comment-only, with
+`require_attention_backend = True` preserved in both.
 
 ## Specification Coverage
 
 | Requirement | Status | Evidence |
 |---|---|---|
-| FR-1 Embedding layer | PASS | `nn.Embedding(num_items + 2, hidden_dim)` and learnable `nn.Embedding(max_seq_length, hidden_dim)` ([transformer.py:373](models/transformer.py:373)). No separate output matrix anywhere; `item_emb_weight` is a property returning `self.item_embedding.weight`. |
-| FR-2 Pre-LN block | PASS | `TransformerBlock.forward` ([transformer.py:354](models/transformer.py:354)) is `x + drop(attn(norm1(x)))` then `x + drop(ffn(norm2(x)))`; FFN is Linear→GELU→Dropout→Linear at `ffn_expansion`. |
-| FR-3 Size variants | PASS | `MODEL_CONFIGS` matches the table exactly; `Config.validate` raises on `hidden_dim % num_heads != 0`; `TestModelShapes` parametrises all three. |
-| FR-4 Attention backends | PARTIAL | Resolution, probing and manifest recording are all real (REV-043's fix holds: every backend is genuinely invoked). MPS→FlexAttention cannot execute a backward pass on this host, so `"auto"` resolves to SDPA — see REV-062. CUDA→FA4 is implemented but has never been run (no CUDA device here). |
-| FR-5 Masking | PASS | Verified directly, not only by inspection: with `v` set to 100.0 at the two padded positions and zero elsewhere, the output at all four real query positions is exactly 0 — padded keys contribute nothing. Causal masking covered by `test_causal_masking`. See REV-080 for the test-coverage gap. |
-| FR-6 Hidden state output | PASS | `return_all_hidden=True` → `(B, S, D)`; `False` → pooled `x[:, -1, :]` with optional L2 normalization ([transformer.py:445-457](models/transformer.py:445)). `TestModelShapes::test_output_shapes` asserts both. |
-| FR-7 Metadata integration | PARTIAL | `nn.Linear(feature_dim, hidden_dim, bias=False)` added to the input sum; `feature_dim <= 0` with `use_metadata=True` raises a clear error (REV-050). But supplying a metadata tensor to a `use_metadata=False` model raises rather than being ignored — see REV-102. |
-| FR-8 Embedding normalization | PASS | `l2_normalize` is applied at the scoring sites — `score_candidates_batch` ([metrics.py:117](evaluation/metrics.py:117)) and the loss functions via `_maybe_normalize` — which is where the dot products happen. `TestEmbeddingNormalization::test_scores_bounded` asserts the [-1, 1] bound. |
-| FR-9 BF16 | PASS | `self.to(dtype=resolve_dtype(config))` in `__init__`; `resolve_dtype` raises off bf16; `TestBF16` asserts both parameter and output dtype. No autocast, no GradScaler anywhere in the repo. |
+| FR-1 Embedding layer, tied weights | PASS | `nn.Embedding(num_items + 2, hidden_dim)`, learnable `position_embedding`, `item_emb_weight` property returns the embedding weight itself; identity test present |
+| FR-2 Pre-LN block, 4× FFN | PASS | `TransformerBlock` applies `norm1`→attn→residual, `norm2`→FFN→residual; `ffn_dim = hidden_dim * ffn_expansion` |
+| FR-3 Three size variants | PASS | Size factory; `assert hidden_dim % num_heads == 0` in `CausalSelfAttention.__init__` |
+| FR-4 Attention backends | **FAIL** | The enum, resolution, self-test (forward+backward) and fail-fast behaviour are all correct. But the wrapper does **not** "change only the backend, not the mathematical operation": on a padded batch SDPA computes causal attention and FA4 computes bidirectional attention (REV-122) |
+| FR-5 Masking | **PARTIAL** | Causal + padding masking is correct under SDPA and verified. Under FA4, padding is handled (via unpad/repad) but causality is not (REV-122) |
+| FR-6 Dual output mode | PASS | `return_all_hidden=True` → `(B, S, D)`; `False` → pooled `x[:, -1, :]`; shape tests for all three sizes |
+| FR-7 Metadata integration | PASS | Bias-free `nn.Linear(feature_dim, hidden_dim)` added to inputs; `feature_dim` validated; a tensor passed to a `use_metadata=False` model is ignored with a once-per-process warning (REV-102) |
+| FR-8 Embedding normalization | PASS | `l2_normalize` on the pooled representation; hidden states returned un-normalized by design (REV-044), with normalization applied at the scoring sites |
+| FR-9 BF16 | PASS | `self.to(dtype=resolve_dtype(config))`; `resolve_dtype` raises on non-bf16; no autocast or GradScaler anywhere |
 
 ## Acceptance Criteria
 
 | Criterion | Status | Evidence |
 |---|---|---|
-| AC-01 output shapes for both modes, all three sizes | PASS | `tests/test_transformer.py::TestModelShapes::test_output_shapes`, parametrised over t-small/t-base/t-large. |
-| AC-02 FlexAttention self-test passes on MPS | **FAIL** | `AttentionBackend._probe("flex_attention")` returns `NotImplementedError: FlexAttention does not support backward on MPS`. Reproduced directly and in both failing gate tests. `"auto"` falls back to SDPA. |
-| AC-03 FlashAttention-4 self-test passes on H100 | NOT VERIFIABLE | No CUDA device and no `flash_attn` build on this host. The varlen plumbing is tested against a stubbed kernel (`TestFlashAttentionVarlen`), which covers everything this repository owns, but the real kernel has not run. T1.1 is correctly left unchecked for this reason. |
-| AC-04 causal mask + padding contribute nothing | PASS (implementation) / NOT VERIFIED (suite) | Property confirmed directly — see FR-5 above. The suite's `test_padding_masking` does not test it (REV-080). |
-| AC-05 tied weights by identity | PASS | `TestTiedWeights::test_item_embedding_is_output_weight` asserts `model.item_emb_weight is model.item_embedding.weight`. |
-| AC-06 metadata on/off | PARTIAL | The `use_metadata=True` half passes (`test_metadata_changes_output`). The `False` half is not tested as written and the implementation raises rather than ignoring — REV-102. |
-| AC-07 normalized scores bounded to [-1, 1] | PASS | `TestEmbeddingNormalization::test_scores_bounded`. |
-| AC-08 all parameters and computation BF16 | PASS | `TestBF16::test_parameters_are_bf16` and `test_output_is_bf16`; `training/pretrain.py::assert_bf16_params` re-asserts at training time. |
+| AC-01 shapes for all sizes, both modes | PASS | Shape tests for T-Small/T-Base/T-Large × both `return_all_hidden` modes |
+| AC-02 SDPA self-test fwd+bwd on MPS, `auto`→`sdpa`, no fallback | PASS | Reproduced directly: `{'backend': 'sdpa', 'requested_backend': 'auto', 'fallback_reason': None, 'device': 'mps', 'dtype': 'torch.bfloat16', 'status': 'passed'}`. `_probe` runs `out.float().sum().backward()` and checks gradient finiteness |
+| AC-03 FA4 self-test on H100 | NOT VERIFIABLE | No CUDA device and no flash-attn build on this host. T1.1 is correctly left unchecked. **Note:** REV-122 means this gate would pass on the H100 while the model still trains non-causally — the probe uses an unpadded input, so it never exercises the broken branch |
+| AC-04 causal mask prevents future attention; padding contributes nothing | **FAIL** | Padding half: PASS, and now genuinely tested (REV-080 fix drives `CausalSelfAttention` with identity projections and asserts exact zero). Causal half: PASS under SDPA, **FAIL under FA4** — measured leakage of 0.133 at positions that must be unaffected (REV-122) |
+| AC-05 tied weights by identity | PASS | `item_emb_weight` returns `self.item_embedding.weight`; identity test |
+| AC-06 metadata on/off | PASS | Output bit-identical to `metadata=None` when `use_metadata=False`; test supplies a real tensor rather than `None` (REV-102 fix) |
+| AC-07 L2 bounds scores to [-1, 1] | PASS | `tests/test_transformer.py` normalization test |
+| AC-08 BF16 throughout | PASS | Parameter dtype check; `resolve_dtype` raises otherwise |
+| AC-09 `flex_attention` rejected, no reachable path | PASS | Rejection message reproduced verbatim; `hasattr(AttentionBackend, "_flex_attention")` is `False`; `grep -rni flex` over `models/ configs/ training/ evaluation/ data/ main.py utils.py` returns only comments |
 
 ## Findings
 
 ```
+REV-122
+Severity: CRITICAL | Status: OPEN | Requirement: FR-4, FR-5 | AC: AC-04, AC-03
+File: models/transformer.py:288-301 (`CausalSelfAttention.forward`, padded branch);
+      models/transformer.py:141-150 (`AttentionBackend._dispatch`);
+      models/transformer.py:186-227 (`_flash_attention_4_varlen`)
+Problem: on the padded branch, `CausalSelfAttention.forward` builds an additive
+  `attn_float` mask that encodes causal + key-padding, and then calls
+      self.backend.forward(q, k, v, attn_mask=attn_float,
+                           padding_mask=padding_mask, is_causal=False)
+  `is_causal=False` is hardcoded because the mask is expected to carry causality. That
+  contract holds for exactly one backend. `_dispatch` forwards `attn_mask` to SDPA (which
+  reads it) but passes only `padding_mask` and `is_causal` to `_flash_attention_4`, which
+  discards the additive mask and derives causality solely from the flag. The varlen call
+  therefore runs with `causal=False`.
+  `TransformerModel.forward` passes a padding mask whenever the batch contains any pad
+  token, and every training batch is left-padded to `max_seq_length`, so this is the
+  normal path on CUDA, not an edge case.
+Evidence (measured, not inferred): driving `TransformerModel` with
+  `attention_backend="flash_attention_4"` and the CUDA kernel replaced by an exact SDPA
+  reference, on a left-padded row `[0,0,0,11,12,13,14,15]`, changing ONLY position 7:
+      pos 0-2 (pad):  0.000000        <- correctly excluded
+      pos 3:          0.129807        <- must be 0 under a causal mask
+      pos 4:          0.132777        <- must be 0
+      pos 5:          0.120646        <- must be 0
+      pos 6:          0.086955        <- must be 0
+      pos 7:          1.517679        <- expected
+  The `causal=` flags the kernel actually received were [True, False, False]: True for
+  the unpadded self-test probe, False for both real forward passes.
+Impact: On the H100 -- the declared production training hardware -- the backbone attends
+  bidirectionally. Every objective that reads an interior position (masked item modelling,
+  multi-step targets at S-1-k) sees tokens that come after its own target, which is direct
+  label leakage. Results would be inflated and not comparable with the MPS/SDPA numbers,
+  since the two backends compute different functions -- precisely what FR-4's "changes
+  only the backend, not the mathematical operation" exists to prevent. Nothing is wrong on
+  the dev host, so this is invisible to every test and every smoke gate currently run, and
+  it would first appear as an unexplained H100-vs-MPS discrepancy in the paper's numbers.
+  AC-03 does not protect against it either: `_probe` attends an UNPADDED input with
+  `is_causal=True`, so the H100 self-test would pass while training ran non-causally.
+Correction: Stop routing causality through a mask only one backend reads. Either
+  (a) pass the real causal intent down -- keep a `is_causal=True` argument on the padded
+  branch and let the SDPA branch combine `is_causal` with a padding-only additive mask
+  (SDPA accepts `attn_mask` and `is_causal` together is NOT allowed, so build the causal
+  part into the mask for SDPA only, while FA4 receives `is_causal=True`); or
+  (b) give `_dispatch` the unambiguous pair `(padding_mask, is_causal)` and let each
+  backend construct its own mask, which is what the "thin wrapper formats masks for the
+  selected backend" design (D2, point 3) actually describes.
+  Add a regression test that goes through `CausalSelfAttention.forward` (NOT through
+  `_flash_attention_4*` directly) with the stubbed kernel and asserts that perturbing
+  position S-1 leaves positions < S-1 bit-identical. The four existing
+  `TestFlashAttentionVarlen` tests all call the private helpers with `is_causal=True`, so
+  none of them can fail on this defect -- that is why it survived two reviews.
+  Also worth extending `_probe` to exercise a padded input, so the H100 gate covers the
+  branch that actually runs in training.
+```
+
+```
 REV-062
-Severity: HIGH | Status: OPEN | Requirement: FR-4 | AC: AC-02
-File: models/transformer.py:76-103 (`_resolve_backend`); configs/config.py:57
-       (`require_attention_backend`); tests/test_smoke.py:30; tests/test_training.py:216
-Problem: FlexAttention cannot run a backward pass on MPS in this PyTorch build, so the
-  project's declared dev host cannot train on the backend `steering/architecture.md`
-  specifies. BUILD's response was correct -- arm the gate in the two smoke tests, leave
-  T1.1/T6.2/T6.3 unchecked, and escalate rather than relax the spec. The consequence is
-  that `uv run python -m pytest` now exits with 2 failures:
-    tests/test_smoke.py::TestOneBatchEndToEnd::test_full_pipeline
-    tests/test_training.py::TestFewStepSmokeViaRunPretrain::test_few_steps_via_run_pretrain
-  both with "Preferred attention backend 'flex_attention' cannot execute on mps:
-  NotImplementedError: FlexAttention does not support backward on MPS."
-Impact: `steering/testing.md`'s Phase 16 and 17 gates cannot be signed off on this host,
-  so BUILD_ORDER Phase 11 cannot authorise full MovieLens training. Leaving the flag at
-  its `False` default instead would let training proceed on SDPA -- exactly the silent
-  fallback `code-quality.md` forbids for the MPS gate.
-Correction: This is a SPEC DECISION for the owner, not a BUILD fix. Two viable
-  resolutions: (a) sanction SDPA as the MPS training backend and reword FR-4/AC-02 and
-  `code-quality.md`'s "Attention Backend Discipline" accordingly, keeping
-  `require_attention_backend` armed for the H100 run only; or (b) pin a PyTorch build in
-  which FlexAttention trains on MPS and re-run the gates. Verified for the owner's
-  benefit: with the requirement neutralised at runtime (no repository file touched),
-  tests/test_smoke.py and TestFewStepSmokeViaRunPretrain BOTH PASS -- so nothing beneath
-  the backend choice is broken. BUILD must not edit requirements.md or steering/ to
-  unblock this.
+Severity: HIGH | Status: RESOLVED | Requirement: FR-4 | AC: AC-02, AC-09
+File: models/transformer.py; configs/config.py:294-303
+Resolution re-verified this pass. The owner's decision (a) is reflected in requirements
+  FR-4/AC-02/AC-09, design D2b, steering/code-quality.md and BUILD_ORDER Phase 4; BUILD's
+  T1.3/T1.4/T5.1/T5.2 implement it. Re-checked the specific failure mode the finding
+  warned about: `git diff HEAD -- tests/test_smoke.py tests/test_training.py` is
+  comment-only in both, `require_attention_backend = True` is still present in each, and
+  no assertion was altered. The suite is green because the preferred backend executes,
+  not because the requirement was relaxed.
 ```
 
 ```
 REV-080
-Severity: LOW | Status: OPEN | Requirement: FR-5 | AC: AC-04
-File: tests/test_transformer.py:38-64 (`test_padding_masking`),
-       tests/test_transformer.py:88-105 (`test_padded_prefix_does_not_change_valid_outputs`)
-Problem: Both tests compare a tensor against itself. `seq_a` and `seq_b` in
-  `test_padding_masking` are both `[[0, 0] + suffix]` -- byte-identical -- despite the
-  docstring saying they carry "DIFFERENT content in the two padded positions"; padding is
-  always id 0, so there is no different content to carry. `torch.equal(out_a, out_b)`
-  therefore holds for any deterministic model whether or not padding is masked. The same
-  applies to `seq_a`/`seq_b` in `test_padded_prefix_does_not_change_valid_outputs`
-  (`[[0]*6 + items]` twice). The only non-vacuous assertion in either test is that a
-  prefix of REAL items changes the output -- which is true whether or not pads are masked.
-  The implementation IS correct: I confirmed separately that with `v = 100.0` at the two
-  padded positions, the attention output at all real query positions is exactly 0.
-Impact: AC-04's padding half is unverified by the suite. Every training sequence is
-  left-padded, so a regression in the mask construction at
-  `CausalSelfAttention.forward:315-323` would pass CI and silently corrupt every batch.
-Correction: Assert the property directly at the layer, not through two identical
-  sequences. Build q/k/v with a distinctive value placed ONLY at padded key positions and
-  assert the output at every real query position is zero -- this is a four-line test and
-  it is what the scratch check above did. Additionally unmark T1.2 or amend its wording
-  until such a test exists, since it claims "Test: padding mask zeros out padded key
-  contributions".
+Severity: LOW | Status: RESOLVED | Requirement: FR-5 | AC: AC-04
+File: tests/test_transformer.py:38-85
+Resolution: re-confirmed. The replacement drives `CausalSelfAttention` directly with
+  identity v/out projections, places the distinctive value at padded key positions only,
+  asserts the real-query output is exactly zero, and includes a non-vacuity assertion
+  that the same value DOES reach real queries when the padding mask is omitted.
+  Note the contrast with REV-122: this test earns its PASS precisely because it goes
+  through `CausalSelfAttention.forward`. The FA4 tests do not, which is the gap.
 ```
 
 ```
 REV-102
-Severity: LOW | Status: OPEN | Requirement: FR-7 | AC: AC-06
-File: models/transformer.py:421-427 (`TransformerModel.forward`);
-       tests/test_transformer.py:217-231 (`test_no_metadata_ignores_tensor`)
-Problem: `requirements.md`'s Edge Cases say "`use_metadata=False` with metadata tensor
-  supplied: must not affect computation", and AC-06 says "with `False`, output is
-  identical regardless of metadata tensor". The implementation instead raises ValueError
-  ("Refusing to silently ignore it"). The test named for this criterion never supplies a
-  metadata tensor -- it calls `model(seq, return_all_hidden=False)` twice with no metadata
-  and asserts the two results match -- so neither the spec's behaviour nor the
-  implementation's is actually covered.
-Impact: Minor. The raising behaviour is arguably safer than silent ignoring and no live
-  call site hits it (`evaluation/longtail.py` passes `metadata=None`, and
-  `cold_start.py`'s meta_off arm passes None deliberately). But AC-06 as written is not
-  met, and its test proves nothing either way.
-Correction: One of two, both cheap: (a) keep the raise and ask the spec owner to reword
-  the Edge Case and AC-06 to "supplying metadata to a metadata-free model is an error";
-  or (b) match the spec and ignore the tensor with a warning. Either way, replace
-  `test_no_metadata_ignores_tensor` with a test that actually passes a metadata tensor to
-  a `use_metadata=False` model and asserts the chosen behaviour.
+Severity: LOW | Status: RESOLVED | Requirement: FR-7 | AC: AC-06
+File: models/transformer.py:398-411; tests/test_transformer.py:294-340
+Resolution: re-confirmed. A metadata tensor supplied to a `use_metadata=False` model is
+  ignored (output identical to `metadata=None`) with a once-per-process warning, so it is
+  ignored but not silently. The test supplies a real tensor.
 ```
 
 ```
 REV-082
-Severity: INFO | Status: OPEN | Requirement: FR-2 | AC: —
-File: models/transformer.py:334 (`CausalSelfAttention.forward`)
-Problem: `attn_dropout` is applied to the attention OUTPUT rather than to the attention
-  weights, because SDPA's `dropout_p` is not usable uniformly across the three backends.
-  This is documented inline and is a reasonable backend-agnostic choice; FR-2 only
-  specifies "Dropout rate: config.dropout" and does not pin the placement.
-Impact: None observed. Noted so the deviation from textbook attention-weight dropout is
-  on the record for the paper's method section.
+Severity: INFO | Status: RESOLVED | Requirement: FR-2 | AC: -
+File: specs/transformer-backbone/design.md (new section "D-dropout")
+Resolution: closed by the spec owner on 2026-09-17. `design.md` now records that
+  `attn_dropout` is applied to the attention OUTPUT rather than to the attention weights,
+  why (SDPA's `dropout_p` is not usable uniformly across the two sanctioned backends, so
+  output-side dropout preserves FR-4's "changes only the backend, not the mathematical
+  operation" property), and that FR-2 pins only the rate and not the placement, so the
+  implementation conforms. The deviation from textbook attention-weight dropout is now on
+  the record in the design rather than only in a review.
 ```
 
 ```
 REV-103
+Severity: INFO | Status: NOT_APPLICABLE | Requirement: FR-5 | AC: —
+Note: this recorded that the `(B, H, S, S)` additive mask was built and then discarded on
+  the FlexAttention and FA4 branches. It is superseded: what it described as a harmless
+  inefficiency on the FA4 branch is, on inspection, the CRITICAL defect now filed as
+  REV-122. Closing this ID and tracking the real problem there.
+```
+
+```
+REV-123
 Severity: INFO | Status: OPEN | Requirement: FR-5 | AC: —
-File: models/transformer.py:315-323 (`CausalSelfAttention.forward`)
-Problem: The `(B, H, S, S)` additive float mask is built on every padded forward pass and
-  handed to `_dispatch` alongside `padding_mask`, but only the SDPA branch reads it --
-  the FlexAttention branch builds its own block mask from `padding_mask` and the FA4
-  branch uses `padding_mask` for unpadding. On the two hardware-preferred backends the
-  mask is constructed and discarded.
-Impact: At batch_size 256, S=50, H=4 in bf16 that is ~5 MB allocated and freed per block
-  per step -- negligible next to the activations, and zero on the SDPA path that actually
-  runs here. Recorded as an observation, not a defect.
+File: models/transformer.py:288-297
+Note: a fully-padded query row (position 0 of a left-padded sequence can only attend to
+  key 0, which is itself padding) produces an all `-inf` mask row. This does NOT produce
+  NaN: PyTorch's SDPA returns zeros for fully-masked rows, verified on both cpu and mps in
+  bf16, and a whole-batch check on an all-pad sequence returned finite hidden states and a
+  finite pooled vector. Recorded only because the safety of this path is a property of the
+  SDPA kernel rather than of anything this repository asserts, and the requirements' Edge
+  Cases section ("sequence entirely padding ... valid hidden state at S-1 still computed")
+  is currently satisfied by that external behaviour. No action required.
 ```
 
 ## Design Compliance
 
-Matches `design.md`. Pre-LN ordering, the `AttentionBackend` indirection that "changes only the backend, not the mathematical operation", learnable positional embeddings (no sinusoidal), tied output weights, and the `get_device`/`resolve_dtype` discipline are all as designed. No `.cuda()` or `.to("cuda")` calls anywhere in `models/`.
+Compliant with the amended design on every point except one, and that one is REV-122.
 
-Two additions beyond `design.md`, both justified in the source:
-- `"sdpa"` as a first-class backend plus `require_attention_backend`. This is the mechanism that makes "no silent fallback" enforceable rather than assumed; `design.md` did not anticipate a third backend. The fallback is loud (WARNING) and recorded in `run_config.json` via `save_config_snapshot`. Acceptable.
-- `_flash_attention_4_varlen`. Required to make the CUDA path work at all on left-padded data; a correct implementation of FR-5 for that backend rather than a redesign.
+D2b is implemented as written: MPS/CPU resolve to `sdpa`, CUDA to `flash_attention_4`, no
+third option in the enum, `require_attention_backend` and the fail-fast paths untouched.
+D2's amended point 2 ("forward *and* backward") is implemented in `_probe`. D1 (Pre-LN),
+D3 (additive bias-free metadata projection), D4 (normalization at scoring sites) are all
+respected. The new testing-strategy line about the backend enum has a matching test.
+
+The violation is **D2 point 3** — "the wrapper's job is ... format masks for the selected
+backend". The wrapper does not do this: the *caller* formats one mask in SDPA's dialect
+and hands it down, and the FA4 branch silently receives a semantic (`is_causal=False`)
+that is false. This is the design decision that, if actually implemented, would have
+prevented REV-122.
+
+No unapproved dependency, no architectural drift.
 
 ## Task Completion
 
-12 of 13 tasks are marked `[x]`; T1.1 is correctly unchecked with a BUILD note explaining that AC-03 cannot be signed off without a CUDA host.
-
 | Task | Verdict |
 |---|---|
-| T1.1 attention backend wrapper | Correctly `[ ]`. The MPS/SDPA halves are done and tested; the CUDA half is implemented but unverifiable here. The BUILD note is accurate. |
-| T1.2 test attention backends | **False-complete.** Claims "Test: padding mask zeros out padded key contributions"; no such test exists (REV-080). The self-test and causal-mask halves are genuinely covered. |
-| T2.1 embedding layer | Complete, with tied weights verified by identity. |
-| T2.2 metadata projection | Complete for the `True` path including the `feature_dim <= 0` validation; the `False`-with-tensor path deviates (REV-102). |
-| T3.1 transformer block | Complete. |
-| T3.2 full model | Complete. |
-| T4.x / T5.x tests | Complete except as noted under T1.2. `TestAttentionBackendGate` is a real test of the `require_attention_backend` mechanism in both directions, and `TestFlashAttentionVarlen` is a genuinely useful stubbed-kernel test of the repository's own varlen plumbing. |
+| T1.1 attention wrapper | Correctly **unchecked**, and REV-122 vindicates that. The task's own text — "delegates to the selected backend in its expected argument format" — is not satisfied for FA4, so this must stay unchecked regardless of H100 access |
+| T1.2 backend tests | Checked. The padding half it claims is genuinely tested now. But the task also claims causal-mask coverage, and that coverage does not extend to the FA4 branch — see REV-122's note on why the four varlen tests cannot fail on it |
+| T1.3 remove FlexAttention | Checked, verified true. Every clause performed: kernel deleted, `_dispatch` branch deleted, `VALID_BACKENDS` narrowed, config list and message narrowed, `_preferred_backend()` changed, docstring rewritten |
+| T1.4 test narrowed surface | Checked, verified true. Both assertions exist; the MPS assertion is not skipped on this host and passes |
+| T2.x–T4.x | Checked; unchanged and previously verified. Re-spot-checked tied weights, BF16 and normalization |
+| T5.1 README sync | Checked, verified true — all three locations updated, nothing else changed |
+| T5.2 smoke-gate comments | Checked, verified true, and verified comment-only |
+
+No false-complete tasks. T1.1 being unchecked is the correct state and now has a second
+reason to remain so.
 
 ## Testing and Verification
 
 | Command | Result |
 |---|---|
-| `uv run python -m pytest -q` (full suite) | 231 passed, **2 failed**, 135 s. Both failures are this spec's REV-062 gate. |
-| `uv run python -m pytest tests/test_transformer.py -q` | All pass (included above). |
-| Scratch: build `TransformerModel` on MPS, forward a batch with 40 padded positions | All outputs finite, gradients finite — no fully-masked-row NaN on the SDPA path. Same on CPU. |
-| Scratch: `AttentionBackend.forward` with `v = 100.0` at padded positions only | Output at all real query positions is exactly `0.0` — FR-5/AC-04 property confirmed. |
-| Scratch: re-run `tests/test_smoke.py` + `TestFewStepSmokeViaRunPretrain` with `require_attention_backend` neutralised at runtime via a scratch pytest plugin (no repository file modified) | **3 passed.** Confirms REV-062 is the sole blocker and the pipeline beneath it is sound. |
-| Scratch: `AttentionBackend._probe("flex_attention")` on this host | `(False, "NotImplementedError: FlexAttention does not support backward on MPS...")` |
+| `uv run python -m pytest -q` | **267 passed**, 0 failed, 49.20 s |
+| `uv run python -m pytest -q -m slow --collect-only` | 8 slow collected, 259 deselected — confirms the 267 run included the slow gates |
+| `Config(attention_backend="flex_attention").validate()` (direct) | raises `ValueError: Unknown attention_backend 'flex_attention'. Choose from 'auto', 'flash_attention_4', 'sdpa'` |
+| `AttentionBackend(cfg).self_test()`, `auto` + `require_attention_backend=True` (direct) | `{'backend': 'sdpa', 'requested_backend': 'auto', 'fallback_reason': None, 'device': 'mps', 'dtype': 'torch.bfloat16', 'status': 'passed'}` |
+| `hasattr(AttentionBackend, "_flex_attention")` (direct) | `False` |
+| `git diff HEAD -- tests/test_smoke.py tests/test_training.py` | comment-only; `require_attention_backend = True` preserved in both |
+| `grep -rni flex models/ configs/ training/ evaluation/ data/ main.py utils.py` | comments only; no reachable code path |
+| **FA4 leakage probe** — `TransformerModel` with `attention_backend="flash_attention_4"`, CUDA kernel stubbed with an exact SDPA reference, left-padded input, perturb position S-1 only (direct) | **positions 3,4,5,6 shift by 0.130 / 0.133 / 0.121 / 0.087 — must be 0. Kernel received `causal=[True, False, False]`.** REV-122 |
+| All-padding and left-padded finiteness check under SDPA (direct) | all hidden states and pooled outputs finite on cpu and mps — REV-123 |
 
 ## Final Assessment
 
-The backbone itself is correct — masking, tied weights, normalization, dtype discipline and the varlen FA4 plumbing all check out. Two actions:
+For BUILD, in order:
 
-1. **REV-062 goes to the spec owner, not to BUILD.** BUILD must not disarm the gate or edit `requirements.md` / `steering/code-quality.md` to make the suite green. Record in the escalation that the underlying pipeline passes once the backend requirement is neutralised, so the decision is purely "which kernel is sanctioned on MPS".
-2. **BUILD should fix REV-080** — replace the two self-comparing padding tests with a direct assertion on the layer, then either re-check T1.2 or leave it unchecked. **REV-102** is a smaller follow-up: pick a behaviour for `use_metadata=False` with a metadata tensor and write the test that actually exercises it.
+1. **REV-122 (CRITICAL, blocking)** — fix the causal-intent plumbing between
+   `CausalSelfAttention.forward` and the FA4 branch, per correction (a) or (b). This must
+   land before any H100 run: it silently invalidates CUDA training results and the AC-03
+   self-test cannot catch it, because `_probe` attends an unpadded input.
+2. **REV-122 regression test** — add a test that goes through `CausalSelfAttention.forward`
+   with the stubbed FA4 kernel and asserts positions `< S-1` are bit-identical when
+   position `S-1` changes. Extend `_probe` to include a padded input so the H100 gate
+   covers the branch training actually takes. Do not close the finding on the
+   implementation fix alone: the reason this survived two reviews is that all four
+   existing varlen tests call the private helpers directly with `is_causal=True`.
+3. **T1.1** — keep it unchecked. It now has two open reasons: unverified FA4 on H100, and
+   REV-122.
 
-Status stays `CHANGES_REQUIRED` while REV-062 is open and the suite does not pass. AC-02 is FAIL on this hardware and AC-03 is NOT VERIFIABLE until an H100 run happens.
+Nothing for the spec owner. REV-062 was resolved by owner decision in the previous round
+and re-verified here; REV-082 was closed by the owner on 2026-09-17. REV-123 is an
+observation carried for the record with no action attached.

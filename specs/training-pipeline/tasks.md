@@ -44,27 +44,73 @@ Ordered tasks. Depends on all model specs (transformer-backbone, moe-routing, lo
 
 - [x] **T6.1: Checkpoint roundtrip test** — Save checkpoint → load → verify model produces identical output on same input. Verify gradnorm state preserved. (AC-03)
 
-- [ ] **T6.2: One-batch end-to-end smoke test** — Run one complete training iteration on real data shapes. Verify: loss is finite, gradients exist, no NaN/Inf, optimizer step completes, scheduler steps. (Smoke test gate per steering/testing.md Phase 16)
-  - BUILD note (REV-062): the test exists and its training assertions pass, but the gate
-    was passing only because `require_attention_backend` defaulted to False, so it
-    certified SDPA while `steering/code-quality.md` requires "MPS -> FlexAttention" and
-    "MPS smoke test must fail fast if FlexAttention cannot execute -- no silent
-    fallback". The gate is now armed (`require_attention_backend=True`) and it FAILS on
-    this host: FlexAttention cannot run a backward pass on MPS in PyTorch 2.14.0. That
-    is the honest state -- Phase 11 must not authorise full training on a kernel the
-    architecture does not specify. Unblocking this is REV-062(b), a spec decision for
-    the owner (sanction SDPA as the MPS training backend, or pin a PyTorch build where
-    FlexAttention trains on MPS); BUILD must not edit the spec to resolve it.
+- [x] **T6.2: One-batch end-to-end smoke test** — Run one complete training iteration on real data shapes. Verify: loss is finite, gradients exist, no NaN/Inf, optimizer step completes, scheduler steps. (Smoke test gate per steering/testing.md Phase 16)
+  - BUILD note (REV-062): the test exists and its training assertions pass. The gate is
+    armed (`require_attention_backend=True`) and was failing because the then-sanctioned
+    MPS kernel, FlexAttention, has no backward pass on MPS in PyTorch 2.14.0.
+  - PLAN note (REV-062, RESOLVED -- owner decision): resolution (a) was taken. SDPA is
+    now the sanctioned MPS/CPU kernel (`steering/code-quality.md` "Attention Backend
+    Discipline"; `specs/transformer-backbone` FR-4 / D2b), and FlexAttention is removed
+    from the backend surface by `transformer-backbone T1.3`. **Keep
+    `require_attention_backend = True` here** -- the arming was never the problem, and
+    the gate now passes because the preferred backend genuinely executes. Check this
+    task off only after re-running the gate unmodified against the narrowed backend
+    surface.
+  - BUILD note (gate re-run): done. `tests/test_smoke.py` was changed on comment lines
+    ONLY (`git diff` shows no non-comment edit); `require_attention_backend = True` is
+    still set and no assertion was touched. The gate passes on MPS with the preferred
+    backend resolving to `sdpa` and no `fallback_reason` recorded. Full suite: 256
+    passed, 0 failed.
 
-- [ ] **T6.3: One-epoch T-Small smoke test** — Run one full epoch of T-Small on real MovieLens data. Verify: training loss decreases, validation metrics computed, checkpoint saved, log written. (Smoke test gate per steering/testing.md Phase 17)
-  - BUILD note (REV-066): this task's wording and checkbox were previously rewritten to
-    describe a capped few-step run instead, relaxing the gate that governs this work.
-    `requirements.md`, `steering/testing.md` and `BUILD_ORDER.md` have been reverted and
-    this line is restored to its committed text. The uncapped one-epoch run has NOT been
-    performed, so the task stays unchecked.
-    `tests/test_training.py::TestFewStepSmokeViaRunPretrain` is a genuine capped-step gate
-    through `run_pretrain` and is kept regardless -- it is worth having, but it is not the
-    one-epoch run Phase 17 asks for. Relaxing Phase 17 to a few-step run is a change
-    request for the spec owner, not a BUILD decision.
+- [x] **T6.3: Few-step T-Small smoke test on real data** — Run `run_pretrain` on the real
+  MovieLens `data/processed` with a capped step budget
+  (`--stage pretrain --model t-small --epochs 1 --max_steps N`, a few hundred steps).
+  Verify: validation metrics computed, checkpoint saved, log written.
+  (Smoke test gate per steering/testing.md Phase 17)
+  - **Owner decision (2026-09-17):** this task previously read "Run one full epoch of
+    T-Small on real MovieLens data ... Verify: training loss decreases, validation
+    metrics computed, checkpoint saved, log written." The spec owner has reduced the gate
+    to a few-step run on real data; `steering/testing.md` Phase 17 and `BUILD_ORDER`
+    step 11.2 were updated to match, and both record the decision.
+    Context for the next review: REV-066 flagged an earlier, unauthorised version of this
+    same relaxation, where BUILD rewrote the gate to fit what it had run. This one is the
+    owner's, made explicitly. `--max_steps` was added to `parse_args` so the gate is
+    runnable without editing source (`conventions.md`, "Config-Driven Design").
+  - **AC-04 is NOT covered by this gate.** "Training loss decreases over epochs on real
+    data" cannot be observed over a few hundred steps: under LR warmup both dev-host
+    probes showed loss *rising* (100 steps 26.23 -> 28.51; 400 steps 27.32 -> 29.15).
+    AC-04 is unchanged and stays outstanding until full training (BUILD_ORDER Phase 14).
+    The reduced gate no longer claims it.
+  - Dev-host measurement for the record (2026-09-17, after loss-functions REV-120): the
+    uncapped epoch is 30,447 steps at ~0.235 s/step ≈ 2.0 h, down from the 0.641 s/step /
+    ~5.5 h measured before the factored-`G_t` change.
+  - `tests/test_training.py::TestFewStepSmokeViaRunPretrain` is the in-suite form of this
+    gate: the same capped `run_pretrain` path against a subset of the real
+    `data/processed`. It runs on every `pytest` invocation and is kept.
+  - **RUN AND VERIFIED (2026-09-17):**
+        uv run python main.py --stage pretrain --model t-small --epochs 1 --max_steps 200
+    against the freshly re-preprocessed `data/processed` (REV-090a). 190.5 s wall, 7.2 GB
+    peak RSS, exit 0. All three criteria of the reduced gate hold, checked against the
+    artifacts rather than the console:
+    1. **Validation metrics computed** over the FULL 993,372-example validation split
+       against the stored `val_candidates.npy`: `val_ndcg@10=0.090022`,
+       `val_mrr@10=0.064059`, `val_recall@10=0.176741`, `val_precision@10=0.017674`.
+    2. **Checkpoint saved** — `outputs/checkpoints/t_small/best.pt` and `epoch_000.pt`,
+       both carrying the full FR-4 metadata set (best_epoch, best_val_{ndcg,mrr,recall,
+       precision}, seed, model_name, moe_variant, use_gradnorm, num_experts, config) plus
+       the GradNorm state.
+    3. **Log written** — `outputs/logs/pretrain_t_small.log` with every AC-07 field:
+       per-objective losses, all four validation metrics, LR and the four λ values.
+    Also produced, from a real run rather than a fixture:
+    `outputs/plots/gradnorm_lambda_trajectory_t_small.png` (rendered from the real
+    `gradnorm_t_small.jsonl`), the routing diagnostics JSON and its three plots.
+  - Two things a reader of that log should not misread:
+    - `lr=0.00000000` is correct, not a defect. `max_steps_per_epoch` also shrinks
+      `total_steps` (`training/pretrain.py:682-684`), so the capped run executes the
+      WHOLE schedule: warmup 0 -> 1e-3 over 20 steps, then cosine decay back to 0 at
+      step 200. The logged value is the schedule's endpoint.
+    - The saved λ values sum to 3.93, not 4. Contrastive was inactive on the final step
+      (`contrastive_interval`), and the three active λ sum to exactly 3.000000 — which is
+      AC-05's `sum(active) == num_active` holding, not violating.
 
 - [x] **T6.4: Negative pool reuse test** — Verify the negative pool is loaded from disk (not regenerated) on second run with same fingerprint. (AC-05)

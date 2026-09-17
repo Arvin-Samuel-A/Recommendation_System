@@ -120,3 +120,15 @@ All three variants (`none`, `mmoe`, `arv_mmoe`) are behind the same `MoELayer.fo
 - Parameter accounting: `count_router_parameters()` matches manual calculation
 - Conventional MMoE: verify gates are independent (no shared params between objectives)
 - Ablation B: `input_only` router has no objective embedding input dimension
+
+### D-dropout: one dropout realisation is shared across all four objectives (REV-079)
+
+`Expert` contains `nn.Dropout`, and FR-1 requires the K expert outputs to be computed
+**once** per forward pass and reused by every objective. A direct consequence is that all
+four objectives in a training step see the *same* dropout mask on the expert outputs; four
+independent forwards would each draw their own.
+
+This is correct and intended — the alternative contradicts FR-1 and G1 — but it must be
+stated when the Ablation D gradient-interference numbers are reported. Part of the measured
+inter-objective cosine similarity is attributable to the shared noise realisation rather
+than to genuine representational conflict between the objectives.

@@ -38,7 +38,8 @@ The pretraining loop must correctly orchestrate: masked input preparation, trans
 - Per epoch: `epoch_{N:03d}.pt`; best: `best.pt`
 
 ### FR-3: Checkpoint Format (Step 15.3)
-- Contains: epoch, model_state_dict (including MoE + GradNorm log_lambdas), optimizer_state_dict, scheduler_state_dict, gradnorm_state_dict, val_ndcg, val_mrr, val_recall, val_precision, config
+- Contains: epoch, model_state_dict, moe_state_dict, loss_fns_state_dict, optimizer_state_dict, scheduler_state_dict, gradnorm_state_dict (holding log_lambdas, its optimizer state and initial_losses), val_ndcg, val_mrr, val_recall, val_precision, config
+  - *(REV-126, owner 2026-09-17: MoE and GradNorm state are sibling top-level keys, not nested inside `model_state_dict` as this line previously implied. The MoE is a separate module and GradNorm's Adam state has no place in a model state dict, so the three-key layout is correct; the wording was wrong.)*
 - Best checkpoint metadata: best_epoch, best_val_ndcg, best_val_mrr, best_val_recall, best_val_precision, seed, model_name, moe_variant, use_gradnorm, num_experts
 
 ### FR-4: Best Checkpoint Selection (Step 15.3.1)

@@ -4,7 +4,7 @@ Ordered tasks. Depends on all other specs. This is the final integration layer.
 
 ## Phase 1: CLI Entrypoint
 
-- [x] **T1.1: Implement argument parsing in `main.py`** — All stages: preprocess, pretrain, personalize, federated, evaluate, cold_start, longtail, latency, routing_diagnostics, gradient_diagnostics, ablation, plots, all. Model: `--model {t-small|t-base|t-large}`. Overrides: `--epochs`, `--batch_size`, `--moe_variant`, `--num_experts`, `--use_gradnorm`/`--no_gradnorm`, `--study`. (FR-1)
+- [x] **T1.1: Implement argument parsing in `main.py`** — All stages: preprocess, pretrain, personalize, federated, evaluate, cold_start, longtail, latency, routing_diagnostics, gradient_diagnostics, ablation, plots, all. Model: `--model {t-small|t-base|t-large}`. Overrides: `--epochs`, `--batch_size`, `--moe_variant`, `--num_experts`, `--use_gradnorm`/`--no_gradnorm`, `--study`, `--no_train` (ablations: evaluate existing per-arm checkpoints instead of training each one — REV-115). (FR-1)
 
 - [x] **T1.2: Implement CLI override logic** — Apply `--epochs`, `--batch_size`, `--moe_variant`, `--num_experts`, `--use_gradnorm` to Config. Log original vs new values for each override. Map `--epochs` to `pretrain_epochs` for pretrain stage and `federated_rounds` for federated stage. (FR-1, AC-05)
 
@@ -16,7 +16,7 @@ Ordered tasks. Depends on all other specs. This is the final integration layer.
 
 - [x] **T2.1: Implement study config resolution in `training/ablation_runner.py`** — Define `STUDY_CONFIGS` dict mapping study letter to list of config override dicts. Each study's configs are complete and explicit. `resolve_study_configs(study, base_config)` returns list of fully resolved Config instances. (FR-5)
 
-- [x] **T2.2: Implement Ablation A — Architecture Progression** — 6 configs: (1) single-objective baseline, (2) 4-objective no routing, (3) conventional MMoE, (4) ARV-MMoE, (5) ARV-MMoE+GradNorm, (6) federated ARV-MMoE+GradNorm+LoRA. Train and evaluate each. Save `outputs/ablations/A_{model}.json`. Generate `outputs/plots/architecture_progression.png`. (FR-6, AC-07)
+- [x] **T2.2: Implement Ablation A — Architecture Progression** — 6 configs: (1) single-objective baseline, (2) 4-objective no routing, (3) conventional MMoE, (4) ARV-MMoE, (5) ARV-MMoE+GradNorm, (6) federated ARV-MMoE+GradNorm+LoRA. Train and evaluate each. Save `outputs/ablations/A_{model}.json`. Generate `outputs/plots/architecture_progression.png`. (FR-6, AC-07) **REV-100 fixed:** arm 6 carries `system_eval="communication"`, so it routes into `run_federated` rather than running single-machine LoRA under a federated label; verified by `tests/test_cli.py::TestAblationStudyConfigs::test_study_A_final_arm_is_federated` and by the fingerprint test that keeps it sharing arm 5's backbone. Like every other T2.x, the end-to-end study run is still pending behind training-pipeline REV-106.
 
 - [x] **T2.3: Implement Ablation B — Routing Formulation** — 2 configs: `objective_conditioned` vs `input_only`. Both `arv_mmoe`, same K and seed. Save JSON + routing diagnostics for both. (FR-7, AC-07)
 
@@ -36,7 +36,7 @@ Ordered tasks. Depends on all other specs. This is the final integration layer.
 
 ## Phase 3: Plot Generation
 
-- [x] **T3.1: Implement `--stage plots` in `main.py`** — Collect results from completed evaluations. Generate all core tradeoff plots: accuracy_vs_model_size, accuracy_vs_communication, accuracy_vs_flops, personalization_gain_vs_lora_rank. (FR-14, AC-09)
+- [x] **T3.1: Implement `--stage plots` in `main.py`** — Collect results from completed evaluations. Generate all core tradeoff plots: accuracy_vs_model_size, accuracy_vs_communication, accuracy_vs_flops, personalization_gain_vs_lora_rank. (FR-14, AC-09) **REV-101 fixed:** `accuracy_vs_model_size` plots `model_size_bf16_mb` against "Model size (MB, BF16)" and `accuracy_vs_communication` plots the per-round `total_round_kb` against "Communication per round (KB)", so both axes now carry the quantity FR-14 names.
 
 - [x] **T3.2: Implement multi-seed aggregation** — For final paper runs: iterate `config.final_seeds`, execute pipeline per seed in independent output directory, aggregate results (mean ± std across seeds). Include exact seed list in final results. (FR-15, AC-08)
 

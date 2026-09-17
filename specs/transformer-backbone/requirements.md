@@ -6,12 +6,12 @@ Implement the Transformer sequential recommendation backbone with three model si
 
 ## Problem Statement
 
-The backbone must produce both pooled representations (for next-item prediction and routing) and full sequence hidden states (for MIM and multi-step objectives). It must support hardware-specific attention backends (FlexAttention on MPS, FlashAttention-4 on CUDA) without silent fallback, and integrate optional item metadata without changing the evaluation protocol.
+The backbone must produce both pooled representations (for next-item prediction and routing) and full sequence hidden states (for MIM and multi-step objectives). It must support hardware-specific attention backends (SDPA on MPS/CPU, FlashAttention-4 on CUDA) without silent fallback, and integrate optional item metadata without changing the evaluation protocol.
 
 ## Goals
 
 - G1: Pre-LN Transformer with three size variants (T-Small, T-Base, T-Large)
-- G2: Hardware-aware attention backends with startup self-tests and no silent fallback
+- G2: Hardware-aware attention backends (SDPA on MPS/CPU, FA4 on CUDA) with startup self-tests and no silent fallback
 - G3: Correct causal mask + padding validity for left-padded sequences
 - G4: Dual output mode: pooled final representation or full sequence hidden states
 - G5: Optional metadata integration via linear projection
@@ -21,7 +21,8 @@ The backbone must produce both pooled representations (for next-item prediction 
 ## Non-Goals
 
 - Implementing a general-purpose Transformer library
-- Supporting attention backends beyond FlexAttention and FlashAttention-4
+- Supporting attention backends beyond SDPA and FlashAttention-4
+- FlexAttention support of any kind (see FR-4 rationale)
 - Sinusoidal positional embeddings
 
 ## Functional Requirements
@@ -45,12 +46,20 @@ The backbone must produce both pooled representations (for next-item prediction 
 - Validate `hidden_dim % heads == 0`
 
 ### FR-4: Attention Backends
-- MPS → FlexAttention (official PyTorch integration)
+- Sanctioned backends are exactly two: `sdpa` and `flash_attention_4`. `flex_attention` must not be accepted as a configuration value.
+- MPS/CPU → SDPA (`torch.nn.functional.scaled_dot_product_attention`) — this is the sanctioned local/dev training kernel, not a degraded fallback
 - CUDA/H100 → FlashAttention-4 (compatible package)
 - `attention_backend="auto"` resolves by detected hardware
 - Dedicated attention wrapper that changes only the backend, not the mathematical operation
-- Startup self-test before any training — fail fast on failure
+- Startup self-test before any training, exercising **forward and backward** — fail fast on failure
+- An explicitly requested backend that cannot execute raises; `require_attention_backend=True` also forbids substituting for an unavailable `"auto"` preference
 - Record resolved backend in run manifest
+
+**Rationale (REV-062, owner decision):** FlexAttention has no backward implementation on
+MPS in the pinned PyTorch build, so it cannot train on the project's declared dev host.
+Rather than pin a speculative PyTorch build, SDPA is sanctioned as the MPS/CPU kernel.
+SDPA computes the same attention function, supports causal and additive key masks, and
+trains on MPS. The H100 path is unchanged.
 
 ### FR-5: Masking
 - Causal mask: future positions cannot contribute
@@ -95,16 +104,17 @@ The backbone must produce both pooled representations (for next-item prediction 
 
 - `configs/config.py` for all model parameters
 - `utils.py` for `get_device()`, `resolve_dtype()`
-- FlexAttention: PyTorch native (MPS)
+- SDPA: PyTorch native (`torch.nn.functional.scaled_dot_product_attention`) — MPS/CPU
 - FlashAttention-4: external package (CUDA only)
 
 ## Acceptance Criteria
 
 - **AC-01:** T-Small/T-Base/T-Large produce correct output shapes for both `return_all_hidden` modes
-- **AC-02:** FlexAttention self-test passes on MPS before MPS training
+- **AC-02:** SDPA self-test (forward + backward) passes on MPS before MPS training, and `attention_backend="auto"` on MPS resolves to `sdpa` with no fallback reason recorded
 - **AC-03:** FlashAttention-4 self-test passes on H100 before CUDA training
 - **AC-04:** Causal mask prevents future attention; padding positions contribute nothing
 - **AC-05:** Item embedding weight is the same object used as output projection (tied weights verified by identity)
 - **AC-06:** With `use_metadata=True`, metadata projection adds to input; with `False`, output is identical regardless of metadata tensor
 - **AC-07:** L2 normalization bounds dot-product scores to [-1, 1] when `normalize_embeddings=True`
 - **AC-08:** All parameters and computation are BF16; no silent dtype changes
+- **AC-09:** `attention_backend="flex_attention"` is rejected by config validation with a message naming only the supported choices, and no FlexAttention code path remains reachable

@@ -28,7 +28,7 @@ Ordered tasks. Depends on training-pipeline (pretrained checkpoints) and all mod
 
 - [x] **T3.2: Implement per-user training function** — Construct optimizer with LoRA params only (AdamW, lr=lora_lr, weight_decay=0). Train using `train_user_history` for negatives. Assert trainable backbone params == 0 before training. (FR-2, FR-3)
 
-- [x] **T3.3: Implement personalization report** — Save `outputs/logs/personalization_gain_{model}.json` with: num_users_evaluated, num_skipped, with_lora stats, without_lora stats, gain stats, per_user_gains array. (FR-4)
+- [x] **T3.3: Implement personalization report** — Save `outputs/logs/personalization_gain_{model}.json` with: num_users_evaluated, num_users_skipped, with_lora stats, without_lora stats, gain stats, per_user_gains array. (FR-4)
 
 - [x] **T3.4: Implement personalization plots** — Histogram: `personalization_gain_histogram_{model}.png` with vertical lines at x=0 and mean. Scatter: `global_vs_personalized_{model}.png` with y=x diagonal. (FR-4)
 
@@ -42,7 +42,7 @@ Ordered tasks. Depends on training-pipeline (pretrained checkpoints) and all mod
 
 - [x] **T4.4: Implement communication cost logging** — Per round: `upload_kb = lora_params * 2 / 1024`, `download_kb` same, `total_round_kb`. Log to `outputs/logs/federated_rounds_{model}.json`. (FR-7, AC-07)
 
-- [x] **T4.5: Implement federated convergence plot** — `outputs/plots/federated_convergence_{model}.png`: val NDCG@10 vs round, dashed baseline. (FR-8)
+- [x] **T4.5: Implement federated convergence plot** — `outputs/plots/federated_convergence_{model}.png`: val NDCG@10 vs round, dashed baseline. (FR-8) **REV-117 fixed:** every round — the final one included — is now scored on the same bounded `federated_eval_examples` prefix, so the plotted series is one population end to end; the final round additionally runs the full split into `val_ndcg_full`, which is what `final_val_ndcg` and `accuracy_vs_communication` quote. `test_scores_stored_candidates_and_bounds_each_round` asserts every plotted point came from the same number of examples.
 
 ## Phase 5: Testing
 

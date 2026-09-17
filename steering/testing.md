@@ -6,7 +6,7 @@ Full MovieLens-20M training is forbidden until ALL of the following pass:
 1. Unit tests
 2. Integration tests
 3. One-batch smoke tests
-4. One-epoch T-Small smoke tests
+4. Few-step T-Small smoke test on real data
 
 ## Required Test Progression (Implementation Order)
 
@@ -19,7 +19,7 @@ Full MovieLens-20M training is forbidden until ALL of the following pass:
 | 5 | Sequence, left-padding, multi-step indexing tests | Model training |
 | 6 | Global negative-pool construction and candidate-set tests | Training |
 | 7 | Pre-tensorised dataset / DataLoader tests | Training |
-| 8 | Transformer + MPS FlexAttention self-test | Training |
+| 8 | Transformer + MPS SDPA self-test (forward + backward) | Training |
 | 9 | Transformer baseline one-batch smoke test | Multi-epoch training |
 | 10 | Loss-function unit tests (all four + GradNorm) | Training |
 | 11 | ARV-MMoE / conventional MMoE shape and sharing tests | MoE training |
@@ -28,7 +28,7 @@ Full MovieLens-20M training is forbidden until ALL of the following pass:
 | 14 | Evaluation metric toy tests (NDCG, MRR, Recall, Precision) | Evaluation |
 | 15 | ANN target force-inclusion toy test | ANN evaluation |
 | 16 | One-batch end-to-end smoke test on Mac | Full training |
-| 17 | One-epoch T-Small smoke test on Mac | Full training |
+| 17 | Few-step T-Small smoke test on Mac, on real data | Full training |
 | 18 | H100 environment + FlashAttention-4 self-test | H100 training |
 
 ## What Each Test Category Verifies
@@ -52,7 +52,22 @@ Full MovieLens-20M training is forbidden until ALL of the following pass:
 
 **Smoke tests:** Real data, minimal scale:
 - One-batch: single batch through full pipeline, loss is finite and decreasing
-- One-epoch T-Small: full epoch on real MovieLens data, metrics are computed
+- Few-step T-Small: a capped run of `run_pretrain` on real MovieLens data
+  (`--max_steps N`, a few hundred steps), which must complete the epoch loop, compute
+  validation metrics, save a checkpoint and write the per-epoch log
+
+**Owner decision (2026-09-17):** Phase 17 was previously "one-epoch T-Small: full epoch on
+real MovieLens data". The full epoch is 30,447 steps (~2 h measured on the dev host) and
+what it actually gates is that `run_pretrain` works end to end on real data, which a few
+hundred steps establishes at the same confidence. REV-066 correctly refused to let BUILD
+relax this gate on its own; this change is the spec owner's, made deliberately and
+recorded here so the next review reads it as such and not as a repeat of REV-066.
+
+**What the few-step gate does NOT establish:** training-pipeline AC-04 ("training loss
+decreases over epochs on real data"). Under LR warmup a short window shows loss *rising*
+(measured: 100 steps 26.23 -> 28.51; 400 steps 27.32 -> 29.15), so AC-04 is only
+observable over a real multi-epoch run and remains outstanding until full training. AC-04
+is unchanged; the gate no longer claims to cover it.
 
 ## Critical Assertions (Runtime)
 

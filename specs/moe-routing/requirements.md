@@ -57,7 +57,8 @@ Multi-objective training causes gradient interference between objectives sharing
 
 ### FR-6: Parameter Accounting
 - `count_router_parameters(config)` returns: mmoe_gate_params, arv_router_params, arv_objective_embedding_params, arv_total_router_params, difference
-- Log to `outputs/logs/moe_parameter_report_{model}.json` for every `moe_variant` run
+- Log to `outputs/logs/moe_parameter_report_{model}_{run_tag}.json` for every `moe_variant` run. When no run tag is supplied the suffix carries the distinguishing fields instead: `{model}_{moe_variant}_K{K}_{router_conditioning}` (plus `_mmoeK{K}` when `match_mmoe_expert_count=False`)
+  - *(REV-104, owner 2026-09-17: the path was previously `{model}.json` alone. Ablation C runs mmoe and arv_mmoe at one size and Ablation G sweeps four expert counts at one size, so every arm overwrote a single file and only the last survived — including the report that is supposed to back C's parameter-matched claim.)*
 - When `match_mmoe_expert_count=True` (default), K is identical across mmoe and arv_mmoe
 - Never claim "parameter-matched" without the report backing it
 
@@ -79,7 +80,8 @@ Multi-objective training causes gradient interference between objectives sharing
 ### FR-10: Per-Objective Head Consumption
 - Next-item head: `Z_{u,next}[:, last_pos, :]`
 - MIM head: `Z_{u,mim}` at all masked positions
-- Multi-step head: `Z_{u,forecast}` at causal positions `S-1-step`
+- Multi-step head: `Z_{u,forecast}[:, S-1, :]` — the same last position for every step
+  - *(REV-105, owner 2026-09-17: was `S-1-step`. See `specs/loss-functions` FR-3: all k horizon heads now read one fixed context representation.)*
 - Contrastive head: `Z_{u,contrast}[:, last_pos, :]`, L2-normalized
 
 ## Edge Cases

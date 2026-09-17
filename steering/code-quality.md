@@ -14,10 +14,12 @@
 
 ## Attention Backend Discipline
 
-- MPS → FlexAttention. CUDA/H100 → FlashAttention-4. `"auto"` resolves by hardware.
-- Each backend must pass a startup self-test before training.
+- MPS/CPU → SDPA (`F.scaled_dot_product_attention`). CUDA/H100 → FlashAttention-4. `"auto"` resolves by hardware.
+- SDPA is the sanctioned local/dev kernel, not a fallback. FlexAttention is not a supported backend in this project: it cannot run a backward pass on MPS in the pinned PyTorch build, so it can never satisfy the training gates on the dev host.
+- Each backend must pass a startup self-test — forward **and** backward — before training.
 - Final H100 run must fail fast if FA4 cannot initialize — no silent fallback.
-- MPS smoke test must fail fast if FlexAttention cannot execute — no silent fallback.
+- MPS smoke test must fail fast if SDPA cannot execute — no silent fallback.
+- "No silent fallback" is about *honesty of the manifest*, not about kernel preference: the backend that actually ran is the backend that gets recorded, and `require_attention_backend=True` turns any substitution into a hard failure.
 - Record PyTorch version, device, dtype, and resolved attention backend in every run manifest.
 
 ## Configuration as Single Source of Truth

@@ -90,7 +90,8 @@ The research project requires 8 ablation studies (A–H), each comparing multipl
 ### FR-13: Ablation H — System-Level
 - H1: Metadata ON/OFF
 - H2: Sequence length sweep over `sequence_length_grid`
-- H3: Cold-start ratio / metadata ON vs OFF
+- H3: Cold-start evaluation, metadata ON vs OFF, on the held-out cold-item split
+  - *(REV-116, owner 2026-09-17: this previously read "Cold-start ratio / metadata ON vs OFF". `cold_start_ratio` is a preprocessing-time parameter baked into `data/processed/`, so sweeping it means re-running `--stage preprocess` per arm — measured at 108 s and 11 GB peak RSS per run — not a config change at training time. A ratio sweep is a separate, multi-preprocessing-run experiment and is out of scope for H3.)*
 - H4: Long-tail with training-derived popularity buckets
 - H5: Latency with Step 21 benchmark
 - H6: Communication cost with Step 17 config

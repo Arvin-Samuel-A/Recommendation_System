@@ -11,7 +11,7 @@ ARV-MMoE is a communication-efficient multi-objective federated sequential recom
 - **Environment manager:** `uv venv` only (no conda, no `python -m venv`)
 - **Dtype:** BF16 everywhere (`torch.bfloat16`) — no FP16 autocast, no GradScaler
 - **Dataset:** MovieLens-20M via Kaggle API
-- **Dev hardware:** Apple Silicon Mac (MPS, FlexAttention)
+- **Dev hardware:** Apple Silicon Mac (MPS, SDPA)
 - **Prod hardware:** NVIDIA H100 (CUDA, FlashAttention-4)
 
 ## Component Map

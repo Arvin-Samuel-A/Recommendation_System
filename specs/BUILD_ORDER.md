@@ -80,7 +80,7 @@ The canonical implementation sequence. Each step maps to specific spec tasks and
 
 | # | Step | Spec Tasks | Produces |
 |---|---|---|---|
-| 4.1 | Attention backend wrapper + self-test | `transformer-backbone T1.1` | `AttentionBackend` with FlexAttention/FA4 |
+| 4.1 | Attention backend wrapper + self-test | `transformer-backbone T1.1, T1.3, T1.4` | `AttentionBackend` with SDPA/FA4 |
 | 4.2 | Test attention backends | `transformer-backbone T1.2` | Causal + padding mask verified |
 | 4.3 | Embedding layer (item + position + tied output) | `transformer-backbone T2.1` | Embedding modules |
 | 4.4 | Metadata projection | `transformer-backbone T2.2` | Optional linear projection |
@@ -89,7 +89,7 @@ The canonical implementation sequence. Each step maps to specific spec tasks and
 | 4.7 | Shape + tied weight + BF16 tests | `transformer-backbone T4.1–T4.5` | All model shapes and invariants verified |
 
 ```
-🧪 GATE: Transformer + MPS FlexAttention self-test passes
+🧪 GATE: Transformer + MPS SDPA self-test passes (forward + backward)
 ```
 
 ---
@@ -196,10 +196,10 @@ The canonical implementation sequence. Each step maps to specific spec tasks and
 | # | Step | Spec Tasks | Produces |
 |---|---|---|---|
 | 11.1 | One-batch end-to-end smoke test on Mac | `training-pipeline T6.2` | Full pipeline: data → model → MoE → losses → GradNorm → backward → step |
-| 11.2 | One-epoch T-Small smoke test on Mac | `training-pipeline T6.3` | Full epoch on real MovieLens data, metrics computed |
+| 11.2 | Few-step T-Small smoke test on Mac | `training-pipeline T6.3` | Capped run of `run_pretrain` on real MovieLens data (`--max_steps N`): validation metrics computed, checkpoint saved, log written |
 
 ```
-🧪 GATE: One-batch AND one-epoch T-Small smoke tests pass
+🧪 GATE: One-batch AND few-step T-Small (real data) smoke tests pass
 ⛔ BLOCKED: Full MovieLens-20M training is FORBIDDEN until this gate passes
 ```
 
@@ -347,14 +347,14 @@ The canonical implementation sequence. Each step maps to specific spec tasks and
 | 1 | Dataset acquisition | 6 CSVs present and valid |
 | 2 | Preprocessing (ratings, splits, cold-start, metadata) | Split/cold-start/metadata unit tests |
 | 3 | Sequences, augmentation, negative pool | Sequence/pool/candidate tests |
-| 4 | Transformer backbone | FlexAttention self-test |
+| 4 | Transformer backbone | SDPA self-test |
 | 5 | Transformer smoke test | One-batch forward+backward |
 | 6 | Loss functions | All loss unit tests |
 | 7 | ARV-MMoE + conventional MMoE | MoE shape/sharing tests |
 | 8 | GradNorm | Lambda/anchor/active-only tests |
 | 9 | LoRA | Key-filtering/freeze tests |
 | 10 | Evaluation metrics | Metric toy tests |
-| 11 | **End-to-end smoke tests** | **One-batch + one-epoch T-Small** |
+| 11 | **End-to-end smoke tests** | **One-batch + few-step T-Small on real data** |
 | 12 | Training pipeline | Checkpoint roundtrip |
 | 13 | H100 validation (if CUDA) | FA4 self-test |
 | 14 | Full central pretraining | Val NDCG improving |
@@ -367,4 +367,13 @@ The canonical implementation sequence. Each step maps to specific spec tasks and
 | 21 | Multi-seed final runs | 3 independent seeds aggregated |
 | 22 | Final plots + deliverables | All outputs present |
 
-**Critical blocking gate:** Phase 11 (end-to-end smoke tests). Full MovieLens-20M training is **forbidden** until both the one-batch and one-epoch T-Small smoke tests pass.
+**Critical blocking gate:** Phase 11 (end-to-end smoke tests). Full MovieLens-20M training is **forbidden** until both the one-batch and few-step T-Small smoke tests pass.
+
+> **Owner decision (2026-09-17):** step 11.2 was "one-epoch T-Small smoke test ... full epoch
+> on real MovieLens data". A full epoch is 30,447 steps (~2 h measured on the dev host);
+> what the gate exists to establish — that `run_pretrain` works end to end on real data,
+> computes validation metrics, checkpoints and logs — is established by a few hundred
+> steps. REV-066 was right to refuse this relaxation when BUILD proposed it; this one is
+> the spec owner's. Note that training-pipeline **AC-04 ("training loss decreases over
+> epochs on real data") is NOT covered by the reduced gate** — LR warmup makes any short
+> window uninformative — and stays outstanding until full training in Phase 14.

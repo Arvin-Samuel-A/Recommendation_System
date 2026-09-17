@@ -2,220 +2,291 @@
 
 ## Review Status
 
-**CHANGES_REQUIRED**
+**PASS_WITH_WARNINGS**
+
+(Up from `CHANGES_REQUIRED`. REV-106, the MEDIUM finding that blocked this spec, is
+resolved: `run_pretrain` has now been executed at real scale and its artifacts verified.
+One LOW finding remains open, plus AC-04, which the spec owner has explicitly deferred to
+full training.)
 
 ## Feature
 
-`specs/training-pipeline` — `training/pretrain.py`: LR scheduling, model construction, the four-objective forward path, GradNorm integration, checkpointing, per-epoch logging, validation, and `run_pretrain`.
+`specs/training-pipeline` — `training/pretrain.py`: LR scheduler, model construction,
+training loop over all four objectives, contrastive interval gating, validation,
+checkpointing and best selection, per-epoch and GradNorm logging, `run_pretrain`
+orchestration, runtime safety assertions.
 
 ## Review Scope
 
-- Spec directory: `specs/training-pipeline/` (requirements.md, design.md, tasks.md)
-- Steering: `steering/architecture.md`, `code-quality.md`, `conventions.md`, `testing.md`, `specs/BUILD_ORDER.md`
-- Baseline: working tree vs `HEAD` = `32b0904` on `master` (`origin/master` at the same commit). All feature work is uncommitted.
-- Files inspected: `training/pretrain.py` (904 lines, modified), `training/gradnorm.py`, `training/losses.py`, `data/sequence_generator.py`, `evaluation/metrics.py`, `tests/test_training.py` (592 lines, modified), `tests/test_smoke.py`
-- Re-review of the prior `review.md`. `pretrain.py` (21:45), `tests/test_training.py` (21:59) and `tests/test_smoke.py` (21:59) were all modified after it.
-- Date: 2026-09-15
+- Spec directory: `specs/training-pipeline/` — `requirements.md` and `design.md`
+  unmodified; **`tasks.md` heavily amended (`+90/-27`)**, carrying the owner's Phase 17
+  decision and BUILD's run record for T6.2 and T6.3.
+- Steering: `steering/testing.md` (**amended by the owner: Phase 17 reduced from a full
+  epoch to a few-step capped run, with a dated rationale**), `code-quality.md`,
+  `architecture.md`, `conventions.md`.
+- Baseline: working tree vs `HEAD` = `d438950` on `master`; `origin/master` at the same
+  commit. 38 tracked files modified, no untracked files.
+- Files inspected: `training/pretrain.py` (modified), `main.py` (modified),
+  `tests/test_training.py` (modified `+26`), `tests/test_smoke.py` (modified `+15`),
+  `configs/config.py`.
+- The real run artifacts under `outputs/` were loaded and measured directly — the
+  checkpoint was opened and its keys enumerated, the log read, the λ arithmetic redone.
+- Re-review. Prior findings carried in: REV-062 (RESOLVED, cross-ref), REV-106 (MEDIUM,
+  OPEN), REV-107 (RESOLVED), REV-108 (LOW, OPEN), REV-092 (cross-ref, superseded).
+- Date: 2026-09-17
 
 ## Summary
 
-Three of the four prior CRITICAL/HIGH findings are genuinely fixed, and I verified each rather than trusting the inline comments. REV-057 (GradNorm leaking second-order gradients into the anchor) is closed — instrumenting a real step shows **zero** model parameters have their `.grad` altered by `gradnorm.update()`. REV-058 (the 60 GB dense metadata block) is closed — `RecDataset` holds the 3.2 MB `(vocab, F)` matrix and gathers per item. REV-059 (the MIM metadata leak) is closed — `mask_metadata` zeroes the metadata rows at masked positions and three tests cover it. REV-063 (one forward per example at validation) is closed — `evaluate_model` batches at `eval_batch_size`. REV-066 is closed: `requirements.md`, `steering/testing.md` and `BUILD_ORDER.md` all carry their committed wording again, and T6.2/T6.3 are correctly left unchecked.
+REV-106 is closed. Two things happened, and it matters that they are distinguished.
 
-What blocks acceptance is not this spec's own code. `uv run python -m pytest` fails two tests, both of them this spec's smoke gates, and both for the reason `specs/transformer-backbone` owns: FlexAttention has no backward pass on MPS, and BUILD correctly armed `require_attention_backend` rather than certifying SDPA silently. I confirmed the pipeline beneath is sound — with the requirement neutralised at runtime and no repository file touched, both gates pass. So AC-04 is not FAIL, it is NOT VERIFIABLE pending a spec decision.
+First, the **spec owner** reduced the Phase 17 gate from an uncapped one-epoch T-Small run
+to a few-step capped run on real data, recording the decision with its rationale and an
+explicit reference to REV-066 — the earlier episode where BUILD rewrote this same gate to
+fit what it had run. `steering/testing.md` now carries a dated owner decision saying
+exactly that: "REV-066 correctly refused to let BUILD relax this gate on its own; this
+change is the spec owner's". That is the right way to make this change, and it is the
+opposite of what REV-066 flagged.
+
+Second, **BUILD actually ran the reduced gate** and the artifacts exist. I verified them
+against disk rather than against the task note:
+`uv run python main.py --stage pretrain --model t-small --epochs 1 --max_steps 200`
+produced `outputs/checkpoints/t_small/{best.pt,epoch_000.pt}`,
+`outputs/logs/pretrain_t_small.log`, `gradnorm_t_small.jsonl`,
+`routing_diagnostics_t_small.json`, and six plots including
+`gradnorm_lambda_trajectory_t_small.png` — all dated 09-17 00:25–00:33, i.e. after the
+preprocess re-run that REV-106 required as its step (1). The four validation metrics in
+the log match the task note to six decimals (`val_ndcg@10=0.090022`,
+`mrr=0.064059`, `recall=0.176741`, `precision=0.017674`), and `best.pt` carries every
+field FR-3 lists, `config` included.
+
+I re-derived the two things the task note asks a reader not to misread, rather than
+accepting them. **`lr=0.00000000` is correct**: `training/pretrain.py:681-683` shrinks
+`num_batches_per_epoch` — and therefore `total_steps` — by `max_steps_per_epoch`, so a
+200-step run executes the entire warmup-plus-cosine schedule and lands on the schedule's
+zero endpoint. **The λ sum is correct**: the three active λ are 0.259607 + 1.430659 +
+1.309734 = exactly 3.000000 against `num_active = 3`, which is AC-05 holding; the 3.93
+total simply includes the inactive contrastive λ, which is excluded by design.
+
+What this run does **not** establish is AC-04. The owner's own amendment says so in
+`steering/testing.md`, with measurements: under LR warmup a short window shows loss
+*rising* (100 steps 26.23 → 28.51; 400 steps 27.32 → 29.15). AC-04 is unchanged and
+remains outstanding until full training. This is a sequencing fact, not a defect, and
+there is no BUILD action for it now — but it is why this spec is not a clean PASS.
 
 ## Git Changes
 
-| File | State |
+| File | Change |
 |---|---|
-| `training/pretrain.py` | modified (+~770 lines vs `32b0904`) |
-| `training/gradnorm.py`, `training/losses.py` | modified (reviewed under `specs/loss-functions`) |
-| `data/sequence_generator.py` | modified (reviewed under `specs/data-pipeline`) |
-| `evaluation/metrics.py` | modified (reviewed under `specs/evaluation-diagnostics`) |
-| `tests/test_training.py`, `tests/test_smoke.py` | modified |
-| `specs/training-pipeline/tasks.md` | modified — BUILD notes on T6.2/T6.3 |
-| `specs/training-pipeline/review.md` | untracked (this file) |
+| `training/pretrain.py` | `+15`: `probe_double_backward` call site removed (loss-functions T3.6) |
+| `main.py` | `+52`: `--max_steps` added to `parse_args` with override logging |
+| `tests/test_training.py` | `+26`: few-step smoke gate updates, SDPA comment sync |
+| `tests/test_smoke.py` | `+15`: **comment-only** — verified; `require_attention_backend = True` preserved |
+| `specs/training-pipeline/tasks.md` | `+90/-27`: owner's Phase 17 decision, T6.2/T6.3 run records |
+| `steering/testing.md` | owner's Phase 17 amendment |
 
-`specs/training-pipeline/requirements.md`, `steering/testing.md` and `specs/BUILD_ORDER.md` show **no** modification against `32b0904` — the REV-066 reverts landed.
-
-**Scope assessment:** in scope. No new dependencies. `outputs/checkpoints/` is empty, so nothing trained has been committed or left behind.
+**Scope assessment:** proportionate. `--max_steps` is a genuine requirement of the reduced
+gate — `conventions.md` forbids editing source to run it — and it is implemented as a CLI
+override that logs the original and new value, which is what `code-quality.md` asks for.
+Nothing unexpected is touched.
 
 ## Specification Coverage
 
 | Requirement | Status | Evidence |
 |---|---|---|
-| FR-1 LR scheduler | PASS | `build_scheduler` ([pretrain.py:48](training/pretrain.py:48)) is linear warmup over `warmup_ratio * total_steps` then cosine to 0; `total_steps = num_batches_per_epoch * pretrain_epochs`; `scheduler.step()` is called once per batch inside `train_one_step` ([:320](training/pretrain.py:320)); `log_epoch` records `lr=`. |
-| FR-2 Per-model checkpoint dirs | PASS | `Config.model_checkpoint_dir()` → `outputs/checkpoints/{t_small\|t_base\|t_large}/`; `epoch_{N:03d}.pt` and `best.pt` written at [:866](training/pretrain.py:866) and [:876](training/pretrain.py:876). |
-| FR-3 Checkpoint format | PASS | `save_checkpoint` ([:68](training/pretrain.py:68)) stores epoch, model/moe/optimizer/scheduler/gradnorm state, all four val metrics and `config`; `is_best=True` adds the full named metadata block (best_epoch, four best metrics, seed, model_name, moe_variant, use_gradnorm, num_experts). MoE and GradNorm state live in sibling keys rather than inside `model_state_dict` — functionally equivalent, and `load_checkpoint` restores all of it. `loss_fns_state_dict` additionally preserves the `MultiStepLoss` projections (REV-047). |
-| FR-4 Best checkpoint selection | PASS | `if val_ndcg > best_val_ndcg` at [:873](training/pretrain.py:873) — strict improvement on validation NDCG@10 only. No test split is loaded anywhere in `run_pretrain`; the only datasets opened are `train_tensorised.pt` and `val_tensorised.pt`. |
-| FR-5 Training loop | PASS | Negative pool loaded once outside the epoch loop ([:713](training/pretrain.py:713)) and never rebuilt; masking applied before the forward pass; contrastive second forward gated on `batch_idx % contrastive_interval`; all four losses combined per §7; `log_epoch` writes every required field to `outputs/logs/pretrain_{model}.log`. |
-| FR-6 ARV-MMoE + GradNorm forward path | PASS | `train_one_step` ([:145](training/pretrain.py:145)) follows the sequence exactly: `return_all_hidden=True` → `pooled = all_hidden[:, -1, :]` (the last non-pad position under left padding) → per-objective MoE forward → per-objective loss → routing snapshots buffered → weighted sum → `backward(retain_graph=gradnorm is not None)` → `gradnorm.update` → `clip_grad_norm_` → `optimizer.step` → `scheduler.step`. |
-| FR-7 BF16 training | PASS | `assert_bf16_params` before the loop; per-step dtype assertions on `all_hidden` and on each loss (with the documented fp32 InfoNCE exception); `zero_grad(set_to_none=True)` at [:299](training/pretrain.py:299) and [:695](training/pretrain.py:695); finite assertions on losses, total, gradients and lambdas. No autocast, no GradScaler. |
-| FR-8 Validation | PASS | `evaluate_model` runs after every epoch under `no_grad` in eval mode ([:847-853](training/pretrain.py:847)) against the pre-stored `val_candidates.npy`, which was built from `eval_user_history` at preprocessing time. All four metrics reported. |
-| FR-9 GradNorm lambda logging | PASS | `log_gradnorm_lambdas` every 100 steps to `outputs/logs/gradnorm_{model}.jsonl` (stale file removed at start of run, [:776](training/pretrain.py:776)); `plot_gradnorm_trajectory` writes `gradnorm_lambda_trajectory_{model}.png` at 150 DPI after the last epoch. |
+| FR-1 LR scheduler | PASS | Linear warmup then cosine decay; `scheduler.step()` at `pretrain.py:322`, inside `train_one_step` — per batch, not per epoch; LR logged per epoch |
+| FR-2 Per-model checkpoint dirs | PASS | `outputs/checkpoints/t_small/` created by the run, holding `epoch_000.pt` and `best.pt` |
+| FR-3 Checkpoint format | PASS | Opened `best.pt` directly: all of `epoch`, `model_state_dict`, `optimizer_state_dict`, `scheduler_state_dict`, `gradnorm_state_dict`, `val_{ndcg,mrr,recall,precision}`, `config`, plus the full best-metadata set (`best_epoch`, `best_val_*`, `seed`, `model_name`, `moe_variant`, `use_gradnorm`, `num_experts`). MoE lives in a sibling `moe_state_dict` key rather than nested inside `model_state_dict`; functionally complete, see REV-126 |
+| FR-4 Best selection by val NDCG@10 | PASS | `pretrain.py:877` — strict `>` against `best_val_ndcg`, no other metric consulted; test data not loaded in this stage |
+| FR-5 Training loop | PASS | Pool loaded once, never regenerated; masking before forward; contrastive on interval batches; per-epoch log written to `outputs/logs/pretrain_t_small.log` with every listed field |
+| FR-6 ARV-MMoE + GradNorm forward path | PASS | Order verified line by line at `pretrain.py:301-322`: `zero_grad(set_to_none=True)` → `backward(retain_graph=(gradnorm is not None))` → `gradnorm.update` → gradient finiteness assertions → `clip_grad_norm_` → `optimizer.step()` → `scheduler.step()`. Routing snapshots accumulated at `:806` |
+| FR-7 BF16 training | PASS | `assert_bf16_params(model, moe)` before training; `set_to_none=True`; no autocast or GradScaler; per-parameter gradient finiteness assertion at `:314-317` |
+| FR-8 Validation | PASS | Post-epoch validation over the **full** 993,372-example split against the stored `val_candidates.npy`; `eval_user_history` used, not `train_user_history` |
+| FR-9 GradNorm λ logging | PASS | `outputs/logs/gradnorm_t_small.jsonl` written from the real run; `outputs/plots/gradnorm_lambda_trajectory_t_small.png` rendered from it |
 
 ## Acceptance Criteria
 
 | Criterion | Status | Evidence |
 |---|---|---|
-| AC-01 warmup→cosine, per-batch stepping | PASS | `TestLRScheduler::test_warmup_increases`, `test_cosine_reaches_near_zero`, `test_per_batch_stepping`. |
-| AC-02 best checkpoint by val NDCG only, no test data | PASS | Verified by inspection of `run_pretrain`: only train/val tensorised splits and `val_candidates.npy` are opened; selection compares `val_ndcg` alone. `TestFewStepSmokeViaRunPretrain` asserts a finite val NDCG is produced. |
-| AC-03 checkpoint roundtrip preserves state incl. GradNorm | PASS | `TestCheckpointRoundtrip::test_save_load_identical_output`. |
-| AC-04 training loss decreases over epochs on real data | NOT VERIFIABLE | The capped-step gate that would show it (`TestFewStepSmokeViaRunPretrain`, which asserts `last_window_loss < first_window_loss`) currently fails on the armed backend gate. With that requirement neutralised at runtime it **passes**, so the loss does decrease — but the uncapped one-epoch run `steering/testing.md` Phase 17 asks for has not been performed, `outputs/checkpoints/` is empty, and no `pretrain_*.log` exists. See REV-106. |
-| AC-05 pool loaded once, never regenerated | PASS | `TestNegativePoolReuse::test_run_pretrain_never_calls_build_once` monkeypatches `build_once` and asserts it is never reached; `test_round_trip_matches_recorded_fingerprint` and `test_tampered_pool_is_rejected` cover the fingerprint guard. |
-| AC-06 routing distributions accumulated, not discarded | PASS | `_append_routing_snapshots` buffers detached `(B, K)` CPU tensors under a 256-batch FIFO cap; `_emit_routing_diagnostics` consumes and clears at `routing_diag_interval_epochs`; `collect_validation_routing` runs the comprehensive end-of-training pass. |
-| AC-07 per-epoch log has all required fields | PASS | `log_epoch` ([:372](training/pretrain.py:372)) emits epoch, total and per-objective train losses, all four val metrics, lr, and per-objective lambdas. No real `pretrain_*.log` exists yet to inspect (AC-04). |
-| AC-08 all finite assertions hold throughout training | PARTIAL | The assertions are present and correctly placed — per-objective loss, total, every trainable gradient (REV-022c), and `assert_finite_step` on lambdas. But nothing tests that they actually fire on a NaN; see `specs/loss-functions` REV-091, which this AC depends on. |
+| AC-01 warmup→cosine, per-batch stepping | PASS | `scheduler.step()` inside `train_one_step`; `total_steps` correctly derived from `num_batches_per_epoch * pretrain_epochs`, with the `max_steps_per_epoch` cap applied to both — which is why the capped run's terminal `lr=0.0` is the schedule's endpoint, not a bug |
+| AC-02 best by val NDCG@10 only; no test data | PASS | Strict-improvement check on `val_ndcg` alone; the pretrain stage loads only train and val tensorised sets |
+| AC-03 checkpoint roundtrip preserves state incl. GradNorm | PASS | `gradnorm_state_dict` present with `log_lambdas`, `optimizer`, `initial_losses`; roundtrip test in `tests/test_training.py` |
+| **AC-04 training loss decreases over epochs on real data** | **NOT VERIFIABLE (outstanding)** | Explicitly not established by the reduced gate, and the owner's `steering/testing.md` amendment says so with measurements (loss *rises* under warmup at 100 and 400 steps). Requires the multi-epoch run at BUILD_ORDER Phase 14. Tracked as REV-125 |
+| AC-05 pool loaded once, never regenerated | PASS | Fingerprint-matched load; `tests/test_training.py` T6.4 reuse test; no per-epoch regeneration path exists |
+| AC-06 routing distributions accumulated | PASS | `routing_buffer` accumulated per step at `:806`, consumed by `_emit_routing_diagnostics` at `:868`, cleared only at `:895`. The real run produced `routing_diagnostics_t_small.json` and three routing plots |
+| AC-07 per-epoch log has all required fields | PASS | Verified against the real log line, not a fixture: `train_loss_total`, the four per-objective losses, all four validation metrics, `lr`, and all four λ values |
+| AC-08 finite assertions hold throughout | PASS | Total-loss assertion at `:298`, per-parameter gradient assertion at `:314-317`, plus `assert_finite_step`. A 200-step real run completed with exit 0 and no assertion firing |
 
 ## Findings
 
 ```
-REV-062 (cross-reference; owned by specs/transformer-backbone)
-Severity: HIGH | Status: OPEN | Requirement: FR-5 | AC: AC-04
-File: tests/test_smoke.py:30; tests/test_training.py:216; models/transformer.py:76-103
-Problem: Both of this spec's smoke gates arm `require_attention_backend = True` and both
-  FAIL on this host: "Preferred attention backend 'flex_attention' cannot execute on mps:
-  NotImplementedError: FlexAttention does not support backward on MPS."
-    tests/test_smoke.py::TestOneBatchEndToEnd::test_full_pipeline
-    tests/test_training.py::TestFewStepSmokeViaRunPretrain::test_few_steps_via_run_pretrain
-Impact: `steering/testing.md` Phases 16 and 17 cannot be signed off, so BUILD_ORDER Phase
-  11 cannot authorise full MovieLens training. The repository's test suite does not pass.
-Correction: Spec decision for the owner, tracked in full under
-  `specs/transformer-backbone/review.md`. Recorded here because the failing tests belong
-  to this spec's task list (T6.2, T6.3). Verified for the owner: with the backend
-  requirement neutralised at runtime -- via a scratch pytest plugin, no repository file
-  modified -- BOTH gates pass. Nothing in `run_pretrain` is broken. BUILD must not disarm
-  the flag or edit the spec to make the suite green.
+REV-106
+Severity: MEDIUM | Status: RESOLVED | Requirement: FR-5, FR-8 | AC: AC-07 (AC-04 carried to REV-125)
+File: outputs/checkpoints/, outputs/logs/, outputs/plots/
+Resolution: all three of the correction's ordered steps were performed.
+  (1) `--stage preprocess` was re-run against the current source -- verified independently
+      in the data-pipeline review this pass (artifacts 09-17 00:13-00:15; the three stale
+      facts all flipped).
+  (2) The Phase 17 gate was run against that fresh data. The gate itself was REDUCED by
+      the spec owner from an uncapped epoch to a capped few-step run, recorded with a
+      dated rationale in `steering/testing.md` and cross-referenced to REV-066. That is an
+      owner decision, correctly made and correctly attributed -- not the BUILD-side
+      relaxation REV-066 flagged. Checked specifically: the reduction is in the owner's
+      steering doc and BUILD_ORDER, not only in tasks.md.
+  (3) The artifacts exist and were verified against disk: `best.pt` + `epoch_000.pt` with
+      the full FR-3 key set, `pretrain_t_small.log` with every AC-07 field,
+      `gradnorm_t_small.jsonl`, `gradnorm_lambda_trajectory_t_small.png` rendered from
+      that real JSONL, `routing_diagnostics_t_small.json` and three routing plots. All
+      dated 09-17 00:25-00:33, after the preprocess re-run.
+  The two potential misreadings in the log were independently re-derived rather than
+  accepted: terminal `lr=0.0` follows from `max_steps_per_epoch` shrinking `total_steps`
+  (pretrain.py:681-683), and the 3.93 lambda total decomposes into exactly 3.000000 over
+  the three ACTIVE objectives, which is AC-05 holding.
+  AC-04 is NOT closed by this and is not claimed to be -- see REV-125.
 ```
 
 ```
-REV-106
-Severity: MEDIUM | Status: OPEN | Requirement: FR-5, FR-8 | AC: AC-04, AC-07
-File: outputs/ (empty checkpoints and no pretrain log); data/processed/ (artifact dates)
-Problem: `run_pretrain` has never been executed at real scale with the current code.
-  `outputs/checkpoints/` is empty, `outputs/logs/` holds only `run_config.json` and two
-  stray `moe_parameter_report_*.json` files, and there is no `pretrain_t_*.log`,
-  `gradnorm_t_*.jsonl` or `gradnorm_lambda_trajectory_*.png`. Separately, the artifacts in
-  `data/processed/` were written at 01:14-01:27 while `data/sequence_generator.py` and
-  `data/preprocessing.py` were last modified at 21:23-21:24, so even the inputs a real run
-  would consume are the previous revision's output (see data-pipeline REV-090).
-Impact: AC-04 ("training loss decreases over epochs on real data") and AC-07 ("per-epoch
-  log contains all required fields") have no artifact behind them. The capped few-step
-  gate is good evidence that the mechanics work, but it runs 1 epoch over a tiny synthetic
-  subset -- it cannot show multi-epoch behaviour, the cosine decay actually reaching its
-  tail, or the lambda trajectory plot rendering from a real JSONL.
-Correction: Sequenced behind REV-062, which currently blocks any sanctioned run. Once the
-  backend question is settled: re-run `--stage preprocess` so `data/processed/` matches the
-  current source, then run the uncapped one-epoch T-Small gate (T6.3) on the training host
-  and attach `pretrain_t_small.log`, `best.pt` and the lambda trajectory PNG as the
-  evidence for AC-04 and AC-07. Leave T6.2/T6.3 unchecked until then -- which BUILD has
-  correctly already done.
+REV-125
+Severity: INFO | Status: OPEN | Requirement: FR-5 | AC: AC-04
+File: specs/training-pipeline/requirements.md (AC-04); steering/testing.md (Phase 17)
+Problem: AC-04 ("training loss decreases over epochs on real data") is not satisfied and
+  cannot be satisfied by the current gate. The owner's Phase 17 amendment states this
+  directly and backs it with dev-host measurements showing loss RISING over short windows
+  under LR warmup (100 steps 26.23 -> 28.51; 400 steps 27.32 -> 29.15). The reduced gate
+  explicitly no longer claims AC-04.
+Impact: None on correctness, and no BUILD action is possible today. Recorded because it
+  is the single reason this spec cannot reach PASS: an acceptance criterion is
+  outstanding by deliberate sequencing, deferred to the multi-epoch run at BUILD_ORDER
+  Phase 14. Filed as INFO rather than as a defect because the gap is documented, dated
+  and owner-authorised -- the failure mode worth guarding against is a later review
+  reading the green suite and marking AC-04 PASS.
+Correction: None now. At Phase 14, record the per-epoch `train_loss_total` series from
+  `outputs/logs/pretrain_t_small.log` across the full run and close AC-04 against it.
+  Do not close AC-04 on a capped run.
 ```
 
 ```
 REV-107
-Severity: LOW | Status: OPEN | Requirement: FR-6 | AC: AC-06
-File: training/pretrain.py:806-822 (gradient-diagnostics call inside the training loop)
-Problem: `run_gradient_diagnostics` is invoked mid-epoch every `grad_diag_interval_steps`.
-  It calls `model.eval()` internally and never restores training mode; `train_one_step`'s
-  dropout and the MoE's dropout would therefore be disabled for the rest of the epoch. The
-  training loop compensates by calling `model.train()` / `moe.train()` immediately after
-  ([pretrain.py:821-822](training/pretrain.py:821)), so the live path is correct -- but the
-  invariant is maintained by the caller, not by the function that broke it, and the second
-  caller (`main.py::run_gradient_diagnostics_stage`) does not restore it because it exits
-  straight afterwards.
-Impact: None today. It is a trap for the next caller: any future site that runs the
-  diagnostic and then continues training without knowing to re-enter train mode silently
-  trains without dropout.
-Correction: Have `run_gradient_diagnostics` save `model.training` / `moe_layer.training` on
-  entry and restore both on exit, the way `collect_validation_routing`
-  ([pretrain.py:517-547](training/pretrain.py:517)) already does. The explicit
-  `model.train()` in the loop can stay as belt-and-braces.
+Severity: LOW | Status: RESOLVED | Requirement: FR-6 | AC: AC-06
+File: evaluation/gradient_diagnostics.py:143-146, :249-250
+Resolution: re-confirmed. `run_gradient_diagnostics` saves and restores both
+  `model.training` and `moe_layer.training`, so the invariant is held by the function
+  that breaks it rather than by its callers.
 ```
 
 ```
 REV-108
 Severity: LOW | Status: OPEN | Requirement: FR-5 | AC: —
-File: training/pretrain.py:242-252 (contrastive augmentation in `train_one_step`);
-       evaluation/gradient_diagnostics.py:202-213 (identical block)
-Problem: The augmented contrastive view is built with a Python loop over the batch. Per
-  contrastive batch it performs B `.tolist()` calls -- each a device-to-host copy and
-  synchronisation -- then B Python-level `augment_sequence` calls and one
-  `torch.tensor(list-of-lists)` construction. At `batch_size=256` that is 256 syncs plus
-  256 list round-trips on every 4th step.
-Impact: Throughput only; the arithmetic is correct. It is the same class of hot-path cost
-  as the `apply_masking` loop that REV-069 removed, and it is now the largest remaining
-  per-step Python/device round-trip in the training loop.
-Correction: Either move the augmentation into the dataset (precompute an augmented view per
-  example at tensorisation time, which also makes it reproducible from the seed alone), or
-  vectorise the three strategies as tensor ops over the `(B, S)` batch. Neither is urgent;
-  measure first against the one-epoch gate before deciding it is worth the complexity.
+File: training/pretrain.py:242-255 (contrastive augmentation in `train_one_step`);
+      evaluation/gradient_diagnostics.py:202-213 (identical block)
+Problem: unchanged. The augmented contrastive view is built with a Python loop over the
+  batch: `for i in range(B): real = seq[i][seq[i] != 0].tolist()`, then a Python-level
+  `augment_sequence` per row, then one `torch.tensor(list-of-lists)` construction. Each
+  `.tolist()` is a device-to-host copy and a synchronisation. At `batch_size=256` that is
+  256 syncs plus 256 list round-trips on every 4th step.
+Impact: Throughput only; the arithmetic is correct. Its relative weight has GROWN since
+  the last review: loss-functions REV-120 removed ~275 ms/step of GradNorm cost, taking
+  the measured step from 0.641 s to ~0.235 s, so this block is now a larger share of what
+  remains.
+Correction: Either move the augmentation into the dataset (precompute an augmented view
+  per example at tensorisation time, which also makes it reproducible from the seed
+  alone), or vectorise the three strategies as tensor ops over the `(B, S)` batch.
+  Still not urgent. The right moment to judge it is against the Phase 14 full run, and
+  ~0.235 s/step is now the baseline to judge it against, not 0.641.
+```
+
+```
+REV-126
+Severity: INFO | Status: RESOLVED | Requirement: FR-3 | AC: AC-03
+File: specs/training-pipeline/requirements.md (FR-3)
+Resolution: closed by the spec owner on 2026-09-17. FR-3 now lists the checkpoint's actual
+  top-level keys -- `model_state_dict`, `moe_state_dict`, `loss_fns_state_dict`,
+  `gradnorm_state_dict` (holding log_lambdas, its optimizer state and initial_losses) --
+  instead of implying MoE and GradNorm state are nested inside `model_state_dict`, with a
+  note recording that the three-key layout is the correct one and the wording was what was
+  wrong. Verified against `best.pt` this pass: every key the amended FR-3 names is present.
+```
+
+```
+REV-062 (cross-reference; owned by specs/transformer-backbone)
+Severity: HIGH | Status: RESOLVED | Requirement: FR-5 | AC: —
+Note: the MPS backend blocker on T6.2 is resolved. Re-verified here that the resolution
+  did not come at the gate's expense: `git diff HEAD -- tests/test_smoke.py` is
+  comment-only and `require_attention_backend = True` is still set.
+  NOTE for the reader: a NEW critical finding on the CUDA/FA4 attention path, REV-122, is
+  filed in `specs/transformer-backbone/review.md`. It does not affect this spec's dev-host
+  results (MPS/SDPA is correct) but it MUST be fixed before the Phase 14 H100 run that
+  AC-04 depends on.
 ```
 
 ```
 REV-092 (cross-reference; owned by specs/loss-functions)
-Severity: MEDIUM | Status: OPEN | Requirement: FR-6 | AC: AC-08
-File: training/gradnorm.py:72-74, reached from training/pretrain.py:302-304
-Problem: `gradnorm.update` needs double-backward through the last block's attention kernel.
-  With `config.device` resolving to CPU this raises "derivative for
-  aten::_scaled_dot_product_flash_attention_for_cpu_backward is not implemented".
-Impact: Any CPU-only host cannot run the default `use_gradnorm=True` configuration; the
-  H100/FlashAttention-4 combination is unverified.
-Correction: Tracked in `specs/loss-functions/review.md` REV-092.
+Severity: MEDIUM | Status: NOT_APPLICABLE (superseded by REV-120)
+Note: the double-backward probe called from `run_pretrain` is deleted, along with the
+  requirement it checked. Verified: `grep -rn probe_double_backward` over the tree returns
+  nothing.
 ```
 
 ## Design Compliance
 
-Matches `design.md` and the steering constraints. Specifically checked:
+Compliant. The FR-6 training-step contract is implemented in exactly the specified order,
+which I checked line by line rather than by grep. The `steering/architecture.md` boundary
+"Training ↔ Evaluation: test data untouched until model configuration and best checkpoint
+are frozen" is respected — the pretrain stage loads only the train and val tensorised
+datasets, and best selection reads `val_ndcg` alone.
 
-- **`conventions.md` left-padding** — `pooled = all_hidden[:, -1, :]` everywhere; no `seq_lens`-based position selection anywhere in `training/`.
-- **`conventions.md` objective order** — `OBJECTIVE_ORDER` drives the MoE objective indices (0/1/2/3), `log_epoch`, `log_gradnorm_lambdas` and `plot_gradnorm_trajectory` identically.
-- **`code-quality.md` config as single source of truth** — no hardcoded hyperparameters in `pretrain.py`. `ROUTING_BUFFER_MAX_BATCHES = 256` is a memory bound, not an experiment parameter, and is exposed as a keyword argument.
-- **`code-quality.md` numerical safety** — `clip_grad_norm_(trainable, config.max_grad_norm)` covers the loss functions' own parameters too (REV-047), and `zero_grad(set_to_none=True)` is used at every site.
-- **`architecture.md` training↔evaluation boundary** — no test data is touched by `run_pretrain`.
-- **`testing.md` critical runtime assertions** — `train_user_history is not eval_user_history` is asserted at [:722](training/pretrain.py:722) against both really-loaded pickles.
+The one behavioural subtlety worth recording is that `max_steps_per_epoch` deliberately
+shrinks `total_steps` as well as the step budget, so a capped run is a complete LR
+schedule compressed rather than a truncated prefix of the full one. That is the right
+choice for a smoke gate — it exercises warmup, decay and the tail in one run — but it does
+mean a capped run's LR trajectory is not a prefix of the uncapped run's, which is worth
+knowing when comparing the two.
 
-One deliberate addition beyond `design.md`: `max_steps_per_epoch`. It is documented in `configs/config.py` as the dev-host smoke lever, defaults to 0 (uncapped, the production setting), and is correctly excluded from the production path. It does not relax any gate — T6.3 remains unchecked precisely because the capped run is not the one-epoch run Phase 17 asks for.
+No unapproved dependency, no architectural drift.
 
 ## Task Completion
 
-16 of 18 tasks are `[x]`; T6.2 and T6.3 are correctly unchecked with accurate BUILD notes.
-
 | Task | Verdict |
 |---|---|
-| T1.x scheduler | Complete, with three real tests. |
-| T2.x model construction / loss fns | Complete. `collect_trainable_parameters` and the `_opt_ids` assertion at [:698-703](training/pretrain.py:698) prove every loss parameter is registered in the optimizer (REV-047). |
-| T3.x GradNorm integration | Complete; isolation independently verified. |
-| T4.x checkpointing, logging, routing snapshots | Complete. |
-| T5.1 `run_pretrain` | Complete as an implementation. Never run at scale (REV-106). |
-| T5.2 BF16 + finite assertions | Complete as code. The negative test proving the assertions fire is missing — loss-functions REV-091. |
-| T6.1 checkpoint roundtrip test | Complete. |
-| **T6.2 one-batch end-to-end smoke** | Correctly `[ ]`. The test exists and its training assertions pass; the gate fails on the backend. BUILD note is accurate. |
-| **T6.3 one-epoch T-Small smoke** | Correctly `[ ]`. The BUILD note states plainly that the uncapped run has not been performed and that relaxing Phase 17 is the owner's call, not BUILD's. This is the right handling of the previous review's REV-066. |
-| T6.4 negative pool reuse test | Complete, and the test is a genuine monkeypatch-based check rather than an inspection. |
+| T6.2 one-batch end-to-end smoke | **Newly checked, and the check is justified.** The gate was re-run unmodified against the narrowed backend surface, and I confirmed the claim that mattered: `tests/test_smoke.py` changed on comment lines only, `require_attention_backend = True` intact, no assertion touched |
+| T6.3 few-step T-Small smoke on real data | **Newly checked, and justified.** The task text was reduced by the *owner*, with the decision recorded in `steering/testing.md` and `BUILD_ORDER` rather than only in tasks.md — the distinction REV-066 turned on. The run happened and its three claims were verified against artifacts on disk. The note is also honest about what the gate does not cover (AC-04), which is the part a weaker note would have quietly omitted |
+| T6.1, T6.4 | Checked; verified |
+| T1–T5 | Checked; unchanged and previously verified. Re-spot-checked the scheduler, best-selection and routing-buffer paths |
 
-No false-complete task claims found in this spec. The two unchecked boxes are honest.
+No false-complete tasks in this spec. T6.3's note is the most carefully evidenced task
+record in the repository and it is worth saying so.
 
 ## Testing and Verification
 
 | Command | Result |
 |---|---|
-| `uv run python -m pytest -q` (full suite) | 231 passed, **2 failed**, 135 s. Both failures are this spec's smoke gates, blocked on `transformer-backbone` REV-062. |
-| `uv run python -m pytest tests/test_training.py::TestFewStepSmokeViaRunPretrain -q` | 1 failed, 20 s — `AttentionBackendError ... require_attention_backend=True forbids falling back`. |
-| Scratch: same two gates re-run with `require_attention_backend` neutralised at runtime via a scratch pytest plugin (no repository file modified) | **3 passed, 23 s.** `run_pretrain` completes its capped budget, validation metrics are computed, the loss decreases across the run, and the checkpoint is written. REV-062 is the sole blocker. |
-| Scratch: instrument `gradnorm.update` against a real `TransformerModel` step | `model grads mutated by gradnorm.update: [] count=0`; active lambdas sum to 2.99999976 for 3 objectives — REV-057 confirmed fixed. |
-| `git diff --stat 32b0904 -- specs/training-pipeline/requirements.md steering/testing.md specs/BUILD_ORDER.md` | No changes — REV-066's reverts are in place. |
-| `ls outputs/checkpoints outputs/logs` | `checkpoints/` empty; `logs/` holds only `run_config.json` and two `moe_parameter_report_*.json` — REV-106 confirmed. |
-| Direct inspection of `data/processed/` mtimes vs `data/*.py` mtimes | Artifacts 01:14–01:27, source 21:23–21:24 — the inputs predate the current pipeline. |
+| `uv run python -m pytest -q` | **267 passed**, 0 failed, 49.20 s |
+| `uv run python -m pytest -q -m slow --collect-only` | 8 slow collected (incl. `TestFewStepSmokeViaRunPretrain`, `TestFewStepsSmoke`), 259 deselected — confirms the slow gates ran in the 267 |
+| `ls -la outputs/checkpoints/t_small outputs/logs outputs/plots` | `best.pt`, `epoch_000.pt`, `pretrain_t_small.log`, `gradnorm_t_small.jsonl`, `routing_diagnostics_t_small.json`, 6 plots — all 09-17 00:25–00:33 |
+| `torch.load("outputs/checkpoints/t_small/best.pt")`, enumerate keys (direct) | all FR-3 fields present incl. `config`; `gradnorm_state_dict` = `{log_lambdas, optimizer, initial_losses}` |
+| `cat outputs/logs/pretrain_t_small.log` (direct) | metrics match the T6.3 note to 6 d.p.; every AC-07 field present |
+| λ arithmetic re-derived from the log (direct) | 0.259607 + 1.430659 + 1.309734 = **3.000000** over 3 active objectives — AC-05 confirmed |
+| `grep -n "max_steps" main.py` | `--max_steps` in `parse_args` at `:59`, override logged at `:96-100` |
+| `sed -n '298,325p' training/pretrain.py` | FR-6 step order confirmed line by line |
+| `uv run python -m compileall -q training main.py` | clean |
 
 ## Final Assessment
 
-`training/pretrain.py` is in good shape. All four prior CRITICAL/HIGH findings are fixed, the fixes verify under instrumentation rather than on the strength of their comments, and the two unchecked tasks are unchecked for the right reason.
+Nothing blocking for BUILD. The finding that held this spec open is resolved, and the run
+behind it is properly evidenced.
 
-What BUILD should do, in order:
+One optional item for BUILD:
 
-1. **Nothing on REV-062** — escalate it. It is a spec decision (sanction SDPA on MPS, or pin a PyTorch build where FlexAttention trains there). Do not disarm `require_attention_backend` and do not edit `requirements.md`, `steering/testing.md` or `BUILD_ORDER.md`. Note for the owner that both gates pass once the backend requirement is lifted, so the only open question is which kernel is sanctioned.
-2. **REV-107** — restore train/eval mode inside `run_gradient_diagnostics`; three lines, and it removes a trap for the next caller.
-3. **REV-106** — once REV-062 is settled: re-run `--stage preprocess`, then the uncapped one-epoch T-Small gate, and attach the log, checkpoint and lambda-trajectory plot as AC-04/AC-07 evidence. Only then re-mark T6.2 and T6.3.
-4. **REV-108** — optional throughput work; measure against the one-epoch run before deciding.
+1. **REV-108 (LOW)** — vectorise or precompute the contrastive augmentation. Judge it
+   against the Phase 14 full run; the baseline is now ~0.235 s/step, not 0.641.
 
-AC-04 and AC-07 stay NOT VERIFIABLE / unevidenced until a real run happens; AC-08 stays PARTIAL until loss-functions REV-091 adds the negative assertion tests.
+Two for the **spec owner**:
+
+2. **REV-125 (INFO)** — AC-04 stays outstanding until the Phase 14 multi-epoch run. Close
+   it against the per-epoch loss series from that run, not from a capped one.
+3. **REV-126 (INFO)** — reword FR-3's "model_state_dict (including MoE + ...)" to match
+   the three sibling keys actually written.
+
+One cross-spec dependency worth flagging here because it lands on this spec's critical
+path: **REV-122** (`specs/transformer-backbone`, CRITICAL) breaks causal masking on the
+CUDA/FlashAttention-4 backend. Dev-host results are unaffected, but it must be fixed
+before the H100 run that AC-04 depends on.

@@ -111,8 +111,41 @@ Federated learning requires strict separation between global parameters (frozen 
 - **AC-02:** `get_lora_state_dict` returns only LoRA keys; no MoE/router/expert/embedding keys
 - **AC-03:** `count_lora_parameters` matches sum of A and B parameter sizes
 - **AC-04:** Frozen backbone checksum identical before and after personalization for every user
-- **AC-05:** Personalization gain histogram shows expected distribution (some negative gains)
-- **AC-06:** Federated convergence NDCG improves over rounds (compared to initial state)
+- **AC-05:** *(smoke gate)* `run_local_personalization` completes end to end on real data at
+  the reduced scale below, writes `personalization_gain_{model}.json` with all six FR-4
+  fields, and renders both plots. The per-user gain array must contain both positive and
+  negative entries — i.e. LoRA is doing something per user and the pipeline is not
+  returning a constant — but the **shape of the gain distribution is not claimed at this
+  scale**
+- **AC-06:** *(smoke gate)* `run_federated` completes the configured rounds, the frozen
+  checksum holds throughout, `federated_rounds_{model}.json` records a uniform
+  `val_examples_scored` across rounds with `val_ndcg_full` on the final round only, and
+  `federated_convergence_{model}.png` renders. **Whether NDCG improves over rounds is not
+  claimed at this scale**
+
+**Owner decision (2026-09-17) — AC-05 and AC-06 are smoke gates, not measurements.**
+These two criteria previously asserted research results: that the gain histogram shows a
+particular distribution, and that federated NDCG improves over rounds. Both are statements
+about measured outcomes, and neither can be established by the reduced run this project
+executes at this stage. They are hereby reduced to **pipeline-integrity gates** — the stage
+runs, the artifacts are produced, the invariants hold — and the scientific claims move to
+the full-scale runs at BUILD_ORDER Phase 14.
+
+Reduced scale for the gate (override at the CLI, never by editing `config.py`):
+
+| Parameter | Configured value | Smoke-gate value |
+|---|---:|---:|
+| `personalization_eval_users` | 1000 | **10** |
+| `clients_per_round` | 100 | **10** |
+| `local_epochs` | 3 | 1 |
+| `federated_rounds` | 20 | a few |
+
+**What this gate does NOT establish.** Ten users cannot characterise a gain distribution,
+and a few rounds over ten clients cannot show convergence. RQ3 (personalization benefit)
+and RQ4 (communication efficiency) therefore have **no acceptance evidence** until Phase 14.
+This is the same discipline `steering/testing.md` applies to Phase 17 and AC-04 of
+`specs/training-pipeline`: the gate is honest about its own reach, and a later review must
+not read a green smoke artifact as satisfying the research claim.
 - **AC-07:** Communication cost per round matches formula: `2 * lora_params * 2 / 1024 * clients_per_round`
 - **AC-08:** Global frozen-state checksum unchanged through all federated rounds
 - **AC-09:** `global_lora_state` persists across all rounds; clients resume from it

@@ -69,11 +69,19 @@ L_total = gradnorm.weighted_sum(active_losses) if use_gradnorm else static_sum(.
 
 # 5. Backward + GradNorm update
 L_total.backward(retain_graph=use_gradnorm)
-if use_gradnorm and step % gradnorm_update_interval == 0:
+if use_gradnorm:   # every step -- see note below
     gradnorm.update(active_losses, anchor_params)
 clip_grad_norm_(model.parameters(), 1.0)
 optimizer.step()
 scheduler.step()
+
+# REV-121 (owner 2026-09-17): this pseudocode previously gated the controller on
+# `step % gradnorm_update_interval == 0`. No such field has ever existed in `Config`
+# and no such gating has ever existed in `training/pretrain.py` -- lambda is updated on
+# every step, which is what FR-5's "Per update" wording implies. The clause is removed
+# rather than implemented: updating lambda every N steps would change the algorithm, and
+# nothing has asked for that. Since REV-120 removed ~275 ms/step from the controller, an
+# update interval is also no longer an attractive performance lever.
 ```
 
 ### Per-Objective Loss Computation
@@ -107,6 +115,67 @@ The anchor is the last shared Transformer block's parameters (before MoE). This 
 ### D6: Separate GradNorm Optimizer
 GradNorm's `log_lambdas` have their own Adam optimizer, separate from the main model optimizer. This prevents the lambda learning dynamics from interfering with model parameter updates (different learning rate, no weight decay on lambdas).
 
+### D7: Factored G_t — no second-order differentiation (REV-120, owner decision)
+
+**Decision:** `G_t` is computed as `λ_t · ‖∇_W L_t‖` with the norm detached, not as
+`‖∇_W(λ_t · L_t)‖` built with `create_graph=True`. `create_graph=True` is forbidden in the
+GradNorm path.
+
+**Why it is the same algorithm.** λ_t is a scalar held in `log_lambdas`, a parameter with
+no dependence on the anchor parameters W. Gradients are linear in the objective, so
+
+```
+∇_W(λ_t · L_t) = λ_t · ∇_W L_t        ⟹        G_t = λ_t · ‖∇_W L_t‖
+```
+
+exactly — not an approximation. `G*_t` is already fully detached (`G_mean` comes from
+`G_t.detach().mean()`, `Lhat` from detached losses), so nothing else in `gradnorm_loss`
+carries a λ dependence. Verified numerically before adopting: G_t and `∂L_grad/∂log λ` are
+**bit-identical** between the two forms (max difference 0.0) across all-active,
+partially-active, and `G_t == G*_t` inputs.
+
+**Why it matters.** Differentiating `‖∇_W(λ_t L_t)‖` w.r.t. λ means differentiating a graph
+whose nodes are themselves derivative computations, i.e. second-order kernels over the
+anchor block, once per active objective. Consequences, all measured on t-small at B=256:
+
+| | |
+|---|---|
+| λ-gradient pass, `create_graph=True` | 276.4 ms |
+| λ-gradient pass, factored form | 0.45 ms |
+| share of a 605 ms training step recovered | ~275 ms (45%) |
+
+Building the graph is nearly free (160.1 ms vs 159.3 ms for the four anchor-local
+backwards); the entire cost is paid when that graph is traversed. Beyond speed, the
+second-order form **cannot run at all** where the attention kernel lacks a second
+derivative — `aten::_scaled_dot_product_flash_attention_for_cpu_backward` is not
+implemented, so every CPU-only host failed on the first optimizer step — and its support
+on the CUDA/FlashAttention-4 path was never verified on real hardware.
+
+**Two admissible implementations of the λ gradient**, both conforming:
+
+1. `torch.autograd.grad(gradnorm_loss, [log_lambdas])`. The graph is now a scalar multiply
+   on a `num_active`-element tensor; costs ~0.45 ms. Preferred for maintainability: it
+   stays correct if this document ever changes the `gradnorm_loss` expression.
+2. Closed form, `∂L_grad/∂log λ_t = sign(G_t - G*_t) · G_t`, scattered into a
+   `zeros_like(log_lambdas)` buffer at the active indices. Costs ~0. Preferred if the goal
+   is a structural guarantee that no graph exists in the controller at all.
+
+**Trap to avoid in either case.** `self.lambdas[idx] * grad_norm` still builds a graph
+through `log_lambdas`. Assigning a tensor derived from it straight to `log_lambdas.grad`
+is silently accepted by PyTorch (`requires_grad=True`, `grad_fn=CopySlices`) and keeps
+that graph alive across steps. Detach before assigning, or build `G_t` detached and
+compute `gradnorm_loss` for logging only.
+
+**Unchanged by this decision:** the post-step renormalization (it runs under `no_grad()`
+after `optimizer.step()` and never saw the λ gradient), the active-only semantics of D4,
+the anchor choice of D5, and the separate optimizer of D6.
+
+**Consequence for the attention backend.** Double-backward support stops being a GradNorm
+prerequisite. `probe_double_backward` and `DoubleBackwardUnsupportedError` in
+`training/gradnorm.py`, and the `probe_double_backward(model, config)` call in
+`run_pretrain`, become dead code and should be removed rather than left as a check of an
+invariant the code no longer relies on.
+
 ## Affected Components
 
 - Consumed by `training/pretrain.py` (training loop integration)
@@ -123,4 +192,12 @@ GradNorm's `log_lambdas` have their own Adam optimizer, separate from the main m
 - InfoNCE: verify symmetric similarity matrix, self-similarity masked, correct labels
 - GradNorm lambda sum: verify constraint holds after update (within tolerance 1e-4)
 - GradNorm with single active objective: lambda = 1.0 trivially
+- GradNorm λ-gradient equivalence (AC-11): assert the shipped λ gradient equals
+  `torch.autograd.grad(gradnorm_loss, [log_lambdas])` on (a) all objectives active,
+  (b) contrastive inactive, (c) `G_t == G*_t` exactly — the subgradient boundary, where
+  `abs()` backward and `torch.sign` both return 0. Also assert
+  `log_lambdas.grad.requires_grad is False` after `update()`
+- GradNorm first-order-only (AC-10): assert `create_graph` appears nowhere in
+  `training/gradnorm.py`, and run one full `update()` with `config.device = "cpu"` — the
+  configuration that previously raised on the missing SDPA CPU double-backward
 - Augmentation: verify random_crop returns valid subsequence, random_mask uses MASK_ID not num_items

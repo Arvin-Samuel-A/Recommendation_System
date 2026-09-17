@@ -49,12 +49,31 @@ The recommendation system requires properly split, tensorised data with correct 
 ### FR-3: Cold-Start Holdout (Step 4.3)
 - Determine complete chronological train/val/test split on untruncated histories first
 - Define global training cutoff = latest timestamp among training-split interactions
-- Cold candidates = items whose first observation is strictly after global training cutoff
-- Select up to `cold_start_ratio` of eligible candidates, ordered by (first_seen_timestamp, original_movie_id)
-- If fewer candidates exist, use achievable count and report it
-- Remove cold items from training split only; preserve in val/test
+- Two holdout strategies are supported, selected by `config.cold_start_strategy`:
+  - **`"first_appearance_rank"` (DEFAULT)** — order all items by
+    `(first_seen_timestamp, original_movie_id)` and hold out the latest-appearing
+    `cold_start_ratio` fraction. Non-empty by construction.
+  - **`"timestamp_cutoff"`** — hold out items whose first observation is strictly after
+    the global training cutoff, selecting up to `cold_start_ratio` of those candidates in
+    the same order. May be empty on a given dataset; an empty holdout is a hard error, not
+    a warning.
+- Config validation must reject any other value; the strategy that ran must be recorded in
+  `preprocessing_manifest.json`
+- If fewer candidates exist than the ratio requests, use the achievable count and report it
+- Under either strategy: remove cold items from the training split only; preserve in val/test
 - Assert: `cold_item_set.isdisjoint(train_interacted_items)`, plus set partition assertions
 - Save cold/warm item sets; log all relevant counts
+
+**Rationale (REV-068, owner decision 2026-09-17):** this requirement previously described
+only the timestamp protocol. On MovieLens-20M essentially every item appears early in the
+timeline, so `timestamp_cutoff` selects the **empty set** — `evaluation/cold_start.py`
+classified 100% of targets as warm and the entire cold-start research question became
+vacuous. `first_appearance_rank` preserves the substantive semantics ("these items are new
+relative to the rest of the catalogue"), keeps the disjoint-from-training guarantee because
+selected items are stripped from the training sequences, and is non-empty on any dataset.
+Both strategies remain implemented and selectable; the default changed, and this text now
+says so. The paper's method section must describe `first_appearance_rank`, not the
+timestamp rule.
 
 ### FR-4: Item Metadata (Step 4.4)
 - Dense matrix shape `(num_items + 1, feature_dim)` where `feature_dim = genome_top_tags + num_genres`
@@ -116,7 +135,7 @@ The recommendation system requires properly split, tensorised data with correct 
 
 - **AC-01:** All 6 CSV files downloaded, validated, and present under `data/raw/`
 - **AC-02:** Item IDs are contiguous 1..N with 0 reserved for padding and N+1 for mask
-- **AC-03:** Cold items have first observation strictly after global training cutoff; none appear in training data
+- **AC-03:** The cold-item set is non-empty, selected by the configured `cold_start_strategy`, recorded in `preprocessing_manifest.json`, and disjoint from all training interactions. Under `"first_appearance_rank"` (the default) the held-out items are the latest-appearing `cold_start_ratio` fraction by first-appearance order; under `"timestamp_cutoff"` their first observation is strictly after the global training cutoff. Under either strategy, no cold item appears in training data
 - **AC-04:** `train_user_history is not eval_user_history` assertion holds
 - **AC-05:** Pre-tensorised datasets load without rebuilding tensors; `__getitem__` performs only indexing
 - **AC-06:** Global negative pool contains only warm items; deterministic across runs with same seed
