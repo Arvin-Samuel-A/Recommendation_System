@@ -168,8 +168,16 @@ Impact: FR-4's report, FR-7's round log and FR-8's convergence plot still have n
   RQ3/RQ4 *claims* to Phase 14, so AC-05 and AC-06 no longer assert an outcome -- but it
   did not remove the requirement that the artifacts exist and the invariants hold, which
   is what this finding tracks.
-Correction: After REV-131 lands, run both stages at the gate scale and verify against the
-  files rather than the console:
+Correction: TWO preconditions before the runs, both outside this spec.
+  (a) `ablations-cli` REV-131 -- the flags below do not exist yet.
+  (b) `loss-functions` REV-105 changes the multi-step objective, which makes the CURRENT
+      `outputs/checkpoints/t_small/best.pt` a model trained under a superseded objective.
+      These stages consume that checkpoint. Re-run the ~190 s T6.3 pretrain gate after
+      REV-105 lands, and run these stages against the regenerated checkpoint -- otherwise
+      the artifacts describe an experiment the code no longer implements, and nothing in
+      the pipeline will flag it.
+  Then run both stages at the gate scale and verify against the files rather than the
+  console:
       uv run python main.py --stage personalize --model t-small --eval_users 10 --local_epochs 1
       uv run python main.py --stage federated  --model t-small --clients_per_round 10 --epochs 3
   Confirm: `personalization_gain_t_small.json` carries all six FR-4 fields (including

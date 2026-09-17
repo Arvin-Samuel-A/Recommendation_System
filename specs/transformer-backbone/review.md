@@ -297,6 +297,10 @@ For BUILD, in order:
 3. **T1.1** — keep it unchecked. It now has two open reasons: unverified FA4 on H100, and
    REV-122.
 
+There is currently **no task in `tasks.md` covering REV-122**. BUILD should add one under
+Phase 1 before starting, so the next review has a task claim to verify the fix against
+rather than only a finding to re-test. `tasks.md` is BUILD's file, not mine.
+
 Nothing for the spec owner. REV-062 was resolved by owner decision in the previous round
 and re-verified here; REV-082 was closed by the owner on 2026-09-17. REV-123 is an
 observation carried for the record with no action attached.

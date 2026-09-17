@@ -171,10 +171,16 @@ Correction: Run
   buckets partition the catalogue; `efficiency_t_small.json` carries every field FR-7
   lists, including `timed_metadata_source == "item_metadata"` (the REV-110 fix, confirmed
   on a real run for the first time); and both plots render.
-  Sequencing note: fix REV-128 BEFORE this run if the gradient diagnostics are to be
-  regenerated, so the artifacts that end up in the paper carry fp32 cosines. Also note
-  that REV-122 (transformer-backbone, CRITICAL) does not affect this run -- it is
-  MPS/SDPA, which is the correct path.
+  Sequencing, and it is load-bearing:
+    - Fix REV-128 BEFORE this run, so the gradient diagnostics that end up in the paper
+      carry fp32 cosines.
+    - `loss-functions` REV-105 changes the multi-step objective, which makes the current
+      `outputs/checkpoints/t_small/best.pt` a model trained under a superseded objective.
+      This stage evaluates that checkpoint. Re-run the ~190 s T6.3 pretrain gate after
+      REV-105 lands and evaluate the REGENERATED checkpoint; otherwise every metric here
+      describes an experiment the code no longer implements.
+    - REV-122 (transformer-backbone, CRITICAL) does NOT affect this run -- it is MPS/SDPA,
+      which is the correct path. No artifact on disk is contaminated by it.
 ```
 
 ```

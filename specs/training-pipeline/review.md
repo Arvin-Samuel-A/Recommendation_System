@@ -274,9 +274,21 @@ record in the repository and it is worth saying so.
 Nothing blocking for BUILD. The finding that held this spec open is resolved, and the run
 behind it is properly evidenced.
 
-One optional item for BUILD:
+One item for BUILD that is NOT optional, though it is not a defect in this spec:
 
-1. **REV-108 (LOW)** — vectorise or precompute the contrastive augmentation. Judge it
+1. **Re-run the T6.3 gate after `loss-functions` REV-105 lands.** That finding changes the
+   multi-step objective, and multi-step was live in the recorded run
+   (`train_loss_multistep=9.912500` in `outputs/logs/pretrain_t_small.log`). Every artifact
+   this spec's T6.3 note cites — `best.pt`, `epoch_000.pt`, `pretrain_t_small.log`,
+   `gradnorm_t_small.jsonl` and the six plots — was produced under the superseded
+   objective, and `personalization-federated` REV-127 and `evaluation-diagnostics` REV-129
+   both consume `best.pt`. The re-run is ~190 s and regenerates all of it, including the
+   fp32 gradient cosines from REV-128. Until it happens, T6.3's evidence is correct about
+   the pipeline and stale about the model.
+
+One genuinely optional item:
+
+2. **REV-108 (LOW)** — vectorise or precompute the contrastive augmentation. Judge it
    against the Phase 14 full run; the baseline is now ~0.235 s/step, not 0.641.
 
 Two for the **spec owner**:

@@ -27,6 +27,36 @@ Ordered tasks. Depends on data-pipeline T1.1 (Config) and T1.2 (utils.py).
 
 - [x] **T1.4: Test the narrowed backend surface** — Assert `Config(attention_backend="flex_attention")` raises `ValueError` listing only `auto`/`flash_attention_4`/`sdpa`. Assert that on MPS (skip otherwise) `attention_backend="auto"` with `require_attention_backend=True` constructs successfully, resolves to `"sdpa"`, and reports no `fallback_reason`. Keep the existing `TestAttentionBackendGate` tests (they monkeypatch `_probe` and do not depend on FlexAttention) and update their comments to name SDPA. (AC-02, AC-09)
 
+- [x] **T1.5: Route causal intent to every backend, not through an SDPA-dialect mask (REV-122)** — `CausalSelfAttention.forward` built one additive `attn_float` mask carrying causal+padding and passed `is_causal=False` alongside it. `_dispatch` forwards `attn_mask` to SDPA (which reads it) but hands FlashAttention-4 only `(padding_mask, is_causal)` — so the FA4 branch discarded causality and ran **bidirectional** on every left-padded batch, i.e. every training batch on CUDA. Apply correction (b): `_dispatch` takes the unambiguous `(padding_mask, is_causal)` pair and each backend formats its own mask (design D2 point 3); `CausalSelfAttention.forward` passes `is_causal=True` on both branches and builds no mask. Add a regression test that goes through `CausalSelfAttention.forward` (NOT the private `_flash_attention_4*` helpers) with the stubbed kernel and asserts positions `< S-1` are bit-identical when position `S-1` changes. Extend `_probe` to a padded input so the H100 gate covers the branch training takes. (FR-4, FR-5, AC-03, AC-04)
+  - BUILD note: done and verified. `AttentionBackend.forward`/`_dispatch` no longer accept
+    an `attn_mask` parameter at all — an additive mask is SDPA dialect, and accepting one
+    is what let causality vanish. New `_sdpa_additive_mask(q, padding_mask, is_causal)`
+    folds the causal half into the mask for SDPA only (SDPA forbids `attn_mask` with
+    `is_causal=True`) and returns `None` when unpadded, so the native `is_causal` fast
+    path is kept. `_probe` now runs forward+backward over BOTH an unpadded and a
+    left-padded input and labels which case failed.
+    Tests added (`tests/test_transformer.py::TestCausalIntentReachesEveryBackend`):
+      * `test_future_token_cannot_reach_earlier_positions[sdpa|flash_attention_4]` — drives
+        `CausalSelfAttention.forward`, perturbs only position S-1, asserts every earlier
+        real position moves by **exactly 0.0**, plus a non-vacuity assertion that position
+        S-1 itself does move.
+      * `test_flash_attention_kernel_receives_causal_true_on_padded_batches` — spies on the
+        stubbed kernel and asserts the `causal=` flag it actually received is True on both
+        the varlen (padded) and dense (unpadded) calls.
+      * `test_probe_covers_the_padded_branch` — asserts `_probe` dispatches with a padding
+        mask that has real padded positions, so the AC-03 self-test cannot pass while
+        training runs non-causally.
+    Non-vacuity verified, not assumed: the pre-REV-122 contract was reinstated in a scratch
+    copy and the suite re-run — `test_future_token_cannot_reach_earlier_positions[flash_
+    attention_4]` and `test_flash_attention_kernel_receives_causal_true_on_padded_batches`
+    both FAIL on it (the spy records `causal=[False, True]`, False on the padded call), and
+    both pass on the fix. The four pre-existing `TestFlashAttentionVarlen` tests pass
+    unchanged on both, which is exactly why they could not catch this.
+    `tests/test_transformer.py` 30 passed.
+    **T1.1 stays unchecked.** This fix does not give it AC-03: the real FlashAttention
+    kernel still has not run (no CUDA device, no flash-attn build on this host), so the
+    CUDA half remains unverified on real hardware.
+
 - [x] **T1.2: Test attention backends** — Unit test: self-test passes on available hardware. Test: causal mask prevents future attention (inject signal at future position, verify it doesn't appear in output). Test: padding mask zeros out padded key contributions. (AC-02, AC-03, AC-04)
 
 ## Phase 2: Embedding Layer

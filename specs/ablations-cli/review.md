@@ -307,6 +307,10 @@ regression test was strengthened to the point where the original defect would no
 clearest example, since the original REV-099 defect existed precisely because the fixture
 invented its own key.
 
+There is currently no task in `tasks.md` covering REV-131. BUILD should add one under
+Phase 1 alongside T1.1, which already lists `--no_train` and `--max_steps` — the two
+previous instances of this same gap.
+
 Nothing outstanding for the spec owner: REV-116 was closed on 2026-09-17.
 
 **REV-130 (INFO)** remains as a marker, not a task: no ablation study has been run and

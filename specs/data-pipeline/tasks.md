@@ -32,7 +32,13 @@ Ordered implementation tasks. Each task traces back to requirements/design. Task
 
 ## Phase 5: Metadata
 
-- [x] **T5.1: Implement metadata extraction in `data/preprocessing.py`** — Load `genome_scores.csv` and `movie.csv`. For each item: extract top `genome_top_tags=20` genome features by relevance, one-hot encode genres. Build `(num_items+1, feature_dim)` matrix with row 0 all-zeros, rows 1..num_items aligned to remapped IDs. Handle zero-metadata cold items (leave as zeros, log count). Save to `data/processed/item_metadata.npy`. (FR-4, AC-09)
+- [x] **T5.1: Implement metadata extraction in `data/preprocessing.py`** — Load `genome_scores.csv` and `movie.csv`. For each item: extract top `genome_top_tags=20` genome features by relevance, one-hot encode genres. Build a `(VOCAB_SIZE, feature_dim)` = `(num_items+2, feature_dim)` matrix with row 0 all-zeros, rows 1..num_items aligned to remapped IDs, and the MASK_ID row (`num_items+1`) present and zero. Handle zero-metadata cold items (leave as zeros, log count). Save to `data/processed/item_metadata.npy`. (FR-4, AC-09)
+  - BUILD note (REV-072, task-text sync): this said `(num_items+1, feature_dim)`, which
+    predates the REV-072 widening to the full embedding vocabulary — one row short, so the
+    MASK_ID row was missing and a metadata gather on a masked position indexed out of
+    range. The code and the artifact have carried the wider shape since REV-072 and REV-090a
+    (measured `(20722, 39)` against `VOCAB_SIZE=20722`); only this text was stale. The
+    change is to the description, not to the requirement.
 
 - [x] **T5.2: Test metadata extraction** — Unit test: small synthetic data → verify matrix shape, row 0 is zeros, known items have correct features, zero-metadata items are zeros. (AC-09)
 

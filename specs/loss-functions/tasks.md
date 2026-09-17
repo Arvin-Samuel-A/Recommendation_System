@@ -8,7 +8,7 @@ Ordered tasks. Depends on transformer-backbone and moe-routing (for integration)
 
 - [x] **T1.2: Implement `MaskedItemLoss` in `training/losses.py`** — Forward: `(hidden_states (B,S,D), mask_positions (B,S) bool, true_item_ids (B,S), item_emb_weight (V,D))`. Extract masked hidden states, compute full-vocab logits via tied weights, cross-entropy. Return 0.0 tensor if zero masked positions. (FR-2)
 
-- [x] **T1.3: Implement `MultiStepLoss` in `training/losses.py`** — `nn.ModuleList` of k `nn.Linear(D, D, bias=False)` step projections. Forward: `(all_hidden_states (B,S,D), targets_k (B,k), item_emb_weight (V,D))`. For step i: read position `S-1-i` (left-padding), project, compute logits, cross-entropy on valid targets only. Return mean loss. (FR-3)
+- [x] **T1.3: Implement `MultiStepLoss` in `training/losses.py`** — `nn.ModuleList` of k `nn.Linear(D, D, bias=False)` step projections. Forward: `(all_hidden_states (B,S,D), targets_k (B,k), item_emb_weight (V,D))`. For step i: read position `S-1-i` (left-padding), project, compute logits, cross-entropy on valid targets only. Return mean loss. (FR-3) **The position rule here is superseded by T3.7** (FR-3/AC-03 amendment, owner 2026-09-17): every step reads `S-1`. The projections, valid-target masking and mean-over-valid-steps reduction are unchanged.
 
 - [x] **T1.4: Implement `InfoNCELoss` in `training/losses.py`** — Forward: `(z_orig (B,D), z_aug (B,D))` both L2-normalized. Cat → `(2B, D)`. Similarity matrix `(2B, 2B)` with temperature. Mask self-similarity to -1e9. Labels: positive pairs at (i, i+B) and (i+B, i). Cross-entropy. (FR-4)
 
@@ -30,13 +30,39 @@ Ordered tasks. Depends on transformer-backbone and moe-routing (for integration)
 
 - [x] **T3.6: Implement factored `G_t` (design D7, REV-120)** — Build `G_t = λ_t · ‖∇_W L_t‖` with the norm taken at `create_graph=False` and detached before being scaled by λ_t, so no second-order differentiation occurs anywhere in the controller. Take the λ gradient with `torch.autograd.grad(gradnorm_loss, [log_lambdas])` and `.detach()` it before assigning to `log_lambdas.grad`. Delete `probe_double_backward`, `_raise_double_backward` and `DoubleBackwardUnsupportedError`, and the probe call in `run_pretrain`. Leave the post-step renormalization unchanged. (FR-5, AC-10, AC-11)
 
+- [x] **T3.7: Read position `S-1` at every multi-step step (REV-105, amended FR-3/AC-03)** — The owner resolved the multi-step horizon question on 2026-09-17: FR-3 and AC-03 now require **every** step to read position `S-1`, so all k per-step projections receive one fixed context representation and the horizons are uniform at 2, 3, ..., k+1 (horizon 1 belongs to the next-item objective and is deliberately not duplicated). In `MultiStepLoss.forward` replace `pos = S - 1 - step` with `pos = S - 1`, leaving the per-step projections, the valid-target masking and the mean-over-valid-steps reduction exactly as they are. Invert the position test, which asserts the superseded rule. (FR-3, AC-03)
+  - BUILD note: done and verified. `training/losses.py` — `pos = S - 1` is now hoisted out
+    of the step loop; nothing else in the loss changed. The old rule paired step s with
+    context `items[:i-s]` and target `items[i+1+s]` (horizons 2, 4, 6); the amended rule
+    gives 2, 3, 4. Neither leaks — every target is strictly in the future of the position
+    it is predicted from — so what changed is which experiment runs.
+    Test: `TestMultiStepLoss::test_correct_position_usage` asserted only `torch.isfinite`,
+    so it held under BOTH rules and could not distinguish them; that is why the mismatch
+    survived three reviews as an INFO note. Replaced with
+    `test_every_step_reads_position_S_minus_1`, which asserts the property true of `S-1`
+    and false of `S-1-step`: scrambling every position `< S-1` leaves the loss **exactly**
+    unchanged, plus a non-vacuity assertion that changing position `S-1` does move it.
+    Added `test_all_k_steps_contribute_distinct_projections` so reading one position is not
+    mistaken for collapsing the k steps into one prediction.
+    Non-vacuity verified, not assumed: `pos = S - 1 - step` was reinstated in a scratch
+    copy and `test_every_step_reads_position_S_minus_1` FAILS on it (5.0938 vs 3.2969) and
+    passes on the fix. `tests/test_losses.py` 39 passed.
+    DOWNSTREAM: `outputs/checkpoints/t_small/best.pt` was trained under the old objective
+    (`train_loss_multistep=9.912500` in `outputs/logs/pretrain_t_small.log`), so the T6.3
+    gate is re-run after this lands — see `training-pipeline` T6.3.
+
+- [x] **T3.8: Reword the `TestGradNormGradientIsolation` docstring (REV-124)** — The class docstring justified the REV-057 isolation requirement in terms of `torch.autograd.grad(..., create_graph=True)` and the second-order graph it built, both deleted by T3.6. The isolation requirement itself survives unchanged; only the stated reason was stale, and it was the one place left in the repository asserting the second-order form still exists — one file away from the AC-10 test that asserts it does not. Reword on first-order grounds; no assertion change. (FR-5)
+  - BUILD note: done. The docstring now says `update()` runs between `L_total.backward()`
+    and `optimizer.step()`, so a plain `.backward()` on `gradnorm_loss` would accumulate
+    into the model `.grad` buffers the main AdamW is about to step on. No assertion touched.
+
 ## Phase 4: Testing
 
 - [x] **T4.1: Test sampled softmax** — Toy data: known positive (high dot product) and negatives (low) → verify loss is low. Reverse → loss is high. Verify loss decreases with optimizer steps. (AC-01)
 
 - [x] **T4.2: Test masked item loss** — Mask specific known positions → verify loss only uses those positions. Mask none → loss is 0.0. Mask all real positions → all contribute. (AC-02)
 
-- [x] **T4.3: Test multi-step loss** — Inject known values at positions S-1, S-2, S-3 → verify each step reads the correct position. Verify with known targets that loss decreases. (AC-03)
+- [x] **T4.3: Test multi-step loss** — Inject known values at positions S-1, S-2, S-3 → verify each step reads the correct position. Verify with known targets that loss decreases. (AC-03) **Superseded by T3.7:** "the correct position" is now `S-1` for every step, so the per-step-position injection this describes no longer distinguishes anything. The replacement test asserts the property only the amended rule has.
 
 - [x] **T4.4: Test InfoNCE loss** — Identical pairs → loss should be low. Random pairs → loss should be higher. Verify similarity matrix shape is `(2B, 2B)` with self-similarity masked. (AC-04)
 

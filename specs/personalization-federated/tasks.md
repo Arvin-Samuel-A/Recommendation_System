@@ -53,3 +53,45 @@ Ordered tasks. Depends on training-pipeline (pretrained checkpoints) and all mod
 - [x] **T5.3: Test federated convergence** — Run 2 rounds with small user set → verify NDCG logged, communication cost matches formula, global_lora_state persists. (AC-06, AC-07, AC-09)
 
 - [x] **T5.4: Test MoE key exclusion assertion** — Inject a model with MoE → verify `get_lora_state_dict` contains no MoE keys. Attempt to add MoE key → verify assertion catches it. (AC-02)
+
+## Phase 6: Gate Execution (REV-127)
+
+- [x] **T6.1: Run both stages at the owner's gate scale and verify against the files (REV-127)** — Neither `--stage personalize` nor `--stage federated` had ever been run, so FR-4's report, FR-7's round log and FR-8's convergence plot had no existence evidence. Blocked on `ablations-cli` REV-131 (no CLI surface for the reduced scale) and on `loss-functions` REV-105 (the checkpoint was trained under a superseded objective). Both preconditions cleared, then run both stages and verify against the artifacts rather than the console. Do NOT reduce the defaults in `configs/config.py`, and do NOT record these numbers as evidence for AC-05's distribution or AC-06's convergence. (FR-4, FR-7, FR-8, AC-05, AC-06)
+  - BUILD note: both run, both exit 0, against the REGENERATED `best.pt` (21:35, corrected
+    multi-step objective) — not the superseded checkpoint.
+    Commands, exactly as REV-127 specifies:
+      `--stage personalize --model t-small --eval_users 10 --local_epochs 1`
+      `--stage federated  --model t-small --clients_per_round 10 --epochs 3`
+    All four overrides logged original -> new, per `code-quality.md`:
+    `personalization_eval_users 1000 -> 10`, `local_epochs 3 -> 1`,
+    `federated_rounds 20 -> 3`, `clients_per_round 100 -> 10`.
+    `configs/config.py` is untouched.
+
+    **FR-4 / personalization** — `personalization_gain_t_small.json` carries all six
+    fields including `num_users_skipped` (REV-113's rename): `num_users_evaluated=10`,
+    `num_users_skipped=0`, `with_lora.mean=0.07002`, `without_lora.mean=0.07476`,
+    `gain.mean=-0.00474` (min -0.09635, max 0.07887). `per_user_gains` has 10 entries with
+    **both positive (4) and negative (3)** values, so the gains are not all-constant —
+    AC-05's smoke-gate condition. Both plots rendered:
+    `personalization_gain_histogram_t_small.png`, `global_vs_personalized_t_small.png`.
+    OBSERVATION, not a finding: mean gain is NEGATIVE at this scale. REV-127 explicitly
+    disclaims the distribution claim here (10 users, 1 local epoch, off a 200-step
+    checkpoint), and the amended AC-05 is a pipeline-integrity gate. RQ3 belongs to Phase 14.
+
+    **FR-7 / FR-8 / federated** — `federated_rounds_t_small.json`, 3 rounds, and
+    `federated_convergence_t_small.png` rendered. REV-127's three invariants, checked
+    against the file:
+      * `val_examples_scored` is UNIFORM at 5000 across all three rounds -> the plotted
+        series is one population (the REV-117 invariant, on a real run for the first time).
+      * `val_ndcg_full` present on the FINAL round ONLY: `[False, False, True]`, value
+        0.11288 over 993,372 examples, alongside the round's own 5,000-example 0.10543.
+      * `upload_kb == lora_params * 2 / 1024` verified INDEPENDENTLY, since the round log
+        does not record `lora_params`: `count_lora_parameters` on a t-small build with
+        `lora_rank=8` gives 24,576, and 24576 * 2 / 1024 = **48.0**, matching the recorded
+        `upload_kb` exactly. `total_round_kb` 960.0 == (48.0 + 48.0) * 10 clients.
+      * The frozen-state checksum assertion did not fire in any round (run exited 0).
+    Per-round val_ndcg 0.0956 -> 0.0969 -> 0.1054. NOT recorded as convergence evidence:
+    AC-06 is a pipeline gate at this scale and RQ4 belongs to Phase 14.
+
+    This run also exercised the REV-119 memory-mapped candidate path for the first time
+    on real data — `run_local_personalization` is its only consumer.

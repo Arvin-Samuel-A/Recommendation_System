@@ -187,6 +187,26 @@ Correction: In `MultiStepLoss.forward`, read the same position for every step:
   unchanged, which is a property only the corrected form has.
   Also update `specs/moe-routing` FR-10's consumer line if it is read as normative; it has
   already been synced to `Z_{u,forecast}[:, S-1, :]` by the owner.
+DOWNSTREAM CONSEQUENCE -- read this before running anything:
+  `outputs/checkpoints/t_small/best.pt` was trained under the OLD scheme. Multi-step was
+  live in that run -- `outputs/logs/pretrain_t_small.log` records
+  `train_loss_multistep=9.912500` -- so once this fix lands, that checkpoint is a model
+  trained under a different objective from the one the code implements.
+  `personalization-federated` REV-127 and `evaluation-diagnostics` REV-129 both CONSUME
+  that checkpoint. Running them against the existing `best.pt` after this fix would produce
+  artifacts describing a superseded experiment, and nothing in the pipeline would flag it.
+  The T6.3 gate is ~190 s, so the remedy is cheap. Required order:
+    1. REV-122 (transformer-backbone, CRITICAL) -- independent; does NOT invalidate any
+       existing artifact, since everything on disk was produced on MPS/SDPA, which is the
+       correct path. It is a blocker for the H100 run only.
+    2. This finding (REV-105), plus REV-128 (evaluation-diagnostics, fp32 cosines),
+       REV-131 (ablations-cli, CLI flags) and REV-124 -- all code/test, no runs.
+    3. Re-run the T6.3 gate:
+         uv run python main.py --stage pretrain --model t-small --epochs 1 --max_steps 200
+       This regenerates `best.pt` under the corrected objective AND the gradient
+       diagnostics with fp32 cosines, in one pass.
+    4. Only then the REV-127 and REV-129 stage runs, against the fresh checkpoint.
+  Step 3 is the step that is easy to skip and expensive to discover later.
 ```
 
 ```
@@ -275,6 +295,10 @@ One thing for BUILD, and it is new work rather than a leftover:
    the superseded rule and would otherwise pass on the wrong behaviour. Nothing else in
    the loss changes. Do this **before** any full training run — after Phase 14 it costs a
    retrain.
+
+There is currently no task in `tasks.md` covering REV-105. BUILD should add one under
+Phase 3 next to T3.2, whose `G_t` clause was superseded the same way — that task is the
+precedent for how to record a requirement amendment without rewriting history.
 
 REV-120 is closed and was the reason this spec was previously reopened; the equivalence was
 independently re-verified this pass rather than carried forward. REV-121 and REV-091 are
