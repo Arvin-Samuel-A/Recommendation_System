@@ -247,10 +247,14 @@ def run_local_personalization(
     # alongside it. Score the SAME stored rows every other stage scores; `user_test_map`
     # indexes `test_examples`, so a test-example index addresses its candidate row
     # directly.
+    # REV-119: memory-mapped. This stage addresses a few thousand ROWS (the test examples
+    # of `personalization_eval_users` sampled users), so materialising the whole 856 MB
+    # matrix to reach them is not proportionate. The rows scored are identical either way.
     cand_matrix = load_or_build_eval_candidates(
         os.path.join(processed, "test_candidates.npy"),
         test_examples, neg_pool, eval_user_history, config,
         expected_rows=len(test_examples["targets"]),
+        mmap=True,
     )
 
     all_user_ids = sorted(set(test_examples["user_ids"]))
@@ -294,7 +298,11 @@ def run_local_personalization(
                 f"example has {int(target)}; test_candidates.npy is not aligned with "
                 f"test_examples.pkl -- re-run --stage preprocess"
             )
-            candidate_sets.append(torch.as_tensor(np.asarray(row), dtype=torch.long, device=device))
+            # REV-119: `np.array` (a copy), not `np.asarray`. The candidate matrix is now
+            # memory-mapped read-only, and `torch.as_tensor` over a non-writable buffer
+            # produces a tensor that aliases it -- undefined behaviour if anything writes,
+            # and a UserWarning every run. One 101-element row; the copy is free.
+            candidate_sets.append(torch.as_tensor(np.array(row), dtype=torch.long, device=device))
 
         test_seq_tensors = [torch.tensor(s, dtype=torch.long) if not isinstance(s, torch.Tensor) else s for s in test_seqs]
 

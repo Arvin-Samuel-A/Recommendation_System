@@ -676,8 +676,19 @@ def save_eval_candidates(candidates, path: str) -> str:
     return fingerprint
 
 
-def load_eval_candidates(path: str, verify: bool = True) -> np.ndarray:
-    matrix = np.load(path)
+def load_eval_candidates(
+    path: str, verify: bool = True, mmap: bool = False,
+) -> np.ndarray:
+    """Load a stored candidate matrix, optionally without materialising it.
+
+    REV-119: `test_candidates.npy` is (1,059,494 x 101) int64 = 856 MB. Consumers that
+    iterate the whole split (`--stage evaluate`, long-tail) should keep the eager path.
+    Consumers that address a few thousand ROWS (`run_local_personalization` scores
+    `personalization_eval_users` users) should pass `mmap=True` and let the OS page in
+    only what they index -- the fingerprint pass below is already block-wise (REV-087) and
+    reads a memmap without materialising it either.
+    """
+    matrix = np.load(path, mmap_mode="r" if mmap else None)
     meta_path = path + ".meta.json"
     if verify and os.path.exists(meta_path):
         with open(meta_path) as f:
@@ -699,6 +710,7 @@ def load_or_build_eval_candidates(
     user_history: Dict[int, List[int]],
     config: Config,
     expected_rows: Optional[int] = None,
+    mmap: bool = False,
 ) -> np.ndarray:
     """Return the stored candidate matrix for a split, regenerating only as a fallback.
 
@@ -713,7 +725,11 @@ def load_or_build_eval_candidates(
     `config.seed` rather than silently from 42.
     """
     if os.path.exists(path):
-        matrix = load_eval_candidates(path)
+        # REV-119: `mmap` only affects HOW the stored matrix is read; the rows are the
+        # same fingerprinted rows either way, so the FR-1 "one candidate protocol"
+        # guarantee is untouched. The regeneration fallback below is in-memory by
+        # construction.
+        matrix = load_eval_candidates(path, mmap=mmap)
         if expected_rows is not None and matrix.shape[0] != expected_rows:
             raise RuntimeError(
                 f"Pre-stored candidate sets at {path} have {matrix.shape[0]} rows but "

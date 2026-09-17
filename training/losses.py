@@ -134,11 +134,17 @@ class MultiStepLoss(nn.Module):
             item_emb_weight, normalized_item_emb, self.normalize_embeddings,
         )
 
+        # REV-105 / amended FR-3: EVERY step reads position S-1. All k projections
+        # receive one fixed context representation, so the horizons are uniform at
+        # 2, 3, ..., k+1 (horizon 1 is the next-item objective's target and is
+        # deliberately not duplicated here).
+        # This was `pos = S - 1 - step`, which paired step s with context items[:i-s] and
+        # target items[i+1+s] -- horizons 2, 4, 6, each step simultaneously pushing the
+        # target further out AND shortening the context. Neither scheme leaks (every
+        # target is strictly in the future of the position it is predicted from); the
+        # owner settled which experiment runs on 2026-09-17.
+        pos = S - 1
         for step in range(self.multi_step_k):
-            pos = S - 1 - step
-            if pos < 0:
-                continue
-
             hidden_at_pos = all_hidden_states[:, pos, :]
             projected = self.step_projections[step](hidden_at_pos)
 

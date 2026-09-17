@@ -152,12 +152,17 @@ def run_longtail_evaluation(
     for bucket in bucket_names:
         stacked = {k: torch.cat(v) for k, v in results[bucket].items()}
         report[bucket] = aggregate_metrics(stacked) if stacked else {}
-    _save_report(config, model_name, report)
+    _save_report(config, model_name, report, buckets)
     _plot_longtail(config, model_name, report)
     return report
 
 
-def _save_report(config: Config, model_name: str, report: Dict) -> None:
+def _save_report(
+    config: Config,
+    model_name: str,
+    report: Dict,
+    buckets: Optional[Dict[str, Set[int]]] = None,
+) -> None:
     os.makedirs(config.log_dir, exist_ok=True)
     mn = model_name.replace("-", "_")
     path = os.path.join(config.log_dir, f"longtail_{mn}.json")
@@ -165,6 +170,36 @@ def _save_report(config: Config, model_name: str, report: Dict) -> None:
     serializable = {}
     for k, v in report.items():
         serializable[k] = {mk: {sk: float(sv) for sk, sv in mv.items()} for mk, mv in v.items()}
+
+    # REV-129 asks a verifier to confirm, against this file, that the report carries the
+    # bucket populations and that the buckets partition the catalogue. Only the per-bucket
+    # metrics reached the artifact, so both had to be re-derived from the pickle by hand.
+    # Recorded here so the numbers are self-describing: a tail NDCG means nothing without
+    # knowing whether "tail" is 10 items or 14,000.
+    # NOTE for the reader (and for the spec owner): `head_fraction_of_catalogue` is
+    # deliberately reported ALONGSIDE the nominal 0.20/0.20/0.60. They differ because the
+    # 20/20/60 split is applied to items that HAVE training interactions, after which
+    # zero-training items are appended to tail per FR-5's second clause. See the note in
+    # `specs/evaluation-diagnostics/tasks.md` T3.3.
+    if buckets is not None:
+        populations = {b: len(items) for b, items in buckets.items()}
+        total = sum(populations.values())
+        union = set().union(*buckets.values())
+        serializable["bucket_populations"] = populations
+        serializable["bucket_partition"] = {
+            "total_items": total,
+            "disjoint": all(
+                buckets[a].isdisjoint(buckets[b])
+                for a, b in (("head", "mid"), ("head", "tail"), ("mid", "tail"))
+            ),
+            "complete_union_size": len(union),
+            "nominal_fractions": {
+                "head": HEAD_FRACTION, "mid": MID_FRACTION, "tail": TAIL_FRACTION,
+            },
+            "realized_fractions_of_catalogue": {
+                b: (n / total if total else 0.0) for b, n in populations.items()
+            },
+        }
 
     with open(path, "w") as f:
         json.dump(serializable, f, indent=2)

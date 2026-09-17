@@ -110,24 +110,39 @@ class AttentionBackend:
         return "sdpa"
 
     def _probe(self, backend: str) -> Tuple[bool, str]:
-        """Run the backend's real kernel forward+backward on a tiny input."""
+        """Run the backend's real kernel forward+backward on tiny inputs.
+
+        REV-122: the probe covers BOTH branches -- unpadded and left-padded. It used to
+        attend an unpadded input only, which is not the branch training takes: every
+        training batch is left-padded, so a defect confined to the padded path (as the
+        FA4 causality bug was) passed the startup gate untouched.
+        """
         B, H, S, D = 2, 2, 8, 16
         try:
-            q = torch.randn(B, H, S, D, device=self.device, dtype=self.dtype, requires_grad=True)
-            k = torch.randn(B, H, S, D, device=self.device, dtype=self.dtype, requires_grad=True)
-            v = torch.randn(B, H, S, D, device=self.device, dtype=self.dtype, requires_grad=True)
-            out = self._dispatch(backend, q, k, v, attn_mask=None, padding_mask=None, is_causal=True)
-            if out.shape != (B, H, S, D):
-                return False, f"unexpected output shape {tuple(out.shape)}"
-            if not torch.isfinite(out).all():
-                return False, "non-finite values in attention output"
-            # Training requires a backward pass through the same kernel.
-            out.float().sum().backward()
-            if q.grad is None or not torch.isfinite(q.grad).all():
-                return False, "backward produced no/!finite gradients"
+            for case, padding_mask in (("unpadded", None), ("left-padded", self._probe_padding_mask(B, S))):
+                q = torch.randn(B, H, S, D, device=self.device, dtype=self.dtype, requires_grad=True)
+                k = torch.randn(B, H, S, D, device=self.device, dtype=self.dtype, requires_grad=True)
+                v = torch.randn(B, H, S, D, device=self.device, dtype=self.dtype, requires_grad=True)
+                out = self._dispatch(
+                    backend, q, k, v, padding_mask=padding_mask, is_causal=True,
+                )
+                if out.shape != (B, H, S, D):
+                    return False, f"[{case}] unexpected output shape {tuple(out.shape)}"
+                if not torch.isfinite(out).all():
+                    return False, f"[{case}] non-finite values in attention output"
+                # Training requires a backward pass through the same kernel.
+                out.float().sum().backward()
+                if q.grad is None or not torch.isfinite(q.grad).all():
+                    return False, f"[{case}] backward produced no/!finite gradients"
         except Exception as e:  # noqa: BLE001 - probe must classify any failure
             return False, f"{type(e).__name__}: {e}"
         return True, ""
+
+    def _probe_padding_mask(self, B: int, S: int) -> torch.Tensor:
+        """Left-padded key-padding mask (True at REAL positions), as training produces."""
+        mask = torch.ones(B, S, device=self.device, dtype=torch.bool)
+        mask[:, : S // 2] = False
+        return mask
 
     # ---------------- kernels ----------------
 
@@ -137,17 +152,51 @@ class AttentionBackend:
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        attn_mask: Optional[torch.Tensor],
         padding_mask: Optional[torch.Tensor],
         is_causal: bool,
     ) -> torch.Tensor:
+        # REV-122: the caller passes causal INTENT (`is_causal`) and the padding mask, and
+        # each backend formats its own mask from that pair -- design D2 point 3. The
+        # previous contract had `CausalSelfAttention` build one additive mask in SDPA's
+        # dialect (carrying causality) and pass `is_causal=False` alongside it; the FA4
+        # branch ignores additive masks and reads causality only from the flag, so every
+        # left-padded batch -- i.e. every training batch -- ran BIDIRECTIONAL on CUDA.
+        # Causality must never travel in a channel only one backend reads.
         if backend == "flash_attention_4":
             return self._flash_attention_4(q, k, v, padding_mask, is_causal)
         if backend == "sdpa":
+            attn_mask = self._sdpa_additive_mask(q, padding_mask, is_causal)
             if attn_mask is not None:
+                # SDPA forbids `attn_mask` and `is_causal=True` together, so the causal
+                # half is folded into the additive mask here and the flag is cleared.
                 return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=False)
             return F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
         raise ValueError(f"Unknown attention backend '{backend}'")
+
+    @staticmethod
+    def _sdpa_additive_mask(
+        q: torch.Tensor,
+        padding_mask: Optional[torch.Tensor],
+        is_causal: bool,
+    ) -> Optional[torch.Tensor]:
+        """Build SDPA's additive mask from `(padding_mask, is_causal)`.
+
+        Returns `None` when there is no key padding, so the unpadded path keeps using
+        SDPA's native `is_causal` fast path. `padding_mask` is True at REAL positions.
+        """
+        if padding_mask is None:
+            return None
+        B, H, S, _ = q.shape
+        blocked = ~padding_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, S) True where padded
+        if is_causal:
+            causal = torch.triu(
+                torch.ones(S, S, device=q.device, dtype=torch.bool), diagonal=1
+            )
+            blocked = blocked | causal.unsqueeze(0).unsqueeze(0)
+        blocked = blocked.expand(B, H, S, S)
+        attn_float = torch.zeros(blocked.shape, device=q.device, dtype=q.dtype)
+        attn_float.masked_fill_(blocked, float("-inf"))
+        return attn_float
 
     @staticmethod
     def _flash_attention_4(
@@ -250,13 +299,19 @@ class AttentionBackend:
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        attn_mask: Optional[torch.Tensor] = None,
         padding_mask: Optional[torch.Tensor] = None,
         is_causal: bool = True,
     ) -> torch.Tensor:
+        """Attend with causal INTENT, not a pre-formatted mask.
+
+        REV-122: callers pass `(padding_mask, is_causal)` and each backend formats the
+        mask its kernel actually reads. There is deliberately no `attn_mask` parameter --
+        an additive mask is SDPA dialect, and accepting one here is what let causality
+        silently vanish on the FlashAttention-4 path.
+        """
         return self._dispatch(
             self.backend_name, q, k, v,
-            attn_mask=attn_mask, padding_mask=padding_mask, is_causal=is_causal,
+            padding_mask=padding_mask, is_causal=is_causal,
         )
 
 
@@ -285,20 +340,12 @@ class CausalSelfAttention(nn.Module):
         k = self.k_proj(x).view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
 
-        if padding_mask is not None:
-            causal = torch.triu(
-                torch.ones(S, S, device=x.device, dtype=torch.bool), diagonal=1
-            )
-            pad_key = ~padding_mask.unsqueeze(1).unsqueeze(2)
-            attn_mask = ~(causal.unsqueeze(0) | pad_key)
-            attn_mask = attn_mask.expand(B, self.num_heads, S, S)
-            attn_float = torch.zeros_like(attn_mask, dtype=x.dtype)
-            attn_float.masked_fill_(~attn_mask, float("-inf"))
-            out = self.backend.forward(
-                q, k, v, attn_mask=attn_float, padding_mask=padding_mask, is_causal=False,
-            )
-        else:
-            out = self.backend.forward(q, k, v, padding_mask=None, is_causal=True)
+        # REV-122: this attention is causal unconditionally -- `is_causal=True` on BOTH
+        # branches. It previously passed `is_causal=False` on the padded branch and relied
+        # on a hand-built additive mask to carry causality, which only SDPA reads; the FA4
+        # branch therefore attended bidirectionally on every left-padded batch. Causal
+        # intent now travels as the flag, and each backend formats its own mask.
+        out = self.backend.forward(q, k, v, padding_mask=padding_mask, is_causal=True)
 
         out = out.transpose(1, 2).contiguous().view(B, S, D)
         # REV-051: attention-weight dropout was stored but never applied. SDPA's

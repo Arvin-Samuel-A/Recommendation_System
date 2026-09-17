@@ -14,6 +14,12 @@ def gradient_cosine_similarity(
     names = list(per_objective_losses.keys())
     T = len(names)
 
+    # REV-128: measure in fp32. The model is bf16 everywhere, and a bf16 cosine of a
+    # ~790k-element vector against ITSELF does not return 1.0 -- the real artifact read a
+    # diagonal of [1.00078, 1.00391, 0.99844, 1.00078], three entries of which are outside
+    # the range a cosine similarity can take. This is one temporary copy on a diagnostic
+    # path that runs rarely, and it is the same fp32-at-the-measurement-site pattern
+    # `routing_diagnostics` and `local_train` already use.
     grads = {}
     for name, loss in per_objective_losses.items():
         g = torch.autograd.grad(
@@ -23,7 +29,7 @@ def gradient_cosine_similarity(
             gi.flatten() if gi is not None else torch.zeros_like(p).flatten()
             for gi, p in zip(g, shared_params)
         ])
-        grads[name] = flat
+        grads[name] = flat.float()
 
     cos_sim = torch.zeros(T, T)
     for i, ni in enumerate(names):
@@ -48,7 +54,9 @@ def per_objective_grad_norms(
             gi.flatten() if gi is not None else torch.zeros_like(p).flatten()
             for gi, p in zip(g, shared_params)
         ])
-        norms[name] = flat.norm(p=2).item()
+        # REV-128: same fp32 treatment as the cosines, for consistency of the reported
+        # numbers -- a bf16 norm over ~790k elements accumulates visible error.
+        norms[name] = flat.float().norm(p=2).item()
 
     vals = list(norms.values())
     t = torch.tensor(vals)

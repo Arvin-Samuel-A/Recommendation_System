@@ -60,6 +60,28 @@ def parse_args(argv=None):
         help="Cap training steps per epoch (0 = uncapped). The Phase 17 few-step smoke "
              "gate uses this to exercise run_pretrain end to end on real data.",
     )
+    # REV-131: the owner's 2026-09-17 smoke-gate decision reduced personalization-federated
+    # AC-05/AC-06 to pipeline-integrity gates at `personalization_eval_users = 10` and
+    # `clients_per_round = 10`, but none of the three parameters had a CLI surface -- so
+    # running that gate meant editing `configs/config.py`, which conventions.md's
+    # "Config-Driven Design" forbids and which would silently change the configured values
+    # every later run inherits. This is the third instance of the same gap, after
+    # `--no_train` (REV-115) and `--max_steps`.
+    # All three default to None so the CONFIGURED values stay authoritative when the flags
+    # are absent -- Phase 14 runs the configured values; the gate is a CLI-time reduction.
+    parser.add_argument(
+        "--eval_users", type=int, default=None,
+        help="Override personalization_eval_users (number of users scored by "
+             "--stage personalize).",
+    )
+    parser.add_argument(
+        "--clients_per_round", type=int, default=None,
+        help="Override clients_per_round for --stage federated.",
+    )
+    parser.add_argument(
+        "--local_epochs", type=int, default=None,
+        help="Override local_epochs for per-user LoRA training.",
+    )
     return parser.parse_args(argv)
 
 
@@ -98,6 +120,22 @@ def apply_cli_overrides(config: Config, args) -> None:
             ("max_steps_per_epoch", config.max_steps_per_epoch, args.max_steps)
         )
         config.max_steps_per_epoch = args.max_steps
+    # REV-131: logged original -> new like every other override (code-quality.md).
+    if getattr(args, "eval_users", None) is not None:
+        overrides.append((
+            "personalization_eval_users",
+            config.personalization_eval_users,
+            args.eval_users,
+        ))
+        config.personalization_eval_users = args.eval_users
+    if getattr(args, "clients_per_round", None) is not None:
+        overrides.append(
+            ("clients_per_round", config.clients_per_round, args.clients_per_round)
+        )
+        config.clients_per_round = args.clients_per_round
+    if getattr(args, "local_epochs", None) is not None:
+        overrides.append(("local_epochs", config.local_epochs, args.local_epochs))
+        config.local_epochs = args.local_epochs
 
     for name, old, new in overrides:
         logger.info(f"CLI override: {name} {old} -> {new}")
@@ -399,6 +437,7 @@ def run_latency_stage(config, args):
 def _load_trained_model(config, args):
     """Shared setup for the standalone diagnostics stages: stats, model, best.pt."""
     from training.pretrain import build_model, load_checkpoint, _build_loss_fns
+    from data.sequence_generator import load_metadata_matrix
     from utils import get_device
 
     config.apply_model_config(args.model)
