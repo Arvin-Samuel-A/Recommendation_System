@@ -33,7 +33,8 @@ Phase 4: Cold-Start (preprocessing.py, called before sequence generation)
 
 Phase 5: Metadata (preprocessing.py)
   genome_scores + movies → top-k genome tags + one-hot genres
-  → dense (num_items+1, feature_dim) matrix, row 0 = zeros
+  → dense (num_items+2, feature_dim) matrix = the full embedding vocab;
+    row 0 (pad) and row num_items+1 (MASK_ID) both all-zero
 
 Phase 6: Sequence Generation (sequence_generator.py)
   Per user: sliding window within each split → left-pad to max_seq_length
@@ -50,10 +51,43 @@ Phase 7: Negative Pool (sequence_generator.py)
 The chronological split boundary is determined on the **complete** user history. Only after the split is the per-example context truncated to `max_seq_length`. This prevents information leakage where truncation could move the effective split point.
 
 ### D2: Cold-Start Identification
-Cold items are identified by `item_first_seen > global_training_cutoff`, not by popularity quantile. The global training cutoff is the latest timestamp in the training split, ensuring cold items are genuinely unseen during any training interaction.
+
+**Amended (owner, 2026-09-18) to match FR-3.** Three strategies exist;
+`config.cold_start_strategy` selects between them and the strategy that ran is recorded in
+`preprocessing_manifest.json`.
+
+- **`"unseen_in_training"` — the DEFAULT.** An item is cold iff it has zero interactions in any
+  user's training portion: `cold = all_items - train_interacted_items`. **Nothing is deleted.**
+  The set is whatever the chronological split already produces — 3,010 items (14.5%) on
+  MovieLens-20M, all of them appearing in val/test and therefore all evaluable.
+  `cold_start_ratio` does not apply. An optional first-appearance threshold tightens the set to
+  a strictly temporal one.
+- **`"first_appearance_rank"`.** Items ordered by first appearance; the latest-appearing
+  `cold_start_ratio` fraction is held out. Non-empty by construction, but **induced** — 44.7% of
+  its cold items had real training interactions deleted to make them cold. No longer the default.
+- **`"timestamp_cutoff"`.** Cold items are those with `item_first_seen > global_training_cutoff`.
+  Still implemented and selectable, but **unusable under this project's split protocol**: because
+  the cutoff is `max()` over every user's own 80% point, it lands 0.1 days before the dataset's
+  last interaction and the set is empty. An empty holdout is a hard error, not a warning.
+
+The strategies differ in whether the disjoint-from-training guarantee is *achieved* or
+*constructed*. `unseen_in_training` achieves it — the guarantee is the definition, so the
+"strip cold items from training" step is a no-op. The other two construct it by deleting
+training interactions of the items they select.
+
+*This section previously described only the timestamp rule, then only the first-appearance rule.
+`requirements.md` FR-3 is authoritative and carries the measured evidence for the 2026-09-18
+decision, including why the earlier rationale's stated cause was wrong. The paper's method
+section must describe `unseen_in_training`.*
 
 ### D3: Deterministic Cold-Item Selection
-Cold candidates are ordered by `(first_seen_timestamp, original_movie_id)` for deterministic selection across runs. Up to `cold_start_ratio` of eligible candidates are selected.
+Cold candidates are ordered by `(first_seen_timestamp, original_movie_id)` for deterministic
+selection across runs. Up to `cold_start_ratio` of eligible candidates are selected.
+
+*Implementation note (owner, 2026-09-18): the code sorts by `(first_seen_timestamp, remapped_item_id)`.
+This induces exactly the order above, because `item_map` is built from `sorted(df["movieId"].unique())`
+with `idx + 1`, so the remapped ID is strictly monotone in the original movie ID. Recorded so the
+difference is not later mistaken for a divergence.*
 
 ### D4: ID Remapping Scheme
 Users start at 0 (for array indexing). Items start at 1 (0 is padding). Mask token is `num_items + 1`. This is a global invariant enforced during remapping and never violated.

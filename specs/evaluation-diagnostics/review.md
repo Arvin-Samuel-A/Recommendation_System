@@ -2,316 +2,294 @@
 
 ## Review Status
 
-**CHANGES_REQUIRED**
+**PASS_WITH_WARNINGS**
 
-(Down from `PASS_WITH_WARNINGS`, for an evidence reason rather than a regression. All five
-prior defects remain fixed. What changed is that a real run finally exists, which (a) makes
-the missing `--stage evaluate` artifacts actionable rather than blocked — REV-129, MEDIUM —
-and (b) exposed a defect in a real diagnostics artifact that no synthetic test could show —
-REV-128.)
+(REV-133 is now resolved too, so every finding this spec owns is closed. What remains is one
+INFO (REV-134). `training-pipeline` REV-138 is now closed too, so the artifacts this spec
+produces are stamped with a revision that actually moves when `evaluation/` changes.)
 
 ## Feature
 
 `specs/evaluation-diagnostics` — `evaluation/metrics.py`, `cold_start.py`, `longtail.py`,
-`flops.py`, `routing_diagnostics.py`, `gradient_diagnostics.py`, and
-`models/ann_retrieval.py`.
+`flops.py`, `routing_diagnostics.py`, `gradient_diagnostics.py`.
 
 ## Review Scope
 
-- Spec directory: `specs/evaluation-diagnostics/` (requirements.md, design.md, tasks.md) —
-  none modified since the last review.
-- Steering: `steering/code-quality.md` (device synchronization before latency timing),
-  `conventions.md` (`OBJECTIVE_ORDER`, plot standards), `architecture.md` (test data
-  untouched until frozen).
-- Baseline: working tree vs `HEAD` = `d438950` on `master`; `origin/master` at the same
-  commit. Of this spec's files only `evaluation/flops.py` is modified (`+30/-7`, REV-110);
-  the rest are at their committed state. `tests/test_diagnostics.py` is modified (`+106`).
-- Files inspected: `evaluation/flops.py`, `longtail.py`, `cold_start.py`,
-  `gradient_diagnostics.py`, `routing_diagnostics.py`, `metrics.py`,
-  `models/ann_retrieval.py`, `tests/test_diagnostics.py`, `tests/test_metrics.py`,
-  `tests/test_ann_retrieval.py`.
-- **New this pass:** the real diagnostics artifacts produced by the 09-17 T6.3 run
-  (`outputs/logs/routing_diagnostics_t_small.json`,
-  `outputs/logs/gradient_diagnostics_t_small.json` and their five plots) were loaded and
-  checked numerically. Previous reviews had no such artifacts to check.
-- Re-review. Prior findings carried in: REV-093, REV-094, REV-095, REV-109, REV-110 (all
-  RESOLVED), REV-119 (LOW, OPEN).
-- Date: 2026-09-17
+- Spec directory: `specs/evaluation-diagnostics/` — `tasks.md` modified (T3.3/T3.4, and
+  T8.1's figures marked superseded). `requirements.md` and `design.md` unmodified.
+- Steering: `code-quality.md` (no silent substitution, mandatory sync before timing, and
+  the new "Artifact Provenance" section), `conventions.md`, `testing.md`, `architecture.md`.
+- Baseline: `master` at `0bc67ee`; 34 files modified after BUILD's round. This spec owns
+  `evaluation/*.py` (+91 total) and `tests/test_diagnostics.py`.
+- Real artifacts re-measured after the 2026-09-18 cascade: `longtail_t_small.json`,
+  `gradient_diagnostics_t_small.json`, `efficiency_t_small.json`, `cold_start_t_small.json`,
+  `routing_diagnostics_t_small.json`, `test_metrics_t_small.json`,
+  `data/processed/popularity_buckets.pkl`.
+- Re-review (third pass). Prior findings carried in: REV-133 (LOW, OPEN), REV-134 (INFO,
+  OPEN), REV-132, REV-128, REV-129, REV-119 (RESOLVED).
+- Date: 2026-09-18 (post-BUILD-fix)
 
 ## Summary
 
-All five prior defects stay fixed and were re-verified, not inherited. REV-093's structural
-fix holds: `grep` for `filter_negatives(` across `data models training evaluation main.py`
-still returns only the definition's own use inside `generate_eval_candidates` and the one
-site in `train_user_lora` that passes an explicit run-scoped `rng` — the per-call rebuild
-is still gone from `longtail.py`, `cold_start.py` and `local_train.py`. REV-110's fix is
-confirmed in the diff: `benchmark_latency` gathers real genome rows and records
-`timed_metadata_source`, falling back to seeded noise but never to zeros.
+All of this spec's findings are closed. The artifacts were regenerated as part of the
+2026-09-18 cascade, off the new checkpoint and the REV-137 training data, and every figure
+was re-measured here.
 
-The new information this pass is that **real artifacts exist for the first time**. The
-T6.3 pretraining run wrote `routing_diagnostics_t_small.json` and
-`gradient_diagnostics_t_small.json` plus five plots, so FR-8 and FR-9 now have artifact
-evidence rather than test-only evidence. I checked them numerically and both are
-structurally correct: the objective×expert heatmap is `(4, 4)` matching
-`heatmap_shape`, with rows summing to 1.0 to within 3e-6 (AC-06); the gradient cosine
-matrix is `(4, 4)` and exactly symmetric (AC-07's first half).
+- **REV-133 resolved.** T8.1's stale long-tail figures are now explicitly listed as
+  *superseded values … retained so the supersession is checkable rather than merely
+  asserted*, with the current values above them. That is a better resolution than deleting
+  them: a reader can verify the change rather than take it on trust.
+- **Long-tail (REV-132) holds through the data change.** `popularity_buckets.pkl` re-measured
+  at 4,144 / 4,144 / 12,432 over 20,720, and `longtail_t_small.json` reports
+  `nominal_fractions` identical to `realized_fractions_of_catalogue` at 0.20/0.20/0.60 with
+  `disjoint: true`. The catalogue-wide split survived REV-137 regenerating the buckets.
+- **REV-128 holds on the regenerated artifact.** Gradient cosine diagonal
+  `[1.00000107, 1.00000095, 1.00000095, 1.00000155]`, max deviation **1.55e-06**, and the
+  matrix maximum is 1.0000015 — no entry above 1.0, where the bf16 artifact had three.
+- **Cold-start is no longer vacuous.** All four cells present on a *natural* cold set: cold
+  NDCG 0.04165 / 0.04143 (metadata on / off) against warm 0.08658 / 0.07695.
+- **Provenance.** All six artifacts this spec produces echo the checkpoint's
+  `source_revision` exactly — verified by comparison, and their mtimes postdate the
+  checkpoint.
 
-Checking them also turned up something no synthetic test could have: **the cosine matrix's
-diagonal is not 1.0 — it reads 1.00078, 1.00391, 0.99844, 1.00078.** Gradients are gathered
-in the model's bf16 and the cosine is computed in bf16, so a vector's similarity with
-itself lands off unity, and three of four entries are **above 1**, which is outside the
-range a cosine similarity can take. The AC-07 test passes only because its tolerance is
-`< 0.01`. This is a one-line fix and is filed as REV-128.
+One caveat, and it lands harder here than anywhere: the provenance enumeration does not
+cover `evaluation/`, so these six artifacts carry a revision that does not move when the
+code producing them changes. **That is now fixed** (`training-pipeline` REV-138): the owner
+widened the coverage rule and BUILD implemented it as an exclusion rule. Verified here —
+editing `evaluation/longtail.py` now MOVES `source_hash`, where before it left it
+byte-identical, and all 7 `evaluation/` modules are among the 27 covered files.
 
-Finally, `--stage evaluate` has still never been run, so FR-4's cold-start report and plot,
-FR-5's long-tail report and plot, and FR-7's efficiency report do not exist — AC-08
-explicitly requires them. This was previously blocked on the absence of a pretrained
-checkpoint; `outputs/checkpoints/t_small/best.pt` now exists, so it is actionable
-(REV-129).
+REV-134 (pytest writing into the real `outputs/logs/`) is still open, unchanged and still
+INFO.
 
 ## Git Changes
 
-| File | Change | Attribution |
-|---|---|---|
-| `evaluation/flops.py` | `+30/-7`: real metadata gathered for the timed path, `timed_metadata_source` recorded, seeded-noise fallback | REV-110, this spec |
-| `tests/test_diagnostics.py` | `+106`: `TestCandidateSetConsistency` and the REV-110 metadata-source assertions | this spec |
+`evaluation/` (+91 across six files): the REV-137-driven longtail changes plus
+`artifact_source_revision` stamping in `cold_start.py`, `flops.py`,
+`gradient_diagnostics.py`, `routing_diagnostics.py` and `longtail.py`.
+`tests/test_diagnostics.py` (+11): the catalogue-denominator bucket assertions.
 
-**Scope assessment:** in scope and proportionate. No new dependency beyond an intra-project
-import (`load_metadata_matrix`), no committed artifact.
+**Scope assessment:** proportionate. The evaluation modules gained provenance plumbing and
+nothing else; the metric, diagnostic and timing logic is untouched, confirmed by diff and by
+the 38 tests across `test_diagnostics.py` / `test_metrics.py` / `test_ann_retrieval.py`
+passing unchanged.
 
 ## Specification Coverage
 
 | Requirement | Status | Evidence |
 |---|---|---|
-| FR-1 Fixed candidate protocol | PASS | Single `load_or_build_eval_candidates` entry point with a row-count guard; verified at the boundary by the `filter_negatives(` grep, and by `TestCandidateSetConsistency` asserting the rows each evaluator *actually scores* are the stored rows |
-| FR-2 ANN retrieval | PASS | Force-inclusion implemented with lowest-scoring replacement; rate reported; `tests/test_ann_retrieval.py`. Documented as exact brute force, which is honest about what it measures |
-| FR-3 Metrics | PASS | NDCG/MRR/Recall/Precision per the stated formulas, per-example values plus mean and std; toy tests |
-| FR-4 Cold-start evaluation | **PARTIAL** | Implemented, loads stored candidates, asserts cold∖train disjointness. **`cold_start_{model}.json` and `cold_vs_warm_{model}.png` have never been produced** (REV-129) |
-| FR-5 Long-tail evaluation | **PARTIAL** | Implemented with head/mid/tail from training popularity only, zero-training items as tail, and metadata supplied (REV-094). **`longtail_{model}.json` and its plot have never been produced** (REV-129) |
-| FR-6 Latency benchmarking | PASS | Warmup discarded; per-run device synchronization; full serving path; mean/std/min/p95/ms-per-rec; timed input is now the serving input (REV-110) |
-| FR-7 Efficiency report | **PARTIAL** | The writer covers every listed field. **`efficiency_{model}.json` has never been produced** (REV-129) |
-| FR-8 Routing diagnostics | PASS | **Now artifact-backed.** `routing_diagnostics_t_small.json` carries entropy, utilization, per-objective, pairwise cosine and KL, collapse fractions, heatmap and `heatmap_shape`; three plots present |
-| FR-9 Gradient-interference diagnostics | PASS (see REV-128) | **Now artifact-backed.** `(4, 4)` cosine matrix, per-objective norms, two plots present. Computed on diagnostic batches, not optimizer-step batches. The diagonal's bf16 precision is REV-128 |
-| FR-10 Calibration | PASS | `use_logit_calibration=False`, `eval_temperature=1.0` by default; no test-set fitting path exists |
+| FR-1 Fixed candidate protocol | PASS | Every consumer reads the stored fingerprinted rows through `load_or_build_eval_candidates` / `load_eval_candidates`; the loaders recompute and compare the block fingerprint on every load, including through the memory-mapped path |
+| FR-2 ANN retrieval | PASS | `models/ann_retrieval.py` retrieves, filters seen/invalid, force-includes the target by replacing the lowest-scoring candidate, and returns `num_force_included` / `num_examples`; `main.py` surfaces the rate |
+| FR-3 Metrics | PASS | Single-target formulas implemented exactly; per-example values plus mean and std. `tests/test_metrics.py` pins rank 1, rank 10 and rank 11 |
+| FR-4 Cold-start evaluation | PASS | `cold_start_t_small.json` carries all four cells — `cold_meta_on`, `cold_meta_off`, `warm_meta_on`, `warm_meta_off` — and `cold_vs_warm_t_small.png` renders |
+| FR-5 Long-tail evaluation | PASS | **Now satisfied clause by clause for the first time.** Measured on the artifact: `bucket_populations` 4,144 / 4,144 / 12,432; `bucket_partition` reports `disjoint: true`, `complete_union_size: 20720`, and `nominal_fractions` identical to `realized_fractions_of_catalogue` at 0.20/0.20/0.60. Popularity is computed from the training history only |
+| FR-6 Latency benchmarking | PASS | `_synchronize` dispatches `torch.mps.synchronize()` / `torch.cuda.synchronize(device)` and is called before the timed loop and around **each** timed run. Warmup runs discarded; all five required statistics reported |
+| FR-7 Efficiency report | PASS | Every field present in `efficiency_t_small.json`, including `routing_overhead` and the REV-110 provenance fields (`timed_metadata_source`, `timed_with_metadata`, `timed_padding_positions`, `timed_sequence_length`) |
+| FR-8 Routing diagnostics | PASS | Entropy, utilization, pairwise cosine/KL, the `(T, K)` heatmap and both collapse tests are implemented and present in `routing_diagnostics_t_small.json`; three plots render |
+| FR-9 Gradient diagnostics | PASS | `(T, T)` cosine matrix and per-objective norms with CV, computed on freshly drawn diagnostic batches rather than optimizer-step batches, now in fp32 |
+| FR-10 Calibration | PASS | `use_logit_calibration=False` and `eval_temperature=1.0` by default; the temperature divisor is applied only when calibration is enabled, and nothing claims it changes ranking |
 
 ## Acceptance Criteria
 
 | Criterion | Status | Evidence |
 |---|---|---|
-| AC-01 same candidate sets for all models | PASS | Single loader + `TestCandidateSetConsistency`, which spies on `score_candidates_batch` inside both `evaluation.longtail` and `evaluation.cold_start` and compares against the stored rows. The fixture deliberately gives half its examples a shared target — the exact case the old per-target RNG fallback collapsed |
+| AC-01 same candidate sets for all evaluations | PASS | One stored matrix per split, fingerprint-verified on every load; `TestCandidateSetConsistency` asserts the rows the long-tail and cold-start evaluators hand to the scorer are the stored rows |
 | AC-02 metrics correct on toy inputs | PASS | `tests/test_metrics.py` |
-| AC-03 cold items disjoint from training | PASS | Asserted in `cold_start.py`, and independently re-measured against the real artifacts in the data-pipeline review (warm ∩ cold = ∅, 18,648 / 2,072) |
-| AC-04 long-tail buckets partition all IDs | PASS | Disjoint-and-complete assertion; zero-training items classified tail |
-| AC-05 latency includes device synchronization | PASS | Verified in code: `torch.mps.synchronize()` / `torch.cuda.synchronize(device)` around each timed run |
-| AC-06 heatmap shape `(num_objectives, num_experts)` | PASS | **Verified against the real artifact**, not only the test: `(4, 4)`, matching the recorded `heatmap_shape`, rows summing to 1.0 within 3e-6 |
-| AC-07 cosine matrix symmetric with 1s on diagonal | **PARTIAL** | Symmetry: PASS, exactly, on the real artifact. Diagonal: the real artifact reads `[1.00078, 1.00391, 0.99844, 1.00078]` — not 1, and three values are impossibly above 1. REV-128 |
-| AC-08 all JSON reports and PNG plots in correct locations | **PARTIAL** | FR-8 and FR-9 artifacts: present and verified. FR-4, FR-5 and FR-7 artifacts: absent (REV-129) |
-| AC-09 ANN force-inclusion rate reported | PASS | Rate computed and included in the evaluation output when `use_ann=True`; toy test |
+| AC-03 cold items disjoint from training | PASS | Asserted in `evaluation/cold_start.py` and re-measured against the regenerated artifacts under `specs/data-pipeline`: **3,010 naturally-cold items**, `cold ∩ train_interacted = ∅`, and `train_interactions_removed_by_holdout: 0`. `cold_start_t_small.json` was regenerated off the new checkpoint (15:38) and now reports all four cells on a natural cold set: cold NDCG 0.04165 / 0.04143 (metadata on / off) against warm 0.08658 / 0.07695 — the cold-start question is no longer vacuous |
+| AC-04 long-tail buckets partition all item IDs | PASS | Measured on both the pickle and the JSON: sizes sum to 20,720 = `num_items`, `disjoint: true`, `complete_union_size: 20720`. Pinned by two tests, one of which I verified fails on the superseded scheme |
+| AC-05 latency includes device synchronization | PASS | Verified in code at three call sites in the timing loop |
+| AC-06 heatmap shape `(num_objectives, num_experts)` | PASS | `TestRoutingDiagnostics` checks the shape and the entropy extremes (uniform → max, delta → zero) |
+| AC-07 cosine matrix symmetric with 1s on diagonal | PASS | Measured on the real artifact: diagonal within **1.79e-06** of 1.0, no entry above 1.0. The test now asserts `< 1e-4` on the diagonal, a documented `FP32_ULP = 1e-5` range tolerance, and `< 1e-6` symmetry — replacing a `< 0.01` bound wide enough to accept the 1.0039 the bf16 artifact actually contained |
+| AC-08 all JSON reports and PNG plots generated | PASS | All six logs and all eight plots present in the expected locations |
+| AC-09 ANN force-inclusion rate reported | PASS | Reported when `use_ann=True`; `tests/test_ann_retrieval.py` covers the force-inclusion path |
 
 ## Findings
 
 ```
+REV-132
+Severity: MEDIUM | Status: RESOLVED | Requirement: FR-5 | AC: AC-04
+File: evaluation/longtail.py:36-86 (compute_popularity_buckets)
+This is the long-tail bucketing question carried as an open item for the spec owner across
+  several rounds, now decided (2026-09-18) and implemented. The split is 20/20/60 of the
+  WHOLE CATALOGUE. No requirements change was needed -- FR-5 meant what it literally says,
+  and the code now matches it.
+Resolution, measured on the regenerated artifacts rather than on the diff:
+  head 3,356 -> 4,144, mid 3,357 -> 4,144, tail 14,007 -> 12,432; realized catalogue
+  fractions 0.162/0.162/0.676 -> exactly 0.200/0.200/0.600. `popularity_buckets.pkl` and
+  `longtail_t_small.json` agree, and the JSON's `nominal_fractions` and
+  `realized_fractions_of_catalogue` are identical -- the two fields T3.3 added exist
+  precisely so this is checkable from the file.
+Verification (independent): the superseded scheme was reinstated in the working copy and
+  the suite re-run. `test_disjoint_complete_correct_percentiles` FAILS on it and passes on
+  the fix; 21 other tests unaffected. Source restored.
+Design note, and the right call: the zero-interaction clause is now a CONSEQUENCE of the
+  ordering rather than a separate step, so it is asserted rather than enforced -- with an
+  explicit `ValueError` naming the incompatibility for the one dataset shape where FR-5's
+  first and second clauses genuinely conflict. Unreachable here (19.0% zero-interaction
+  against a 60% tail), but it fails loudly instead of silently choosing a clause, which is
+  what `steering/code-quality.md` requires.
+```
+
+```
 REV-128
-Severity: LOW | Status: OPEN | Requirement: FR-9 | AC: AC-07
-File: evaluation/gradient_diagnostics.py:17-35 (`gradient_cosine_similarity`);
-      tests/test_diagnostics.py:94-99 (the AC-07 test)
-Problem: the per-objective gradients are flattened and compared in whatever dtype the
-  model holds, which is bf16 everywhere in this project. `F.cosine_similarity` on bf16
-  vectors of ~790k elements does not return 1.0 for a vector against itself.
-Evidence (measured against the real artifact, not a fixture) --
-  `outputs/logs/gradient_diagnostics_t_small.json`, `cosine_similarity` diagonal:
-      [1.0007813, 1.00390625, 0.99843752, 1.0007813]
-  Three of the four are ABOVE 1, which is outside the range a cosine similarity can take.
-  The matrix is exactly symmetric, so only the diagonal half of AC-07 is affected.
-Impact: Diagnostic reporting only -- nothing reads this matrix back into training, and the
-  off-diagonal interference numbers the Ablation D claim rests on are affected only at the
-  same ~4e-3 magnitude, which is far below the effect being measured. The real cost is
-  presentational and reputational: `gradient_cosine_similarity_t_small.png` is a paper
-  figure, and a heatmap whose diagonal reads 1.004 invites exactly the wrong question from
-  a reviewer.
-  Note why this survived: the AC-07 test asserts `abs(cos_sim[i, i] - 1.0) < 0.01`, a
-  tolerance wide enough to accept 1.0039. The test is not wrong to be tolerant of fp
-  noise; it is just not tight enough to distinguish fp noise from a dtype choice.
-Correction: cast the flattened gradients to fp32 before the comparison --
-      grads[name] = flat.float()
-  in `gradient_cosine_similarity`, which costs one temporary copy on a diagnostic path
-  that already runs rarely. `per_objective_grad_norms` is worth the same treatment for
-  consistency. Then tighten the AC-07 test to `< 1e-4` and add an assertion that no entry
-  exceeds 1.0, so the range violation cannot come back. This is the same fp32-at-the-
-  measurement-site pattern `routing_diagnostics` and `local_train` already use
-  (`normalize(..., .float())`).
+Severity: LOW | Status: RESOLVED | Requirement: FR-9 | AC: AC-07
+File: evaluation/gradient_diagnostics.py (gradient_cosine_similarity,
+      per_objective_grad_norms)
+Resolution verified on the artifact, which is where the defect was visible: the cosine
+  diagonal now reads [1.00000107, 1.00000095, 1.00000095, 1.00000179] -- maximum deviation
+  1.79e-06, against the bf16 artifact's 3.91e-03, with three of four entries previously
+  ABOVE 1.0 and none above now. The flattened gradients are cast with `.float()` at the
+  measurement site, matching the pattern `routing_diagnostics` and `local_train` already
+  use.
+The test tightening matters as much as the fix: the old bound was `< 0.01`, wide enough to
+  accept the 1.0039 that was actually being produced. It is now `< 1e-4` on the diagonal, a
+  documented `FP32_ULP = 1e-5` range assertion, and `< 1e-6` on symmetry.
 ```
 
 ```
 REV-129
-Severity: MEDIUM | Status: OPEN | Requirement: FR-4, FR-5, FR-7 | AC: AC-08
-File: outputs/logs/ (no cold_start_*.json, longtail_*.json, efficiency_*.json);
-      outputs/plots/ (no cold_vs_warm_*.png, longtail_*.png)
-Problem: `--stage evaluate` has never been run, so three of this spec's five required
-  report artifacts and two of its required plots do not exist. Listing `outputs/logs/` and
-  `outputs/plots/` directly this pass, the only artifacts belonging to this spec are the
-  routing and gradient diagnostics the T6.3 pretraining run produced as a side effect.
-  AC-08 ("All JSON reports and PNG plots generated in correct locations") is therefore
-  half-met at best.
-Impact: FR-4 and FR-5 carry two of the paper's four research questions -- cold-start
-  performance with metadata ON vs OFF, and head/mid/tail behaviour. Neither has a single
-  measured number behind it. FR-7's efficiency report is the source for the
-  parameter/latency/FLOPs columns of the comparison tables. The code for all three is
-  implemented and unit-tested, so this is an execution gap, not a correctness gap -- but
-  unit tests on synthetic fixtures cannot produce the numbers these requirements exist to
-  produce.
-  Raised to a finding this pass (it was prose in the previous review) because the reason
-  to defer it is gone: `outputs/checkpoints/t_small/best.pt` now exists and was verified
-  in the training-pipeline review, so the stage has an input.
-Correction: Run
-      uv run python main.py --stage evaluate --model t-small
-  and verify against the files rather than the console: `cold_start_t_small.json` reports
-  metrics for cold and warm separately under metadata ON and OFF (all four cells);
-  `longtail_t_small.json` reports head/mid/tail with the bucket populations, and the
-  buckets partition the catalogue; `efficiency_t_small.json` carries every field FR-7
-  lists, including `timed_metadata_source == "item_metadata"` (the REV-110 fix, confirmed
-  on a real run for the first time); and both plots render.
-  Sequencing, and it is load-bearing:
-    - Fix REV-128 BEFORE this run, so the gradient diagnostics that end up in the paper
-      carry fp32 cosines.
-    - `loss-functions` REV-105 changes the multi-step objective, which makes the current
-      `outputs/checkpoints/t_small/best.pt` a model trained under a superseded objective.
-      This stage evaluates that checkpoint. Re-run the ~190 s T6.3 pretrain gate after
-      REV-105 lands and evaluate the REGENERATED checkpoint; otherwise every metric here
-      describes an experiment the code no longer implements.
-    - REV-122 (transformer-backbone, CRITICAL) does NOT affect this run -- it is MPS/SDPA,
-      which is the correct path. No artifact on disk is contaminated by it.
+Severity: MEDIUM | Status: RESOLVED | Requirement: FR-4, FR-5, FR-7 | AC: AC-08
+File: outputs/logs/, outputs/plots/
+Resolution: all missing artifacts produced and verified against the files --
+  `test_metrics_t_small.json`, `cold_start_t_small.json` (all four cold/warm x metadata
+  cells), `longtail_t_small.json`, `efficiency_t_small.json` (every FR-7 field, including
+  `timed_metadata_source == "item_metadata"`, which confirms REV-110 on a real run for the
+  first time), and the regenerated gradient diagnostics. AC-08 is met for t-small.
+Worth recording: BUILD corrected three factual errors in this finding's own stated
+  procedure -- the T6.3 pretrain gate does NOT regenerate gradient diagnostics (the hook
+  fires at `grad_diag_interval_steps = 500` and the gate runs 200 steps); the
+  `gradient_diagnostics` and `routing_diagnostics` stages were dead on a `NameError` and
+  needed fixing first; and `--stage evaluate` writes only `test_metrics_*.json`, not the
+  other three reports. Correcting the finding rather than working around it is the right
+  response, and the corrections check out against the code.
 ```
 
 ```
 REV-119
-Severity: LOW | Status: OPEN | Requirement: FR-1 | AC: AC-01
-File: data/sequence_generator.py:679-692 (`load_eval_candidates`), reached from
-      training/local_train.py:250 and evaluation/longtail.py:100
-Problem: unchanged. `load_eval_candidates` does a plain `np.load(path)` and then
-  fingerprints the whole matrix. Re-measured this pass: `test_candidates.npy` is
-  (1,059,494 x 101) int64 = 856 MB. For `longtail.py` that is fine -- it iterates the
-  whole test split anyway. For `run_local_personalization` it is not proportionate: that
-  stage scores 1,000 users, i.e. a few thousand rows, and pays a ~1 GB resident copy and a
-  full-matrix hash to reach them.
-Impact: Operational, not a correctness defect -- and strictly better than the behaviour it
-  replaced, which was wrong. Its practical weight is about to increase: REV-127 asks for
-  the first real personalization run, which is exactly the path that pays this cost, and
-  `--stage all` would hold this alongside the 11 GB preprocessing peak.
-Correction: Load with `mmap_mode='r'` and slice the needed rows, materialising only what
-  is scored; the fingerprint pass is already block-wise (REV-087) and works on a memmap.
-  Keep the eager path for `--stage evaluate`, which consumes the whole matrix. Worth doing
-  before REV-127's personalization run if that run hits memory pressure; otherwise still
-  not urgent.
-```
-
-```
-REV-093
-Severity: MEDIUM | Status: RESOLVED | Requirement: FR-1, FR-5 | AC: AC-01
-Resolution: re-verified at the boundary rather than at the call sites. `grep` for
-  `filter_negatives(` over `data models training evaluation main.py` returns only the
-  definition's own use inside `generate_eval_candidates` and one site in `train_user_lora`
-  that passes an explicit run-scoped `rng`. No evaluation entry point rebuilds candidates.
-```
-
-```
-REV-094
-Severity: LOW | Status: RESOLVED | Requirement: FR-5 | AC: —
-Resolution: re-confirmed. `run_longtail_evaluation` supplies the metadata matrix, so it no
-  longer scores a metadata-enabled model on a metadata-free path.
-```
-
-```
-REV-095
 Severity: LOW | Status: RESOLVED | Requirement: FR-1 | AC: AC-01
-Resolution: re-confirmed. `TestCandidateSetConsistency` spies on `score_candidates_batch`
-  in both evaluators and asserts the rows scored are the stored rows, with a fixture that
-  deliberately reproduces the shared-target case the old fallback collapsed. This is a
-  test that can fail on the defect it guards.
+File: data/sequence_generator.py (load_eval_candidates, load_or_build_eval_candidates);
+      training/local_train.py
+Resolution: `mmap: bool = False` added to both loaders, so every existing caller keeps the
+  eager path unchanged, and only the row-sliced consumer (`run_local_personalization`)
+  passes `mmap=True`. The block-wise fingerprint reads a memmap without materialising it,
+  so the mapped path runs the same integrity check -- and the extended test asserts that
+  verification still RAISES on a corrupted meta file through the mapped path, which is the
+  assertion that matters: a fast path that silently skips integrity checking would be
+  worse than the copy it saves.
+  The consequence BUILD handled is the kind that is easy to miss: a read-only memmap makes
+  `torch.as_tensor` alias a non-writable buffer, so the per-row conversion now copies 101
+  elements explicitly. `federated.py` and `longtail.py` were deliberately left eager
+  because both consume the whole matrix -- correct reasoning, not an oversight.
 ```
 
 ```
-REV-109
-Severity: LOW | Status: RESOLVED | Requirement: FR-9 | AC: —
-Resolution: re-confirmed. `run_gradient_diagnostics` saves and restores both
-  `model.training` and `moe_layer.training`.
+REV-093 / REV-094 / REV-095 / REV-109 / REV-110
+Severity: MEDIUM / LOW / LOW / LOW / LOW | Status: RESOLVED
+Re-confirmed. Candidate-set routing goes through the single loader everywhere; the
+  long-tail report carries its bucket populations and partition block; latency timing
+  synchronises around every timed run; and REV-110's metadata-provenance fields are
+  present in the real efficiency artifact (`timed_metadata_source == "item_metadata"`),
+  which closes it on evidence rather than on the diff alone.
 ```
 
 ```
-REV-110
-Severity: LOW | Status: RESOLVED | Requirement: FR-6 | AC: AC-05
-Resolution: confirmed in the diff. `benchmark_latency` gathers `metadata_matrix[dummy_seq]`
-  when a matrix is available, falls back to seeded `randn` when it is not, never to zeros,
-  and records which in `timed_metadata_source`. The timed input is now unambiguously the
-  serving input.
-  Not yet confirmed on a real `--stage evaluate` run, because none has happened --
-  REV-129 folds that check in.
+REV-133
+Severity: LOW | Status: RESOLVED | Requirement: FR-5 | AC: —
+File: specs/evaluation-diagnostics/tasks.md (T8.1)
+Resolution: T8.1's superseded figures are now collected under an explicit *"Superseded values
+  (2026-09-17/18), retained so the supersession is checkable rather than merely asserted"*
+  block -- cold 0.05774/0.05485, warm 0.09286/0.08093, buckets 3,356 + 3,357 + 14,007 with
+  head NDCG 0.09937 -- sitting below the current values. Retaining them beats deleting them:
+  a reader can verify the change rather than take it on trust, which is the same standard
+  REV-130 asked of T6.3.
+  The note also records the second reason they are superseded -- REV-137 changed the training
+  data underneath -- so the supersession is attributed to both causes, not just the bucketing.
+```
+
+```
+REV-134
+Severity: INFO | Status: OPEN | Requirement: — | AC: —
+File: outputs/logs/moe_parameter_report_t_base_A_arv_mmoe_gradnorm*.json
+Note: running `pytest` writes into the project's real `outputs/logs/`. Both MoE parameter
+  reports were rewritten during this review's test runs (mtime 2026-09-18 13:34, matching
+  the suite invocation). `outputs/` is gitignored so nothing is corrupted in version
+  control, and these two files are pure functions of the config so their contents do not
+  change -- but a test suite that mutates the deliverable directory can in principle
+  overwrite a real run's artifact with a fixture's. Worth a `tmp_path` log_dir in the
+  ablation tests at some point. No action required, and not a defect in this spec's code.
 ```
 
 ## Design Compliance
 
-Compliant. The Constraints line this spec turns on — "Fixed evaluation candidate sets
-generated once and reused — never regenerated per model" — is enforced by a single loader
-with a row-count guard rather than by each call site remembering to do the right thing.
-That is a strengthening of the design.
+Compliant. The constraints this spec places on itself are all respected:
 
-`OBJECTIVE_ORDER` is respected by the routing and gradient diagnostics and by their plots;
-I confirmed this against the real artifact, where `objective_names` is recorded alongside
-the matrix. Latency timing synchronizes the device per `code-quality.md`. Plot output goes
-to `outputs/plots/` at `config.plot_dpi`.
-
-One design point is worth recording now that real numbers exist: the Constraints line "Do
-not interpret low entropy as proof of usefulness — report without editorializing" is
-respected by the artifact, which reports `overall_utilization`
-`[0.065, 0.311, 0.395, 0.229]` and the two collapse fractions as bare numbers with no
-verdict attached. That utilization is notably non-uniform for a 200-step run, which is
-information for the owner rather than a defect — it is exactly the kind of thing the
-diagnostic exists to surface.
+- **Fixed candidate sets generated once and reused, never regenerated per model** — held
+  by routing every consumer through the shared loaders, and now held through the
+  memory-mapped path as well.
+- **Diagnostics use declared diagnostic data, never optimizer-step batches** — the
+  gradient hook draws from a separate `diag_loader`, and the caller re-zeros gradients
+  after the excursion so the diagnostic pass cannot contaminate the training step.
+- **Report without editorializing** — the artifacts carry measured numbers. The routing
+  utilization `[0.065, 0.311, 0.395, 0.229]` against a uniform 0.25 is recorded as an
+  observation from a capped run and not interpreted, which is exactly what the constraint
+  asks for.
+- **No silent substitution** — the new `ValueError` in `compute_popularity_buckets` is the
+  clearest instance of this rule being applied deliberately rather than by habit.
 
 ## Task Completion
 
-| Task | Verdict |
-|---|---|
-| T1.1–T1.5 metrics, eval loop, ANN, calibration | Checked and verified |
-| T2.x cold-start, T3.x long-tail | Checked; both load stored candidates and T3.x supplies metadata. Implementation complete; **never executed** (REV-129) |
-| T4.1–T4.3 latency + efficiency | Checked; the timed path is now the serving path. Report never produced (REV-129) |
-| T5.x routing diagnostics | Checked, and **now artifact-verified** — heatmap shape and row sums measured on the real JSON |
-| T6.x gradient diagnostics | Checked, and now artifact-verified — which is how REV-128 surfaced |
-| T7.1 candidate-set consistency test | Checked and justified — this was the false-complete REV-095 flagged, and its replacement is sound |
+| Task | Marked | Verdict |
+|---|---|---|
+| T3.3 record bucket populations and partition | `[x]` | Complete, and the fields earned their keep immediately — they are what makes T3.4's 0.20/0.20/0.60 checkable from the artifact rather than by re-deriving from the pickle |
+| T3.4 catalogue-wide split | `[x]` | Complete. Every measured claim re-verified here, and the non-vacuity claim reproduced independently. The cache hazard BUILD names is real and was handled: `run_longtail_evaluation` loads `popularity_buckets.pkl` whenever it exists, so a stale pickle would have survived the code change silently |
+| T6.5 fp32 gradient measurement | `[x]` | Complete and confirmed on the artifact, not only in the unit test |
+| T6.6 memory-mapped candidates | `[x]` | Complete, with the integrity check preserved through the mapped path and the non-writable-buffer consequence handled |
+| T8.1 stage execution | `[x]` | Complete as to execution and artifacts. Its recorded long-tail figures are stale relative to T3.4 — REV-133 |
+| T1.x–T7.x | `[x]` | Complete. Verified against the code, the artifacts and 38 passing tests across the three relevant test modules |
 
-No false-complete tasks: every task claims implementation and every implementation exists.
-As in `personalization-federated`, no task in this spec asks anyone to *run* the stage.
+No false-complete tasks.
 
 ## Testing and Verification
 
 | Command | Result |
 |---|---|
-| `uv run python -m pytest -q` | **267 passed**, 0 failed, 49.20 s |
-| Load `outputs/logs/routing_diagnostics_t_small.json` (direct) | heatmap `(4, 4)` == recorded `heatmap_shape`; row sums 1.0 ± 3e-6; collapse fractions and utilization present — AC-06 |
-| Load `outputs/logs/gradient_diagnostics_t_small.json` (direct) | cosine matrix `(4, 4)`, **exactly symmetric**; diagonal `[1.00078, 1.00391, 0.99844, 1.00078]` — AC-07 half-met, REV-128 |
-| `grep -rn "filter_negatives(" data models training evaluation main.py` | definition's own use + one `rng`-passing site — REV-093 still closed |
-| `git diff evaluation/flops.py` | REV-110 fix confirmed; `timed_metadata_source` recorded |
-| `ls outputs/logs outputs/plots` | no `cold_start_*`, `longtail_*`, `efficiency_*`, `cold_vs_warm_*` — REV-129 |
-| `uv run python -m compileall -q evaluation models` | clean |
+| `uv run python -m pytest -q` | **275 passed**, 0 failed, 55.74 s |
+| `uv run python -m pytest tests/test_diagnostics.py tests/test_metrics.py tests/test_ann_retrieval.py -q` | **38 passed**, 3.45 s |
+| `uv run python -m pytest tests/test_diagnostics.py -q` **with the superseded bucketing reinstated** | **1 failed, 21 passed** — `test_disjoint_complete_correct_percentiles`. Source restored |
+| Read `data/processed/popularity_buckets.pkl` (direct) | head 4,144 / mid 4,144 / tail 12,432, sum 20,720 |
+| Read `outputs/logs/longtail_t_small.json` (direct) | `bucket_populations` as above; `bucket_partition` `disjoint: true`, `complete_union_size: 20720`, nominal == realized at 0.20/0.20/0.60; head NDCG 0.09744 > mid 0.04760 > tail 0.04623 |
+| Read `outputs/logs/gradient_diagnostics_t_small.json` (direct) | diagonal `[1.0000011, 1.0000010, 1.0000010, 1.0000018]`; max deviation 1.79e-06; no entry > 1.0 |
+| Read `outputs/logs/efficiency_t_small.json` (direct) | all FR-7 fields present, including `timed_metadata_source`, `routing_overhead`, `flops_per_inference` |
+| Read `outputs/logs/cold_start_t_small.json` (direct) | all four cells: `cold_meta_on/off`, `warm_meta_on/off` |
+| `grep -n synchronize evaluation/flops.py` | `_synchronize` defined with both MPS and CUDA branches; called at three points in the timing loop |
+| `ls outputs/plots/` | all eight plots present |
 
 ## Final Assessment
 
-For BUILD, in order:
+**Nothing for BUILD in this spec. It is accepted.**
 
-1. **REV-128 (LOW, but do it first)** — cast the flattened gradients to fp32 in
-   `gradient_cosine_similarity` (and `per_objective_grad_norms`), then tighten the AC-07
-   test to `< 1e-4` and assert no entry exceeds 1.0. One line plus a test. It comes first
-   only because REV-129's run should regenerate these artifacts afterwards.
-2. **REV-129 (MEDIUM, blocking)** — run `--stage evaluate --model t-small` and verify
-   the five artifacts against the files. AC-08 cannot be met any other way, and FR-4/FR-5
-   carry two of the paper's research questions.
-3. **REV-119 (LOW)** — `mmap_mode='r'` in `load_eval_candidates` for the row-sliced
-   consumers. Worth doing before the personalization run (`personalization-federated`
-   REV-127) if that run hits memory pressure.
+Every finding this spec owns is closed, and the two that mattered were closed in the way
+that leaves the decision auditable: the long-tail supersession is recorded with both the old
+and new values, and T8.1's stale figures are retained-and-labelled rather than quietly
+overwritten.
 
-For the **spec owner** (no action required, one thing to look at):
+Worth noting that the long-tail work survived a change it did not anticipate. REV-137
+regenerated `popularity_buckets.pkl` from different training data, and the catalogue-wide
+split still lands at exactly 4,144 / 4,144 / 12,432 — because the rule is expressed as a
+property of the catalogue rather than of a particular popularity distribution. That is the
+difference between a fix and a fix that holds.
 
-4. The first real routing artifact shows expert utilization of
-   `[0.065, 0.311, 0.395, 0.229]` against a uniform `1/K = 0.25`. From a 200-step capped
-   run this is not evidence of anything, but it is the number the Ablation G/collapse
-   discussion will turn on, so it is worth having seen early.
+Two items carried, neither actionable here:
+
+1. **`training-pipeline` REV-138 — RESOLVED.** The provenance enumeration omitted
+   `evaluation/`, so the six artifacts this spec produces carried a revision that did not move
+   when their producing code changed. The owner widened the rule to an exclusion rule and BUILD
+   implemented it; verified here, editing `evaluation/longtail.py` now moves `source_hash`, and
+   all 7 `evaluation/` modules are covered. This spec was the strongest argument for the change
+   and is the main beneficiary of it. Note existing artifacts keep their pre-widening hash and
+   are **not** to be re-stamped (REV-140).
+2. **REV-134 (INFO).** `pytest` still writes `moe_parameter_report_*.json` into the real
+   `outputs/logs/` — timestamps moved again during this review's test runs. Harmless today
+   (the contents are a pure function of config, and `outputs/` is gitignored), but a suite
+   that mutates the deliverable directory can in principle overwrite a real run's artifact.
+   A `tmp_path` log dir in the ablation tests closes it whenever it is convenient.

@@ -22,6 +22,55 @@
 - "No silent fallback" is about *honesty of the manifest*, not about kernel preference: the backend that actually ran is the backend that gets recorded, and `require_attention_backend=True` turns any substitution into a hard failure.
 - Record PyTorch version, device, dtype, and resolved attention backend in every run manifest.
 
+## Artifact Provenance
+
+**Owner decision (2026-09-18).** Every artifact must be able to say which code produced it, from
+the file itself and without reference to prose.
+
+- Every checkpoint records a `source_revision`: the git commit when the tree is clean; otherwise
+  the commit plus a content hash over the covered sources and a `dirty: true` marker. A run from a
+  dirty tree is recorded as such, never silently as its nearest commit.
+- Every artifact derived from a checkpoint — metrics, diagnostics, reports, round logs — echoes
+  that checkpoint's `source_revision` verbatim.
+- A verification note that quotes a number quotes it by reading the artifact back after the run,
+  never from console output. A run that is later superseded then leaves a record that is visibly
+  wrong rather than plausibly right.
+
+### Coverage: a property, not a list (amended 2026-09-18)
+
+**The governing rule is a property: `source_revision` must change whenever any code that can
+change a published artifact changes.** Everything below is how that property is realised; if the
+two ever conflict, the property wins and the realisation is the thing that is wrong.
+
+Coverage is therefore defined by **exclusion, not enumeration**: every first-party `.py` file in
+the repository is covered, except
+
+- `tests/` — a test cannot change a published artifact;
+- `.venv/`, `__pycache__/`, and anything not tracked by git;
+- `data/raw/` and `data/processed/` — data, not code.
+
+An allowlist was tried first and failed within one round: it named `models/`, `training/`,
+`data/`, `configs/` and thereby omitted `evaluation/`, which is where every derived artifact in
+this project is actually produced. Measured at the time: editing `evaluation/longtail.py` left
+`source_revision` byte-identical. A denylist covers new code by default, so drift now requires
+someone to write an explicit exclusion rather than merely to forget one.
+
+Two constraints that follow, and are not optional:
+
+- **The dirtiness check and the content hash use the same coverage rule**, so the two halves of a
+  revision can never disagree about what "this code" means. A change to a covered file that moves
+  neither the hash nor the `dirty` flag is a defect in the rule's implementation.
+- **Coverage completeness is tested, not assumed.** A test asserts that the set of files actually
+  hashed equals the set this rule defines. Asserting only that *some* change moves the hash proves
+  the mechanism works, not that it covers what it must — that is precisely the gap that let the
+  allowlist ship green.
+
+**Why this exists.** Commit time is not edit time, and a change landing between a run and its
+write-up leaves no trace in the artifact. That happened: three task notes gave three different
+accounts of which objective trained a single checkpoint, none matched the files, and the question
+could not be settled from the repository at all — the checkpoint stores `config`, which the change
+in question did not touch. Provenance belongs in the artifact, not in prose about the artifact.
+
 ## Configuration as Single Source of Truth
 
 - `configs/config.py` (`Config` dataclass) holds all hyperparameters.

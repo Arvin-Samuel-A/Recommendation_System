@@ -44,6 +44,40 @@ Ordered tasks. Depends on all other specs. This is the final integration layer.
     Non-vacuity verified, not assumed: removing the import again makes the test FAIL with
     the original `NameError`. `tests/test_cli.py` 38 passed.
 
+- [x] **T1.7: Guard the whole REV-135 defect class, not just the one instance** — T1.6
+  fixed one unresolvable name and pinned it with one test. That was not enough: while
+  implementing AC-09 the **same defect recurred**, in `run_longtail_stage`, which gained a
+  call to `artifact_source_revision` without the matching import. `--stage longtail` exited
+  1 with `NameError: name 'artifact_source_revision' is not defined` — and the full 284-test
+  suite was green at the time. Found the same way T1.6 was: by running the stage.
+  - Fix: the missing import, plus
+    `tests/test_cli.py::TestEvaluationStagesResolveTheirNames`, which walks the AST of each
+    evaluation stage body (`evaluate`, `cold_start`, `longtail`, `latency`) and asserts
+    every global name it loads resolves against either the function's own imports or
+    `main`'s module namespace. Parametrized, so a new stage is one line.
+  - Non-vacuity verified, not assumed: removing the import again makes the test FAIL,
+    naming `['artifact_source_revision']` and the stage. Restored, it passes.
+  - The lesson is the one the `ablations-cli` review already drew and this incident
+    confirms from the other side: a green suite is not evidence that a stage runs. T1.6
+    caught an instance; this catches the class. It does not replace running the stages —
+    it just means the next instance fails in CI instead of in a two-hour cascade.
+
+- [x] **T1.8: Echo `source_revision` in every per-arm ablation result (AC-09)** —
+  `steering/code-quality.md` "Artifact Provenance" binds every spec, and it matters more
+  here than anywhere else: an ablation JSON **compares arms**, and an unstamped one cannot
+  prove its arms were produced by the same code. `_run_single_config` now records
+  `result["source_revision"]` read off the checkpoint that arm was evaluated from — via
+  `utils.artifact_source_revision`, so a shared-backbone arm (REV-084) reports the
+  provenance of the backbone it actually reused rather than of the code that scored it.
+  It sits alongside the `resolved_config`, `config_diff` and `training_fingerprint` the
+  result already carries.
+  - **Not yet exercised on a real study**, because `outputs/ablations/` is still empty —
+    that is REV-130, correctly sequenced to Phase 14. Implemented now so the Phase 14
+    studies are stamped from their first run rather than retrofitted. When those run,
+    verify each `{study}_{model}.json` arm's `source_revision` against the checkpoint under
+    `outputs/checkpoints/ablations/{study}_{label}/`, and check that arms sharing a
+    `training_fingerprint` also share a `source_revision`.
+
 - [x] **T1.2: Implement CLI override logic** — Apply `--epochs`, `--batch_size`, `--moe_variant`, `--num_experts`, `--use_gradnorm` to Config. Log original vs new values for each override. Map `--epochs` to `pretrain_epochs` for pretrain stage and `federated_rounds` for federated stage. (FR-1, AC-05)
 
 - [x] **T1.3: Implement startup routine** — Seed all RNGs (`torch.manual_seed`, `np.random.seed`, `random.seed`). Set `torch.backends.cudnn.deterministic = True`. Save resolved config to `outputs/logs/run_config.json`. (FR-3, AC-10)

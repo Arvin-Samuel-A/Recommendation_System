@@ -21,6 +21,18 @@ Ordered tasks. Depends on transformer-backbone (complete) and data-pipeline T1.1
 - [x] **T2.2: Implement `MoELayer` class** — `__init__` builds components based on `config.moe_variant`: "none" → nothing, "arv_mmoe" → SharedExperts + ARVRouter + ObjectiveEmbeddings, "mmoe" → SharedExperts + ConventionalMMoEGates. `forward(all_hidden_states, pooled_hidden, objective_idx)` returns `(Z_ut, r_ut)`. For "none" variant: return `(all_hidden_states, None)`. Implement expert output caching (compute once per batch, clear between batches). (FR-7, FR-8)
 
 - [x] **T2.3: Implement `count_router_parameters` function** — Compute: mmoe_gate_params, arv_router_params, arv_objective_embedding_params, arv_total, difference. Uses config dimensions. Save to `outputs/logs/moe_parameter_report_{model}.json`. (FR-6, AC-05)
+  - **Provenance stamp added 2026-09-18** (owner-approved; driven by `training-pipeline`
+    REV-136's closing note, not by a finding in this spec). The report now carries
+    `source_revision`. It echoes the **running** revision via `get_source_revision()`, not
+    `artifact_source_revision()`: the report is a pure function of `config` and is not
+    derived from a checkpoint, so there is no model whose provenance it could be
+    reporting. Verified by reading the field back off a written file, not off the returned
+    dict — `tests/test_moe.py::TestParameterReportNamespacing::test_report_carries_the_running_source_revision`,
+    which fails if the stamping line is removed.
+  - The two already-published reports
+    (`moe_parameter_report_t_base_A_arv_mmoe_gradnorm{,_lora}.json`, written 23:32) were
+    **not** regenerated: they predate the field, and REV-138's instruction not to
+    re-stamp existing artifacts applies. Future arms carry it.
 
 ## Phase 3: Testing
 

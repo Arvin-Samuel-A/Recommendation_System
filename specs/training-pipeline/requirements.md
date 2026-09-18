@@ -41,6 +41,18 @@ The pretraining loop must correctly orchestrate: masked input preparation, trans
 - Contains: epoch, model_state_dict, moe_state_dict, loss_fns_state_dict, optimizer_state_dict, scheduler_state_dict, gradnorm_state_dict (holding log_lambdas, its optimizer state and initial_losses), val_ndcg, val_mrr, val_recall, val_precision, config
   - *(REV-126, owner 2026-09-17: MoE and GradNorm state are sibling top-level keys, not nested inside `model_state_dict` as this line previously implied. The MoE is a separate module and GradNorm's Adam state has no place in a model state dict, so the three-key layout is correct; the wording was wrong.)*
 - Best checkpoint metadata: best_epoch, best_val_ndcg, best_val_mrr, best_val_recall, best_val_precision, seed, model_name, moe_variant, use_gradnorm, num_experts
+- **`source_revision`** — required on every checkpoint. The git commit when the tree is clean;
+  otherwise the commit plus a content hash over the covered sources, with a `dirty: true` marker.
+  Every artifact derived from a checkpoint echoes this value verbatim, so "which code produced
+  this number?" is answerable from the files. `config` alone is insufficient: a change to a loss
+  function or an attention kernel leaves it identical.
+  - **Coverage is defined by `steering/code-quality.md` ("Coverage: a property, not a list",
+    amended 2026-09-18) and is deliberately NOT restated here.** The governing rule is the
+    property — the revision must change whenever any code that can change a published artifact
+    changes — realised as an exclusion rule rather than an enumeration. This requirement
+    previously restated the enumeration `models/`, `training/`, `data/`, `configs/`; that list
+    omitted `evaluation/`, where every derived artifact is produced, and a second copy of a list
+    is a second thing to drift. One definition, in steering, referenced from here.
 
 ### FR-4: Best Checkpoint Selection (Step 15.3.1)
 - Selected ONLY by validation NDCG@10 — strict improvement over best seen so far
@@ -111,3 +123,12 @@ The pretraining loop must correctly orchestrate: masked input preparation, trans
 - **AC-06:** Routing distributions are accumulated in per-epoch buffer (not discarded)
 - **AC-07:** Per-epoch log contains all required fields (losses, metrics, LR, lambdas)
 - **AC-08:** All assertions (finite losses, finite lambdas, finite gradients) hold throughout training
+- **AC-09:** Every saved checkpoint carries a `source_revision`, and every artifact derived from a
+  checkpoint carries the same value. Verified by reading a real checkpoint and at least one derived
+  artifact and comparing the two fields — not by the presence of the code that writes them. A run
+  from a dirty working tree is marked `dirty: true` rather than attributed to its nearest commit.
+  **Coverage is complete against the rule in `steering/code-quality.md`, and completeness is
+  tested rather than assumed:** the set of files actually hashed equals the set that rule defines,
+  and the dirtiness check uses the same rule as the hash. A test showing that *some* covered change
+  moves the revision proves the mechanism works, not that it covers what it must — that distinction
+  is what let the superseded enumeration pass a green suite while omitting `evaluation/`

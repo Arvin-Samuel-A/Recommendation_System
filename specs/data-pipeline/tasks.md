@@ -30,6 +30,71 @@ Ordered implementation tasks. Each task traces back to requirements/design. Task
 
 - [x] **T4.3: Test cold-start holdout** — Unit test: synthetic dataset with known timestamps → verify cold items are strictly post-cutoff, removed from training, present in val/test, set partition assertions hold. (AC-03)
 
+- [x] **T4.4: Implement `"unseen_in_training"` as the cold-start default (REV-137, amended
+  FR-3 / AC-03)** — Owner decision 2026-09-18, made after the REV-068 rationale was measured
+  and found to record a **false cause**. An item is cold iff it has zero interactions in any
+  user's training portion: `cold = all_items - train_interacted_items`. Nothing is deleted;
+  `cold_start_ratio` does not apply. (FR-3, AC-03)
+  - `data/preprocessing.py` — `identify_cold_items` gains the branch, computed against the
+    union over the **unfiltered** `train_seqs` the function already receives. No new
+    plumbing. The optional first-appearance threshold FR-3 describes is applied only when
+    `config.cold_start_first_seen_after` is set; when it is `None`, none is applied.
+  - `configs/config.py` — `cold_start_strategy` default is now `"unseen_in_training"`,
+    `Config.validate` accepts exactly the three documented values and its error message
+    names all three, and the new `cold_start_first_seen_after: Optional[float] = None`
+    field carries the optional threshold. `cold_start_ratio` is annotated as applying only
+    to the other two strategies.
+  - **AC-03's new clause is ASSERTED, not assumed.** Under this strategy the removal step
+    must be a no-op, so `filtered_train == train_seqs` is asserted directly, with a message
+    naming the before/after user and interaction counts. This is what distinguishes a
+    natural cold set from an induced one. `preprocessing_manifest.json` additionally records
+    `train_interactions_before_holdout` and `train_interactions_removed_by_holdout`, so the
+    question "was anything deleted to make this cold set?" is answerable **from the
+    artifact** rather than from the code that wrote it.
+  - **Non-vacuity verified, not claimed.** (a) Reinstating `first_appearance_rank` as the
+    default makes `test_unseen_in_training_is_the_configured_default` FAIL; restored, it
+    passes. (b) Injecting a selection that deletes a training interaction makes the AC-03
+    assertion FIRE with the count in the message; restored, it does not. Both were run.
+  - Tests in `tests/test_preprocessing.py::TestColdStartHoldout` (5 new): the configured
+    default; `cold == all_items - train_interacted` exactly; **the no-deletion clause,
+    which asserts the superseded default DOES delete on the same fixture** so the test
+    discriminates between the two protocols rather than merely documenting one;
+    `cold_start_ratio` does not move the set; the optional threshold tightens it and is
+    still non-deleting.
+  - **RUN AND VERIFIED (2026-09-18)** — `uv run python main.py --stage preprocess`, 107 s,
+    exit 0. Every figure below read back off the artifacts, not the console:
+      * **3,010 cold / 17,710 warm** over 20,720 items, against 2,072 / 18,648 before —
+        matching REV-137's measured prediction exactly, including `warm 18,648 -> 17,710`.
+      * **`train_interactions_removed_by_holdout: 0`**, against the 6,634 the superseded
+        default removed across 2,192 users. All **136,677** users retain training history.
+      * `cold == set(1..20720) - train_interacted_items` verified True by direct set
+        comparison; `cold ∩ train_interacted = ∅`; `cold ∩ warm = ∅`; `cold ∪ warm ==
+        {1..20720}`.
+      * `preprocessing_manifest.json` records `cold_start_strategy: "unseen_in_training"`.
+      * Negative pool rebuilt over exactly the 17,710 warm items (measured: 17,710 distinct,
+        all ⊆ warm); both candidate matrices and `popularity_buckets.pkl` regenerated —
+        the latter measured at head 4,144 / mid 4,144 / tail 12,432, so T3.4's
+        catalogue-wide split survives the change.
+  - **CASCADE COMPLETED.** This changes the training data, so the re-run went all the way
+    through: preprocess → pretrain gate → personalize → federated → evaluate, cold_start,
+    longtail, latency, routing_diagnostics, gradient_diagnostics. Sequenced with
+    `training-pipeline` REV-129/REV-136 and `personalization-federated` REV-131 so one pass
+    served all three, and landed **before** BUILD_ORDER Phase 14 as REV-137 directs. The
+    authoritative record of that run is `specs/training-pipeline` T6.3.
+  - **For the paper's method section**, per FR-3's rationale: cold items are those with no
+    training-set interactions under the chronological split — not a global-date rule, and
+    not an induced holdout. If a strictly temporal characterisation is wanted, set
+    `cold_start_first_seen_after` and report it; without a threshold the set is dominated
+    by, but not exclusively, recent items.
+
+- [x] **T4.5: Remove the dead `item_first_seen_orig_id` local (REV-121)** — Declared in
+  `identify_cold_items`, written nowhere and read nowhere; a leftover from the
+  deterministic-ordering work D3 describes. The ordering is correct without it: `item_map`
+  is built from `sorted(df["movieId"].unique())` with `idx + 1`, so the remapped ID is
+  strictly monotone in the original movie ID and the code's `(first_seen, remapped_item_id)`
+  sort induces exactly D3's stated `(first_seen, original_movie_id)` order. Deleted. INFO
+  severity, no behavioural change. (FR-3)
+
 ## Phase 5: Metadata
 
 - [x] **T5.1: Implement metadata extraction in `data/preprocessing.py`** — Load `genome_scores.csv` and `movie.csv`. For each item: extract top `genome_top_tags=20` genome features by relevance, one-hot encode genres. Build a `(VOCAB_SIZE, feature_dim)` = `(num_items+2, feature_dim)` matrix with row 0 all-zeros, rows 1..num_items aligned to remapped IDs, and the MASK_ID row (`num_items+1`) present and zero. Handle zero-metadata cold items (leave as zeros, log count). Save to `data/processed/item_metadata.npy`. (FR-4, AC-09)

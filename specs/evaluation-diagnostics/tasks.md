@@ -32,24 +32,57 @@ Ordered tasks. Depends on training-pipeline (for pretrained models and routing b
     `num_items`; pairwise disjoint TRUE; union == {1..20720}; pad and mask absent. **AC-04
     verified directly, not inferred.**
 
-  - **OPEN QUESTION FOR THE SPEC OWNER — not a defect, deliberately not changed by BUILD.**
-    The realized catalogue fractions are head 0.162 / mid 0.162 / tail 0.676, not FR-5's
-    nominal 0.20 / 0.20 / 0.60. Cause: `compute_popularity_buckets` sets
-    `n = len(sorted_items)`, which counts only the 16,781 items that HAVE training
-    interactions; the 20/20/60 split is applied to those, and the 3,939 zero-training
-    items are then appended to tail under FR-5's second clause.
-    FR-5 carries three clauses — (1) "Head: top 20%, Mid: middle 20%, Tail: bottom 60%",
-    (2) "Zero-training items classified as tail", (3) "All item IDs partitioned". The
-    implementation satisfies (2) and (3) exactly and (1) relative to RANKED items, which
-    is what the code comment at `longtail.py:22` states. The alternative reading — rank the
-    whole catalogue, with zero-popularity items tying at the bottom — satisfies all three
-    exactly and yields 20/20/60 of the catalogue.
-    Both readings are defensible and no review has flagged this; the reviews mark AC-04
-    PASS on the partition property alone, which holds either way. BUILD is not changing it
-    because switching moves the bucket boundaries and changes the long-tail study's
-    published numbers, which is a research decision for the owner (§9). The realized
-    fractions are now recorded in the artifact so the choice is visible rather than
-    implicit.
+  - **RESOLVED by owner decision, 2026-09-18: the split is 20/20/60 of the WHOLE
+    CATALOGUE.** BUILD had flagged that the realized catalogue fractions were
+    0.162 / 0.162 / 0.676 because `compute_popularity_buckets` set
+    `n = len(sorted_items)` over the 16,783 items that HAVE training interactions and
+    then appended the 3,937 zero-interaction items to tail. FR-5's three clauses —
+    "Head: top 20%, Mid: middle 20%, Tail: bottom 60%", "Zero-training items classified
+    as tail", "All item IDs partitioned" — are all satisfied exactly by ranking the full
+    catalogue with zero-count items tying at the bottom, so **no requirements change was
+    needed**: the resolution is that FR-5 meant what it literally says, and the code now
+    matches it.
+    Implementation (T3.4 below). Note the zero-training clause is now a CONSEQUENCE of
+    the ordering rather than a separate append step, which is why it needed no special
+    handling.
+
+- [x] **T3.4: Apply the catalogue-wide 20/20/60 split (owner decision 2026-09-18)** — Rank ALL of `all_item_ids` by `(-count, item_id)` with a default count of 0, then cut at `int(n*0.20)` and `int(n*0.40)` over the full catalogue. Zero-interaction items sort last and land in tail structurally, so the separate `tail = tail | zero_items` append is removed. Keep the disjoint/complete assertions. Regenerate `popularity_buckets.pkl` and the long-tail artifact. (FR-5, AC-04)
+  - BUILD note: done and verified on the real catalogue.
+    Measured before -> after, `num_items = 20720` (16,783 interacted / 3,937 zero):
+      head  3,356 -> **4,144**   (0.1620 -> **0.2000**)
+      mid   3,357 -> **4,144**   (0.1620 -> **0.2000**)
+      tail 14,007 -> **12,432**  (0.6760 -> **0.6000**)
+    Cutoffs are exact: `len(head) == int(20720*0.20) == 4144`, `len(mid) == 4144`.
+    Partition re-verified: pairwise disjoint, union == {1..20720}, pad and mask absent,
+    and all 3,937 zero-interaction items ⊆ tail. **1,575 items changed head/mid
+    membership**, so the long-tail numbers move — which is the point of the decision and
+    why it was made before Phase 14 rather than after.
+    Regenerated `longtail_t_small.json` (00:35) now reports `nominal_fractions` and
+    `realized_fractions_of_catalogue` as IDENTICAL at 0.20/0.20/0.60 — the two fields
+    T3.3 added exist precisely so this agreement is checkable from the artifact.
+    New per-bucket metrics: head NDCG 0.09744 > mid 0.04760 > tail 0.04623 (was
+    0.09937 / 0.04793 / 0.04597 under the superseded buckets).
+    Added an explicit `ValueError` for the one case where FR-5's first and second clauses
+    are genuinely incompatible — zero-interaction items exceeding the tail fraction. It
+    cannot trigger on this dataset (19.0% vs a 60% tail) but fails loudly rather than
+    silently mis-bucketing, per `steering/code-quality.md`'s no-silent-substitution rule.
+    Cache hazard handled: `run_longtail_evaluation` LOADS `popularity_buckets.pkl`
+    whenever it exists, so the stale pickle would have silently survived this change. It
+    was moved aside and recomputed from the same inputs `data/preprocessing.py:627` uses,
+    which is equivalent to re-running `--stage preprocess` (108 s, 11 GB peak) for this
+    artifact alone. Only `evaluation/longtail.py` consumes the buckets — verified by grep
+    over `evaluation/`, `training/` and `main.py` — so no other artifact is affected.
+    Two tests updated, both verified to FAIL on the superseded scheme:
+      * `tests/test_preprocessing.py::test_popularity_buckets_partition_the_catalogue`
+        previously asserted the split against the INTERACTED denominator and said so in a
+        comment ("the full catalogue is the wrong denominator") — that is what let 0.162
+        pass CI across every prior review. Now asserts the catalogue denominator to 1e-3;
+        fails on the old buckets with `head is 0.1620 of the catalogue`.
+      * `tests/test_diagnostics.py::test_disjoint_complete_correct_percentiles` now pins
+        4 / 4 / 12 on its 20-item fixture; fails on the old scheme with `head=3, expected 4`.
+    `test_exact_20_20_60_proportions` passes unchanged — its fixture gives every item an
+    interaction, so the two schemes coincide there, which is why it never caught this.
+    Full suite: 275 passed.
 
 - [x] **T3.1: Implement `evaluation/longtail.py`** — Compute popularity from training set. Assign buckets: head (top 20%), tail (bottom 60%), mid (remaining). Zero-training items → tail. Assert partition: disjoint, complete over all item IDs. Save `data/processed/popularity_buckets.pkl`. (FR-5, AC-04)
 
@@ -149,23 +182,63 @@ Ordered tasks. Depends on training-pipeline (for pretrained models and routing b
     **Artifacts verified against the files:**
       * `test_metrics_t_small.json` — NDCG@10 0.09307, MRR 0.06675, Recall 0.18102,
         Precision 0.01810 over the full test split.
+      * **ALL FIGURES IN THIS BULLET LIST WERE SUPERSEDED ON 2026-09-18** and are updated
+        in place below. Two owner decisions landed after they were recorded: T3.4
+        (catalogue-wide long-tail buckets — REV-133 flagged this bullet's stale
+        populations specifically) and `data-pipeline` REV-137 (cold-start protocol
+        changed to `"unseen_in_training"`, which changes the TRAINING DATA and so changes
+        every number here). All six artifacts were regenerated off the 2026-09-18
+        re-run checkpoint and re-read from the files; see `training-pipeline` T6.3 for the
+        run itself. The pre-2026-09-18 values are kept at the end of this bullet.
       * `cold_start_t_small.json` + `cold_vs_warm_t_small.png` — all FOUR cells present:
-        cold/warm x metadata ON/OFF. Cold 0.05774 (on) vs 0.05485 (off); warm 0.09286 (on)
-        vs 0.08093 (off).
+        cold/warm x metadata ON/OFF. **Cold 0.04165 (on) vs 0.04143 (off); warm 0.08658
+        (on) vs 0.07695 (off).** Worth noting for the method section: the cold set is now
+        the 3,010 items with NO training interactions, so the cold/warm gap (0.042 vs
+        0.087) describes genuinely unseen items rather than the induced holdout the
+        previous numbers measured.
       * `longtail_t_small.json` + `longtail_t_small.png` — head/mid/tail metrics plus the
         bucket populations added by T3.3. **AC-04 verified directly against the buckets:**
-        3,356 + 3,357 + 14,007 = 20,720 = `num_items`, pairwise disjoint, union == {1..N},
-        pad and mask absent. head NDCG 0.09937 > mid 0.04793 > tail 0.04597.
+        **4,144 + 4,144 + 12,432 = 20,720 = `num_items`**, pairwise disjoint,
+        `complete_union_size: 20720`, `realized_fractions_of_catalogue` exactly
+        0.20 / 0.20 / 0.60 and identical to `nominal_fractions` (T3.4).
+        **head NDCG 0.09084 > mid 0.04667 > tail 0.04142**, the monotone ordering FR-5
+        expects, preserved under the new bucketing and the new training data.
       * `efficiency_t_small.json` — every FR-7 field, including
         **`timed_metadata_source == "item_metadata"`**, which confirms REV-110's fix on a
-        real run for the first time (REV-110 was closed on the diff alone). 1.824 ms/rec,
-        9,800,964 params, 18.69 MB bf16, 463,936,512 FLOPs/inference, routing overhead
-        0.438 ms.
+        real run (REV-110 was closed on the diff alone). **1.8216 ms/rec, 9,800,964 params,
+        18.69386 MB bf16, 463,936,512 FLOPs/inference, routing overhead 0.4436 ms.** The
+        parameter, size and FLOP counts are unchanged by the re-run, as they must be —
+        they are functions of the architecture, not of the data; only the timings moved.
+        A note on the two timing figures, because it illustrates REV-130 rather than
+        contradicting it: `--stage latency` was run twice on 2026-09-18 (the second time
+        after a one-line change to the run-manifest writer), and the timings differ
+        between them — 1.8676 / 0.4075 ms on the first, 1.8216 / 0.4436 ms on the second.
+        The figures above are read from the file that **survives**, which is the whole
+        point of quoting artifacts rather than console output: a superseded run leaves a
+        note that is visibly wrong, not plausibly right. Latency on a shared dev host is
+        noisy at this magnitude and neither number is a result; FR-6's statistics, not a
+        single mean, are what Phase 14 reports.
       * `gradient_diagnostics_t_small.json` + 2 plots — regenerated with the T6.5 fp32 fix:
-        diagonal `[1.00000107, 1.00000095, 1.00000095, 1.00000179]`, max deviation from
-        1.0 now **1.79e-06** against the previous bf16 **3.91e-03**, matrix exactly
-        symmetric, no entry outside range. **REV-128 closed on the artifact, not only in
-        unit test.** Off-diagonal interference: max 0.0612 (next_item/masked_item).
-    AC-08 is now met for t-small. Note the routing artifact reports expert utilization
-    `[0.065, 0.311, 0.395, 0.229]` against uniform 0.25 — the owner observation carried
-    from the prior review, unchanged and still from a capped run.
+        diagonal **`[1.00000107, 1.00000095, 1.00000095, 1.00000155]`**, max deviation from
+        1.0 now **1.55e-06** against the pre-fix bf16 **3.91e-03**, matrix exactly symmetric
+        (max |M_ij - M_ji| = **0.0**), no entry outside range. **REV-128 stays closed on the
+        artifact, not only in unit test** — re-confirmed on this regenerated file.
+        Off-diagonal interference: max **0.0805** (next_item/multi_step).
+    AC-08 is met for t-small: all six JSON reports and all 11 plots are present, and all
+    six reports carry `source_revision` matching the checkpoint (AC-09 —
+    `training-pipeline` T6.5).
+    Note the routing artifact reports expert utilization **`[0.2425, 0.3674, 0.2046,
+    0.1855]`** against uniform 0.25, overall entropy mean 1.1433 against a K=4 maximum of
+    ln 4 = 1.3863. Recorded as an observation from a capped run and NOT interpreted, per
+    this spec's "report without editorializing" constraint. (The prior
+    `[0.065, 0.311, 0.395, 0.229]` was more skewed; this run is closer to uniform. Neither
+    is a result — both are 200-step runs.)
+
+    *Superseded values (2026-09-17/18), retained so the supersession is checkable rather
+    than merely asserted:* cold 0.05774/0.05485, warm 0.09286/0.08093; buckets
+    3,356 + 3,357 + 14,007 with head NDCG 0.09937 > mid 0.04793 > tail 0.04597;
+    1.824 ms/rec and routing overhead 0.438 ms; gradient diagonal
+    `[1.00000107, 1.00000095, 1.00000095, 1.00000179]` with max off-diagonal 0.0612;
+    utilization `[0.065, 0.311, 0.395, 0.229]`. REV-133 flagged the long-tail figures in
+    this list as stale against T3.4; the 2026-09-18 re-run supersedes all of them, for the
+    additional reason that REV-137 changed the training data underneath.

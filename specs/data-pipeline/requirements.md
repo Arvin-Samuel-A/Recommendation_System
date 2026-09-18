@@ -49,31 +49,86 @@ The recommendation system requires properly split, tensorised data with correct 
 ### FR-3: Cold-Start Holdout (Step 4.3)
 - Determine complete chronological train/val/test split on untruncated histories first
 - Define global training cutoff = latest timestamp among training-split interactions
-- Two holdout strategies are supported, selected by `config.cold_start_strategy`:
-  - **`"first_appearance_rank"` (DEFAULT)** — order all items by
+- Three holdout strategies are supported, selected by `config.cold_start_strategy`:
+  - **`"unseen_in_training"` (DEFAULT, owner decision 2026-09-18)** — an item is cold iff
+    it has **zero interactions in any user's training portion**:
+    `cold = all_items - train_interacted_items`. Nothing is deleted; the set is whatever
+    the chronological split already produces. `cold_start_ratio` does **not** apply — the
+    size is data-determined. Optionally tightened with a first-appearance threshold
+    (`cold = zero-training-interactions AND first_seen > D`) when a strictly temporal set
+    is wanted; when no threshold is configured, none is applied.
+  - **`"first_appearance_rank"`** — order all items by
     `(first_seen_timestamp, original_movie_id)` and hold out the latest-appearing
-    `cold_start_ratio` fraction. Non-empty by construction.
+    `cold_start_ratio` fraction. Non-empty by construction. **Induced:** selected items
+    that do have training interactions have them deleted.
   - **`"timestamp_cutoff"`** — hold out items whose first observation is strictly after
     the global training cutoff, selecting up to `cold_start_ratio` of those candidates in
     the same order. May be empty on a given dataset; an empty holdout is a hard error, not
-    a warning.
+    a warning. **Unusable under the per-user split protocol — see the rationale below.**
 - Config validation must reject any other value; the strategy that ran must be recorded in
   `preprocessing_manifest.json`
 - If fewer candidates exist than the ratio requests, use the achievable count and report it
-- Under either strategy: remove cold items from the training split only; preserve in val/test
+- Remove cold items from the training split only; preserve in val/test. Under
+  `"unseen_in_training"` this step is a **no-op by construction** — cold items have no
+  training interactions to remove — and that is the point of the strategy
 - Assert: `cold_item_set.isdisjoint(train_interacted_items)`, plus set partition assertions
 - Save cold/warm item sets; log all relevant counts
 
-**Rationale (REV-068, owner decision 2026-09-17):** this requirement previously described
-only the timestamp protocol. On MovieLens-20M essentially every item appears early in the
-timeline, so `timestamp_cutoff` selects the **empty set** — `evaluation/cold_start.py`
-classified 100% of targets as warm and the entire cold-start research question became
-vacuous. `first_appearance_rank` preserves the substantive semantics ("these items are new
-relative to the rest of the catalogue"), keeps the disjoint-from-training guarantee because
-selected items are stripped from the training sequences, and is non-empty on any dataset.
-Both strategies remain implemented and selectable; the default changed, and this text now
-says so. The paper's method section must describe `first_appearance_rank`, not the
-timestamp rule.
+**Rationale (owner decision 2026-09-18) — supersedes the REV-068 rationale below.**
+
+The previous rationale recorded a **false cause** and is corrected here. It stated that
+"on MovieLens-20M essentially every item appears early in the timeline, so
+`timestamp_cutoff` selects the empty set". The empty set is real — measured: **exactly 0
+items**. The stated cause is not. Measured on the real data, **9,009 items (43.5% of the
+catalogue) are first seen after a global date at the 80th percentile of interactions
+(2009-10-18)**. Items keep arriving throughout the decade.
+
+The actual cause is the **cutoff definition interacting with the per-user split**:
+`global_training_cutoff = max(all_train_timestamps)` is the maximum over *every user's*
+training portion. Because each user is cut at their own 80% point and user activity windows
+vary enormously, that maximum lands at **2015-03-31 04:45 — 0.1 days before the dataset's
+final interaction**. Nothing can be first seen after it. The set is empty *by construction
+of the cutoff*, not because of the item timeline:
+
+| percentile of per-user training-end timestamps | date |
+|---|---|
+| p50 | 2003-02-18 |
+| p90 | 2012-06-05 |
+| p99 | 2015-01-25 |
+| **p100 — what the code uses** | **2015-03-31** |
+
+A genuine global-date temporal split would restore the timestamp protocol, but it costs
+**96% of evaluable users**: at a p80 global cutoff only **5,539 of 136,677 users (4.1%)**
+retain both training and evaluation data, because MovieLens users are bursty. That price is
+not worth paying for the whole pipeline.
+
+`"unseen_in_training"` obtains the intended semantics without it. An item is cold exactly
+when the model never saw it, which under a chronological split is what happens to items
+that entered the catalogue late. Measured on the real data: **3,010 items (14.5% of the
+catalogue), all 3,010 appearing in val/test and therefore all evaluable**, with
+first-appearance dates clustering late — p10 2010-08-17, **median 2013-09-20**, p90
+2015-02-02, against a dataset ending 2015-03.
+
+Why this is preferred over `first_appearance_rank`, which it replaces as the default: that
+strategy produces an **induced** cold set. Measured: **927 of its 2,072 cold items (44.7%)
+had real training interactions deleted** to make them cold — 6,634 interactions across
+2,192 users, one item losing 619. `"unseen_in_training"` deletes nothing, restores those
+2,192 users' training data, retains all 136,677 users, and makes the
+`cold_item_set.isdisjoint(train_interacted_items)` guarantee hold trivially and exactly
+rather than by construction-after-deletion.
+
+**The paper's method section must describe `unseen_in_training`**, and must state that
+cold items are those with no training-set interactions under the chronological split —
+not a global-date rule, and not an induced holdout. If a strictly temporal characterisation
+is wanted, apply the optional first-appearance threshold and report it: ~10% of the set
+first appeared before 2010-08, so without a threshold the set is dominated by, but not
+exclusively, recent items.
+
+*Superseded rationale (REV-068, owner 2026-09-17), retained for history:*
+`first_appearance_rank` was made the default because `timestamp_cutoff` selected the empty
+set. That observation was correct; its stated cause was not, and the replacement chosen at
+the time was induced rather than natural. Both strategies remain implemented and
+selectable.
 
 ### FR-4: Item Metadata (Step 4.4)
 - Dense matrix shape `(num_items + 1, feature_dim)` where `feature_dim = genome_top_tags + num_genres`
@@ -135,7 +190,7 @@ timestamp rule.
 
 - **AC-01:** All 6 CSV files downloaded, validated, and present under `data/raw/`
 - **AC-02:** Item IDs are contiguous 1..N with 0 reserved for padding and N+1 for mask
-- **AC-03:** The cold-item set is non-empty, selected by the configured `cold_start_strategy`, recorded in `preprocessing_manifest.json`, and disjoint from all training interactions. Under `"first_appearance_rank"` (the default) the held-out items are the latest-appearing `cold_start_ratio` fraction by first-appearance order; under `"timestamp_cutoff"` their first observation is strictly after the global training cutoff. Under either strategy, no cold item appears in training data
+- **AC-03:** The cold-item set is non-empty, selected by the configured `cold_start_strategy`, recorded in `preprocessing_manifest.json`, and disjoint from all training interactions. Under `"unseen_in_training"` (the default) the cold set equals `all_items - train_interacted_items` exactly, and **no training interaction is deleted to produce it** — verified by comparing the training split before and after the holdout step and asserting they are identical. Under `"first_appearance_rank"` the held-out items are the latest-appearing `cold_start_ratio` fraction by first-appearance order; under `"timestamp_cutoff"` their first observation is strictly after the global training cutoff. Under every strategy, no cold item appears in training data
 - **AC-04:** `train_user_history is not eval_user_history` assertion holds
 - **AC-05:** Pre-tensorised datasets load without rebuilding tensors; `__getitem__` performs only indexing
 - **AC-06:** Global negative pool contains only warm items; deterministic across runs with same seed

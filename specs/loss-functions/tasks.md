@@ -47,9 +47,26 @@ Ordered tasks. Depends on transformer-backbone and moe-routing (for integration)
     Non-vacuity verified, not assumed: `pos = S - 1 - step` was reinstated in a scratch
     copy and `test_every_step_reads_position_S_minus_1` FAILS on it (5.0938 vs 3.2969) and
     passes on the fix. `tests/test_losses.py` 39 passed.
-    DOWNSTREAM: `outputs/checkpoints/t_small/best.pt` was trained under the old objective
-    (`train_loss_multistep=9.912500` in `outputs/logs/pretrain_t_small.log`), so the T6.3
-    gate is re-run after this lands — see `training-pipeline` T6.3.
+    DOWNSTREAM — **RESOLVED 2026-09-18; this bullet previously stood as one of three
+    contradictory accounts of one checkpoint (REV-129, REV-131) and is rewritten to point
+    at the single authoritative record rather than to add a fourth.**
+    What it used to claim: that `outputs/checkpoints/t_small/best.pt` "was trained under
+    the old objective (`train_loss_multistep=9.912500`)". Two problems with that claim, both
+    found by REVIEW: the log on disk read 9.903438, not 9.912500 — the figure was
+    transcribed from the console of a run that was later superseded (REV-130) — and the
+    underlying provenance question was **not decidable** from the repository at all, because
+    commit time is not edit time and the checkpoint stored only `config`, which this change
+    left byte-identical.
+    How it is resolved: not by settling the argument but by removing its cause. The gate was
+    re-run on 2026-09-18 against current source, and the checkpoint now on disk was written
+    at 15:29 that day by a run whose source is recorded IN the file
+    (`source_revision.source_hash = "3a59e7cb70a8be69"`, `dirty: true`). Its
+    `train_loss_multistep=9.905000`, read back from `outputs/logs/pretrain_t_small.log`.
+    **The authoritative record is `specs/training-pipeline` T6.3.** Do not re-derive the
+    provenance of this checkpoint from this note or from
+    `specs/personalization-federated` T6.1; both now defer to T6.3.
+    The durable fix is `specs/training-pipeline` T6.5 (AC-09): every checkpoint carries
+    `source_revision` and every derived artifact echoes it, so this question is a lookup.
 
 - [x] **T3.8: Reword the `TestGradNormGradientIsolation` docstring (REV-124)** — The class docstring justified the REV-057 isolation requirement in terms of `torch.autograd.grad(..., create_graph=True)` and the second-order graph it built, both deleted by T3.6. The isolation requirement itself survives unchanged; only the stated reason was stale, and it was the one place left in the repository asserting the second-order form still exists — one file away from the AC-10 test that asserts it does not. Reword on first-order grounds; no assertion change. (FR-5)
   - BUILD note: done. The docstring now says `update()` runs between `L_total.backward()`

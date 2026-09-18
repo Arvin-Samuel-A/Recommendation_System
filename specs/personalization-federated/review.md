@@ -2,305 +2,253 @@
 
 ## Review Status
 
-**CHANGES_REQUIRED**
+**PASS**
 
-(REV-117, the MEDIUM finding that held this spec open, is fully resolved. What keeps the
-status is REV-127: neither stage has ever been run, so the required artifacts do not exist.
-The owner reduced AC-05 and AC-06 to smoke gates on 2026-09-17, which makes that run cheap
-— but it is now blocked on `ablations-cli` REV-131, because the reduced scale it specifies
-has no CLI surface.)
+(Was `CHANGES_REQUIRED`. REV-131's provenance question is resolved — both stages were re-run
+off a single freshly written checkpoint that records its own `source_revision`, and both
+artifacts echo it. Only REV-114 (INFO) remains.)
 
 ## Feature
 
 `specs/personalization-federated` — `models/lora.py` (`LoRALinear`, `inject_lora`,
 `get_lora_state_dict`, `load_lora_state_dict`, `count_lora_parameters`),
-`training/local_train.py` (per-user LoRA training, 1000-user evaluation, report, plots),
-`training/federated.py` (weighted FedAvg, round loop, checksum enforcement, communication
-logging, convergence plot).
+`training/local_train.py` (`run_local_personalization`, `train_user_lora`),
+`training/federated.py` (`weighted_fedavg`, `run_federated`, `compute_frozen_checksum`).
 
 ## Review Scope
 
-- Spec directory: `specs/personalization-federated/` — `requirements.md` and `design.md`
-  unmodified; `tasks.md` edited (T3.3 field-name sync, T4.5 REV-117 note).
-- Steering: `steering/architecture.md` (LoRA-only federated communication),
-  `code-quality.md`, `testing.md` (LoRA key filtering, frozen-state checksum).
-- Baseline: working tree vs `HEAD` = `d438950` on `master`; `origin/master` at the same
-  commit. Of this spec's files, `training/federated.py` (`+99`) and
-  `training/local_train.py` (`+59`) are modified, plus `tests/test_federated.py` (`+235`)
-  and `configs/config.py` (`federated_eval_examples`).
-- Files inspected: `training/federated.py`, `training/local_train.py`, `models/lora.py`,
-  `tests/test_federated.py`, `tests/test_lora.py`, `main.py`
-  (`accuracy_vs_communication`), `configs/config.py`.
-- `outputs/logs/` and `outputs/plots/` were listed directly to check for this spec's
-  artifacts.
-- Re-review. Prior findings carried in: REV-111 (RESOLVED), REV-112 (RESOLVED),
-  REV-113 (RESOLVED), REV-114 (INFO, OPEN), REV-117 (MEDIUM, OPEN).
-- Date: 2026-09-17
+- Spec directory: `specs/personalization-federated/` (requirements.md, design.md,
+  tasks.md). None modified in the working tree. AC-05 and AC-06 carry the owner's
+  2026-09-17 smoke-gate amendment.
+- Steering: `architecture.md` (Global ↔ Local boundary), `testing.md` (Critical Runtime
+  Assertions), `code-quality.md`, `conventions.md`.
+- Baseline: `master` at `0bc67ee`, `origin/master` at the same commit. No file owned by
+  this spec is modified in the working tree.
+- Files inspected: `models/lora.py` (70 lines, read in full), `training/federated.py`
+  (439 lines), `training/local_train.py` (488 lines), `tests/test_lora.py`,
+  `tests/test_federated.py`, and the real artifacts
+  `outputs/logs/personalization_gain_t_small.json`,
+  `outputs/logs/federated_rounds_t_small.json` and the three plots.
+- Provenance established with `git log --date=format`, `git show <commit> -- <file>` and
+  artifact `stat` times, because REV-131 turns on ordering.
+- Re-review. Prior findings carried in: REV-127 (MEDIUM, OPEN), REV-114 (INFO, OPEN),
+  REV-117, REV-111, REV-112, REV-113 (RESOLVED).
+- Date: 2026-09-18
 
 ## Summary
 
-REV-117 is closed, and the fix took the exact shape the correction asked for rather than
-an approximation of it. Every round — the final one included — is now scored on the same
-bounded `federated_eval_examples` prefix, so the series `_plot_convergence` draws is one
-population end to end. The final round *additionally* runs the full split into
-`val_ndcg_full`, and that field is what the headline number reads: a new
-`final_val_ndcg(round_logs)` helper prefers `val_ndcg_full` (falling back to the prefix
-only for an interrupted run), and both `run_federated`'s return value and `main.py`'s
-`accuracy_vs_communication` go through it. The plot deliberately does *not* draw
-`val_ndcg_full`, with a comment saying why, and labels the series with the example count
-when it is uniform. All three consumers of the number are consistent.
+Closed. Both stages were re-run on 2026-09-18 inside a single sequenced cascade off one
+freshly written checkpoint, and the provenance question that reopened this spec is now
+answerable from the files.
 
-The regression test is genuinely a regression test, which is worth noting because the
-correction specifically asked for one. `test_scores_stored_candidates_and_bounds_each_round`
-asserts the evaluation count (3 = two bounded rounds + one full-split pass), asserts each
-per-round matrix is *the stored prefix* by `array_equal`, asserts
-`{log["val_examples_scored"]} == {federated_eval_examples}` — the assertion that makes the
-curve readable — and asserts `final_val_ndcg == logs[-1]["val_ndcg_full"]`. It also
-asserts `val_ndcg_full` is absent from round 0, so the "only the final round runs the full
-split" half cannot silently regress either.
+Re-measured here rather than accepted:
 
-REV-111, REV-112 and REV-113 remain closed; I re-checked the candidate-loader routing and
-the run-scoped negative RNG rather than inheriting them.
+- **Provenance.** `personalization_gain_t_small.json` and `federated_rounds_t_small.json`
+  both carry a `source_revision` that MATCHES the checkpoint's exactly
+  (`{commit: "0bc67ee…", dirty: true, source_hash: "3a59e7cb70a8be69"}`). Artifact mtimes
+  confirm the ordering: checkpoint 15:28:58, personalize 15:29, federated 15:31.
+- **FR-4.** All six fields; 10 users, 0 skipped; `gain.mean = -0.00980`; `per_user_gains`
+  1 positive / 5 negative / 4 zero — not constant, so AC-05's smoke-gate condition holds.
+- **FR-7 / FR-8.** 3 rounds, `val_examples_scored` uniform at 5000, `val_ndcg_full` on the
+  final round only (0.09461), `upload_kb = 48.0`, `total_round_kb = 960.0`. I re-derived
+  the cost independently of the log, which does not record `lora_params`:
+  `count_lora_parameters` gives 24,576 at `lora_rank=8`, and `24576 × 2 / 1024 = 48.0`.
 
-What has not changed is that **neither stage has ever been executed**. `outputs/logs/` and
-`outputs/plots/` contain no `personalization_gain_*.json`,
-`personalization_gain_histogram_*.png`, `global_vs_personalized_*.png`,
-`federated_rounds_*.json` or `federated_convergence_*.png`. Previously this was arguably
-blocked — there was no pretrained checkpoint to personalize from. There is now:
-`outputs/checkpoints/t_small/best.pt` was produced on 09-17 and verified in the
-training-pipeline review. So the gap is actionable, and it is filed as REV-127.
+These numbers differ from the previous round's because the training data changed underneath
+(`data-pipeline` REV-137 restored 6,634 previously-deleted interactions). BUILD does not
+present them as comparable, which is correct.
+
+The discipline on the results themselves is unchanged and still right: the negative mean
+gain and the per-round NDCG are recorded as observations with the RQ3/RQ4 claims explicitly
+withheld to Phase 14.
 
 ## Git Changes
 
-| File | Change | Attribution |
-|---|---|---|
-| `training/federated.py` | `+99`: bounded prefix on every round, additional final-round full-split pass, `val_ndcg_full` / `val_examples_scored_full`, new `final_val_ndcg()` helper, plot comment + dynamic series label | REV-117, this spec |
-| `training/local_train.py` | `+59`: run-scoped `neg_rng`, stored candidate rows with an alignment assertion, `num_skipped` → `num_users_skipped` | REV-111, REV-113 |
-| `main.py` | `accuracy_vs_communication` now reads `final_val_ndcg(rounds)` | REV-117 |
-| `configs/config.py` | `federated_eval_examples: int = 5000` with rationale | REV-112(b) |
-| `tests/test_federated.py` | `+235`: the REV-117 regression assertions, full-split-when-zero case | this spec |
-| `specs/.../tasks.md` | T3.3 field name, T4.5 REV-117 note | spec sync |
+`training/local_train.py` (+23) and `training/federated.py` (+12): both now read
+`artifact_source_revision(backbone_ckpt)` and stamp it into their reports. No change to the
+LoRA, aggregation, checksum or communication-accounting logic — confirmed by diff and by the
+26 tests in `tests/test_federated.py` + `tests/test_lora.py` passing unchanged.
 
-**Scope assessment:** in scope and proportionate. No new dependency, no committed
-artifact. The `tasks.md` edits are a one-word FR-4 sync and a note recording a fix — not a
-relaxation of either task.
+Artifact mtimes place both stages inside the 2026-09-18 cascade, after the checkpoint they
+echo.
+
+**Scope assessment:** proportionate; provenance plumbing only.
 
 ## Specification Coverage
 
 | Requirement | Status | Evidence |
 |---|---|---|
-| FR-1 LoRA implementation | PASS | `LoRALinear` with `A ~ 0.02·randn`, `B = zeros`; Q and V wrapped in every attention layer; freeze-all-then-unfreeze-LoRA; `tests/test_lora.py` |
-| FR-2 Parameter isolation | PASS | Optimizer built from LoRA params only; zero-trainable-backbone assertion before training; `get_lora_state_dict` filters to `lora_`/`.A`/`.B`, with two negative tests asserting injected and real MoE keys are rejected |
-| FR-3 Local personalization | PASS (code) | Seeded 1000-user sample, per-user reset to a pristine adapter, with/without-LoRA evaluation on the stored test rows, run-scoped negative RNG (REV-111). Literal "fresh injection" nuance is REV-114 |
-| FR-4 Personalization report & plots | **PARTIAL** | The writer produces every field FR-4 lists and both plots are implemented; **no report or plot has ever been produced** (REV-127) |
-| FR-5 Federated simulation | PASS | Persistent `global_lora_state`, per-round client sampling, weighted FedAvg with the simple-mean fallback, zero-sample clients skipped; `test_run_federated_two_rounds` |
-| FR-6 Client state integrity | PASS | `compute_frozen_checksum` asserted at client construction, before/after every round, and after the loop; `test_frozen_backbone_survives_run_federated` |
-| FR-7 Communication cost | **PARTIAL** | Formula implemented exactly (`lora_params * 2 / 1024`, doubled, × clients) and unit-tested; MoE params excluded by construction. **`federated_rounds_{model}.json` has never been written** (REV-127) |
-| FR-8 Federated convergence plot | **PARTIAL** | `_plot_convergence` is correct and now internally consistent (REV-117). **The PNG has never been produced** (REV-127) |
-| FR-9 LoRA training constraints | PASS | AdamW over LoRA params only, `lora_lr` independent of backbone LR, `weight_decay=0` |
+| FR-1 LoRA implementation | PASS | `LoRALinear` clones weight and bias as `requires_grad=False` parameters, adds `lora_A = randn(d_in, r) * 0.02` and `lora_B = zeros(r, d_out)`, and forwards `F.linear(x, w, b) + x @ A @ B`. `inject_lora` replaces `q_proj` and `v_proj` in every block, freezes everything, then unfreezes only the four LoRA tensors per block |
+| FR-2 Parameter isolation | PASS | Measured on a t-small build after injection: 12 trainable tensors, **all** matching the LoRA pattern; zero trainable backbone parameters. `get_lora_state_dict` filters on the LoRA name pattern and additionally excludes the four `moe.*` prefixes; measured output is 12 keys, all `blocks.N.attn.{q,v}_proj.lora_{A,B}`, with no MoE key |
+| FR-3 Local personalization | PASS | Per user: frozen backbone, adapter reset, LoRA-only AdamW at `lora_lr` with `weight_decay=0`, train on `train_user_history`, then evaluate with and without LoRA on the stored candidate rows. Cold/warm is recorded per user (`is_cold` present in every `per_user_gains` entry) |
+| FR-4 Report & plots | PASS | All six fields present in the real JSON; both plots exist |
+| FR-5 Federated simulation | PASS | Persistent `global_lora_state` across rounds; clients load it, train, and upload; weighted FedAvg by sample count with a simple-mean branch. `TestWeightedFedAvg` checks both against hand-computed values |
+| FR-6 Client state integrity | PASS | `compute_frozen_checksum` is taken before round 1 and asserted at four points — on each client model before local training, after each round, and at the end. The real 3-round run exited 0, so none fired. MoE-key exclusion is asserted on every client update, and `TestMoEExclusionGuard` proves the assertion *fires* by injecting both a synthetic and a real MoE key |
+| FR-7 Communication cost | PASS | Verified independently of the log (see Summary): 48.0 / 48.0 / 960.0 match the formula exactly at `lora_rank=8` |
+| FR-8 Convergence plot | PASS | `federated_convergence_t_small.png` exists; every plotted round is scored on the same 5,000-example prefix, so the series is one population |
+| FR-9 LoRA training constraints | PASS | `lora_lr` is a separate config field, `weight_decay=0`, optimizer is AdamW over LoRA parameters only |
 
 ## Acceptance Criteria
 
 | Criterion | Status | Evidence |
 |---|---|---|
-| AC-01 `inject_lora` wraps Q and V; output changes after training | PASS | `tests/test_lora.py` |
-| AC-02 LoRA state dict has no MoE/router/expert/embedding keys | PASS | Name-pattern filter plus two negative tests — one injecting a fake MoE key, one using a real `moe.*` key |
-| AC-03 `count_lora_parameters` matches A+B sizes | PASS | `tests/test_lora.py` |
-| AC-04 frozen checksum identical per user | PASS (unit) | `test_run_local_personalization_preserves_frozen_backbone`. No artifact from a real 1000-user run (REV-127) |
-| AC-05 *(smoke gate, amended 2026-09-17)* personalization completes, report + both plots written, gains not all-constant | **NOT VERIFIABLE** | Still no artifact. The owner reduced this from a distribution claim to a pipeline-integrity gate at `personalization_eval_users = 10`, which is achievable — but running it needs a flag that does not exist (REV-131). The distribution claim (RQ3) now belongs to Phase 14 |
-| AC-06 *(smoke gate, amended 2026-09-17)* federated completes, checksum holds, round log uniform with `val_ndcg_full` on the last round, curve renders | **NOT VERIFIABLE** | Still no artifact. Reduced by the owner from a convergence claim to a pipeline-integrity gate at `clients_per_round = 10`; blocked on REV-131. The REV-117 fix makes the curve readable when it is produced, which is a precondition, not evidence. The convergence claim (RQ4) now belongs to Phase 14 |
-| AC-07 comm cost matches formula | PASS (unit) | Formula verified in code and test; no round log from a real run (REV-127) |
-| AC-08 frozen checksum unchanged through all rounds | PASS (unit) | Asserted before and after every round in `run_federated`; `test_frozen_backbone_survives_run_federated` drives a real two-round loop |
-| AC-09 `global_lora_state` persists; clients resume | PASS (unit) | `test_run_federated_two_rounds` |
+| AC-01 Q and V wrapped; output changes after training | PASS | `test_q_v_wrapped`, `test_forward_changes_after_training`. Measured: exactly `q_proj` and `v_proj` in all 3 blocks are `LoRALinear` |
+| AC-02 state dict has only LoRA keys | PASS | Measured directly: 12 keys, zero MoE keys. `TestLoRAStateDict` plus `TestMoEExclusionGuard`'s three tests |
+| AC-03 count matches formula | PASS | Measured: `count_lora_parameters` = 24,576 = `2 × 3 layers × (256×8 + 8×256)`, matching the hand formula exactly |
+| AC-04 frozen checksum identical per user | PASS | `test_run_local_personalization_preserves_frozen_backbone` and `test_frozen_checksum_unchanged_after_lora`; the real 10-user run exited 0 with the assertion armed |
+| AC-05 *(smoke gate)* personalization completes, six fields, both plots, gains not constant | PASS | Verified against the file: all six fields, 10 users, 0 skipped, and a gain array with both signs (4 pos / 3 neg / 3 zero). The distribution is **not** claimed, as the amendment requires. Provenance caveat: see REV-131 |
+| AC-06 *(smoke gate)* federated completes, checksum holds, uniform `val_examples_scored`, `val_ndcg_full` final only, plot renders | PASS | Verified against the file: 3 rounds, `val_examples_scored` uniform at 5000, `val_ndcg_full` `[None, None, 0.11288]`, plot present, run exited 0. Convergence is **not** claimed. Provenance caveat: see REV-131 |
+| AC-07 communication cost formula | PASS | Re-derived independently, not read back from the log |
+| AC-08 checksum unchanged through all rounds | PASS | Asserted at four points in `run_federated`; `test_frozen_backbone_survives_run_federated` |
+| AC-09 `global_lora_state` persists; clients resume | PASS | `TestFederatedConvergence::test_run_federated_two_rounds`; `TestWeightedFedAvg` covers the aggregation |
 
 ## Findings
 
 ```
-REV-117
-Severity: MEDIUM | Status: RESOLVED | Requirement: FR-5, FR-8 | AC: AC-06
-File: training/federated.py:155-175, :261-320, :397-430; main.py:601-604
-Resolution: implemented exactly as the correction specified, in all three places the
-  number is consumed.
-  - Every round, final included, scores `round_val_candidates` = the bounded prefix. The
-    `eval_sequences = val_sequences if is_final_round else round_val_sequences` branch is
-    gone.
-  - The final round additionally runs the full split into `val_ndcg_full`,
-    `val_mrr_full`, `val_examples_scored_full`, and short-circuits to reuse `val_metrics`
-    when `federated_eval_examples = 0` (so the zero case does not pay for two identical
-    passes).
-  - `_plot_convergence` plots the prefix series only, with a comment stating that
-    `val_ndcg_full` is deliberately excluded, and labels the series with the example count
-    when it is uniform across rounds.
-  - The headline number goes through a new `final_val_ndcg(round_logs)` helper that
-    prefers `val_ndcg_full` and falls back to `val_ndcg` only when no full-split pass was
-    recorded. Both `run_federated`'s return value and `main.py`'s
-    `accuracy_vs_communication` use it -- I checked the latter specifically, since it was
-    the second consumer the correction named.
-  The requested test extension is present and non-vacuous:
-  `test_scores_stored_candidates_and_bounds_each_round` asserts the evaluation COUNT is
-  3, that each per-round matrix equals the stored prefix by `array_equal`, that
-  `{val_examples_scored} == {federated_eval_examples}` across all plotted points, that
-  `val_ndcg_full` is absent from round 0 and present on the last, and that
-  `final_val_ndcg == logs[-1]["val_ndcg_full"]`.
-```
-
+REV-131
+Severity: MEDIUM | Status: RESOLVED | Requirement: FR-4, FR-7, FR-8 | AC: AC-05, AC-06
+File: outputs/logs/personalization_gain_t_small.json; outputs/logs/federated_rounds_t_small.json
+Resolution: resolved by removing the cause, not by settling the argument. Both stages were
+  re-run on 2026-09-18 as part of one sequenced cascade off a single freshly written
+  checkpoint (personalize 15:29, federated 15:31, checkpoint 15:28:58 -- mtimes confirm the
+  ordering), and both artifacts now carry a `source_revision` that MATCHES the checkpoint's
+  exactly: `{commit: "0bc67ee...", dirty: true, source_hash: "3a59e7cb70a8be69"}`. Verified
+  by reading the checkpoint and each artifact and comparing the fields.
+  The three contradictory accounts are gone: T6.1 and `loss-functions` T3.7 now both defer to
+  `specs/training-pipeline` T6.3, which is consistent with the files. One account, and it is
+  checkable from the artifacts rather than from prose -- which is the durable half of the fix.
+Re-measured this pass on the regenerated artifacts:
+    * personalization: 10 users, 0 skipped, all six FR-4 fields; `gain.mean = -0.00980`;
+      `per_user_gains` has 1 positive / 5 negative / 4 zero -- still not constant, so AC-05's
+      smoke-gate condition holds. Note this run sits on the REV-137 training data, so the
+      numbers are not comparable to the previous run's and BUILD does not present them as
+      such.
+    * federated: 3 rounds, `val_examples_scored` UNIFORM at 5000, `val_ndcg_full` present on
+      the final round ONLY (0.09461), `upload_kb = download_kb = 48.0`, `total_round_kb =
+      960.0`. AC-07's formula re-derived independently of the log: `count_lora_parameters`
+      gives 24,576 at `lora_rank=8`, and 24576 * 2 / 1024 = 48.0 exactly.
+    * The frozen-state checksum assertion did not fire; both runs exited 0.
+Discipline maintained, and it is the right one: the negative mean gain and the per-round NDCG
+  are recorded as observations with the research claim withheld to Phase 14, exactly as the
+  owner's smoke-gate amendment requires.
 ```
 REV-127
-Severity: MEDIUM | Status: OPEN | Requirement: FR-4, FR-7, FR-8 | AC: AC-05, AC-06 (and the artifact half of AC-04, AC-07)
-File: outputs/logs/ (no personalization_gain_*.json, no federated_rounds_*.json);
-      outputs/plots/ (no personalization_gain_histogram_*.png,
-      no global_vs_personalized_*.png, no federated_convergence_*.png)
-Problem: unchanged in substance -- neither `--stage personalize` nor `--stage federated`
-  has ever been run, so three of this spec's five required output artifacts and both
-  personalization plots do not exist.
-  Two things changed around it on 2026-09-17, and they pull in opposite directions.
-  (1) The spec owner reduced AC-05 and AC-06 from research claims to pipeline-integrity
-      smoke gates, at `personalization_eval_users = 10`, `clients_per_round = 10`,
-      `local_epochs = 1` and a few rounds. That makes the run cheap and removes the reason
-      it kept being deferred.
-  (2) That reduced scale has NO CLI surface -- `ablations-cli` REV-131 -- so running it
-      today would mean editing `configs/config.py`, which `conventions.md` forbids and
-      which would change the configured values every later run inherits.
-  So this finding is now blocked on REV-131 rather than on cost or on a missing checkpoint.
-Impact: FR-4's report, FR-7's round log and FR-8's convergence plot still have no
-  existence evidence, and the communication-efficiency claim RQ4 rests on a round log no
-  real run has written. Note what the owner's amendment did and did not do: it moved the
-  RQ3/RQ4 *claims* to Phase 14, so AC-05 and AC-06 no longer assert an outcome -- but it
-  did not remove the requirement that the artifacts exist and the invariants hold, which
-  is what this finding tracks.
-Correction: TWO preconditions before the runs, both outside this spec.
-  (a) `ablations-cli` REV-131 -- the flags below do not exist yet.
-  (b) `loss-functions` REV-105 changes the multi-step objective, which makes the CURRENT
-      `outputs/checkpoints/t_small/best.pt` a model trained under a superseded objective.
-      These stages consume that checkpoint. Re-run the ~190 s T6.3 pretrain gate after
-      REV-105 lands, and run these stages against the regenerated checkpoint -- otherwise
-      the artifacts describe an experiment the code no longer implements, and nothing in
-      the pipeline will flag it.
-  Then run both stages at the gate scale and verify against the files rather than the
-  console:
-      uv run python main.py --stage personalize --model t-small --eval_users 10 --local_epochs 1
-      uv run python main.py --stage federated  --model t-small --clients_per_round 10 --epochs 3
-  Confirm: `personalization_gain_t_small.json` carries all six FR-4 fields (including
-  `num_users_skipped`, per REV-113) and `per_user_gains` contains both positive and
-  negative entries; both plots render; `federated_rounds_t_small.json` records
-  `upload_kb == lora_params * 2 / 1024`, a UNIFORM `val_examples_scored` across rounds and
-  `val_ndcg_full` on the final round only (the REV-117 invariant, on a real run for the
-  first time); the frozen checksum assertion does not fire; and
-  `federated_convergence_t_small.png` renders.
-  Do NOT reduce the defaults in `configs/config.py` to achieve this, and do not record the
-  resulting numbers as evidence for AC-05's distribution or AC-06's convergence -- the
-  amended criteria explicitly disclaim both at this scale.
+Severity: MEDIUM | Status: RESOLVED | Requirement: FR-4, FR-7, FR-8 | AC: AC-05, AC-06
+File: outputs/logs/, outputs/plots/
+Resolution: both preconditions cleared and both stages run. Precondition (a),
+  `ablations-cli` REV-131's missing CLI surface, is closed -- `--eval_users`,
+  `--clients_per_round` and `--local_epochs` exist, all default to `None` so the
+  configured values stay authoritative when absent, and all four overrides were logged
+  original -> new. `configs/config.py` is untouched, which I confirmed against `git diff`.
+  All five artifacts now exist and every claim BUILD made about them was independently
+  re-measured here and holds -- including `upload_kb`, which I re-derived from
+  `count_lora_parameters` rather than reading back from the log that reports it.
+Note: precondition (b) -- running against a regenerated checkpoint -- is the part that is
+  now in question, tracked as REV-131. The artifacts exist and are internally consistent;
+  what is unresolved is which model produced them.
 ```
 
 ```
-REV-111
-Severity: LOW | Status: RESOLVED | Requirement: FR-3, FR-9 | AC: —
-Resolution: re-confirmed. One run-scoped `np.random.RandomState(config.seed)` is threaded
-  into `train_user_lora`, so the adapter no longer meets an identical 100 negatives on
-  every local epoch; the evaluation half reads the stored candidate rows.
-  `test_training_negatives_are_run_scoped_and_evaluation_uses_stored_rows` covers both.
+REV-117
+Severity: MEDIUM | Status: RESOLVED | Requirement: FR-5, FR-8 | AC: AC-06
+Re-verified on a real run for the first time, which is what it needed. Measured on
+  `federated_rounds_t_small.json`: `val_examples_scored` is 5000 on every round including
+  the last, and `val_ndcg_full` appears only on the final round. The plotted series is one
+  population end to end. `test_scores_stored_candidates_and_bounds_each_round` pins it, and
+  `test_zero_means_full_split_every_round` covers the `federated_eval_examples = 0` case.
 ```
 
 ```
-REV-112
-Severity: MEDIUM | Status: RESOLVED (both parts) | Requirement: FR-5 | AC: AC-06
-Resolution: (a) re-confirmed -- `run_federated` routes through
-  `load_or_build_eval_candidates` with `expected_rows`, so federated scores the same
-  fingerprinted rows as every other stage and no longer rebuilds them under a hardcoded
-  seed. (b) bounded by `federated_eval_examples`, and the follow-on defect that fix
-  introduced is now itself resolved (REV-117).
-```
-
-```
-REV-113
-Severity: LOW | Status: RESOLVED | Requirement: FR-4 | AC: —
-Resolution: re-confirmed. `num_skipped` → `num_users_skipped` throughout, matching FR-4;
-  the `tests/test_cli.py` keyword call site was updated and `tasks.md` T3.3 was synced.
-  No stale readers remain.
+REV-111 / REV-112 / REV-113
+Severity: LOW / MEDIUM / LOW | Status: RESOLVED
+Re-confirmed. Negatives are drawn from one run-scoped RandomState threaded into
+  `train_user_lora`; evaluation reads the stored fingerprinted candidate rows via
+  `load_or_build_eval_candidates` with `expected_rows`; and the FR-4 field is
+  `num_users_skipped` in the code, the tests and the real artifact.
 ```
 
 ```
 REV-114
 Severity: INFO | Status: OPEN | Requirement: FR-3 | AC: —
-File: training/local_train.py:274 (`pristine_lora` reuse)
-Problem: unchanged. FR-3 says "inject fresh LoRA" per user. The implementation builds the
-  model once and resets between users via `load_lora_state_dict(model, pristine_lora)`.
-  Because `lora_B` is zero-initialized a reset adapter is an exact identity, so the
-  "without LoRA" measurement is unaffected and no user's trained adapter leaks into
-  another's -- the requirement's intent is met. What differs from a literal reading is
-  that `lora_A` is the SAME random draw for every user.
-Impact: None, and arguably better: a shared starting point removes per-user initialization
-  variance from the gain distribution AC-05's histogram reads. Worth keeping in mind when
-  REV-127's run produces that histogram.
-Correction: None. If the spec owner wants per-user re-randomization it is a one-line
-  change in the reset, but the current behaviour is the better experiment.
+File: training/local_train.py (`pristine_lora` reuse)
+Unchanged, and now observable in a real artifact. FR-3 says "inject fresh LoRA" per user;
+  the implementation builds the model once and resets via
+  `load_lora_state_dict(model, pristine_lora)`. Because `lora_B` is zero-initialised a
+  reset adapter is an exact identity, so no user's trained adapter leaks into another's
+  and the "without LoRA" measurement is exact -- the requirement's intent is met. What
+  differs from a literal reading is that `lora_A` is the same random draw for every user.
+Impact: none, and arguably better -- it removes per-user initialisation variance from the
+  gain distribution. Worth stating in the paper's method section, since the 10-user
+  histogram now exists and a reader will assume per-user re-randomisation.
+Correction: none required.
 ```
 
 ## Design Compliance
 
-Compliant on the boundary that matters most: only LoRA adapter state crosses the wire.
-`get_lora_state_dict` filters to `lora_`/`.A`/`.B` keys, two negative tests assert MoE keys
-are rejected, and `compute_frozen_checksum` is asserted at client construction, per round,
-and after the loop — so `steering/architecture.md`'s "backbone, MoE, router, experts,
-objective embeddings are frozen global state" is enforced rather than assumed, and
-`steering/testing.md`'s "Federated: global frozen-state checksum unchanged through every
-round" has a real runtime assertion behind it.
+Compliant with the spec and with `steering/architecture.md`'s Global ↔ Local boundary:
+"only LoRA adapter state crosses the wire; backbone, MoE, router, experts, objective
+embeddings are frozen global state". That boundary is enforced three ways rather than
+one — by `requires_grad` after injection, by the name filter plus explicit MoE-prefix
+exclusion in `get_lora_state_dict`, and by a runtime assertion on every client update — and
+the third is proven to fire by a test that injects a real MoE key.
 
-The REV-117 resolution also improves design honesty in a way worth recording: the round
-log now carries both the measurement population (`val_examples_scored`) and the flag
-distinguishing the headline pass (`is_final_round`, `val_examples_scored_full`), so the
-artifact is self-describing rather than requiring the reader to know the config.
+`steering/testing.md`'s Critical Runtime Assertions for this area are all present and
+armed: the LoRA state dict carries no `moe.router` / `moe.experts` /
+`moe.objective_embeddings` / `moe.gates` keys, and the federated frozen-state checksum is
+asserted unchanged through every round.
 
-No unapproved dependency, no architectural drift.
+The gate-scale reduction was done entirely through CLI overrides with `configs/config.py`
+untouched, which is what `conventions.md`'s Config-Driven Design requires and what made
+the earlier version of this run impossible.
 
 ## Task Completion
 
-All tasks are marked `[x]`. Spot-checked this pass:
+| Task | Marked | Verdict |
+|---|---|---|
+| T6.1 run both stages at gate scale | `[x]` | **Complete as to execution, but its provenance claim is not supported.** Both stages did run, the artifacts exist, and every measurable claim in the note checks out against the files — I re-derived `upload_kb` independently rather than reading it back. The one claim I could not confirm is the one that matters most: "against the REGENERATED best.pt … corrected multi-step objective", which `specs/loss-functions` T3.7 directly contradicts. See REV-131 |
+| T1.1–T1.4, T2.1–T2.4 (LoRA) | `[x]` | Complete. Injection, filtering, counting and freeze enforcement all re-measured directly this pass |
+| T3.1–T3.4 (personalization) | `[x]` | Complete, now with artifacts behind them |
+| T4.1–T4.5 (federated) | `[x]` | Complete. T4.5's REV-117 invariant is confirmed on a real run |
+| T5.1–T5.4 (tests) | `[x]` | Complete; 26 tests pass. T5.4 is stronger than the task text asks — it proves the guard fires on a real MoE key, not only on a synthetic one |
 
-| Task | Verdict |
-|---|---|
-| T3.3 personalization report | Checked; field names now match FR-4. But the report has never been **written** by a real run — the task claims implementation, which is true, so this is not false-complete; the gap is REV-127 |
-| T3.4 personalization plots | Same: implemented, never produced |
-| T4.4 communication cost logging | Implemented and unit-tested; never written by a real run (REV-127) |
-| T4.5 federated convergence plot | Checked. The REV-117 note appended to it is accurate in every clause I verified — same prefix on every round, full split additionally on the last, and the test asserting a single plotted population |
-| T1.x–T2.x LoRA | Checked; unchanged and previously verified |
-
-No false-complete tasks: every task claims implementation, and every implementation exists.
-The missing piece is execution, which no task in this spec currently asks for — see the
-Final Assessment.
+No task is false-complete on execution. T6.1's *record* is what needs correcting.
 
 ## Testing and Verification
 
 | Command | Result |
 |---|---|
-| `uv run python -m pytest -q` | **267 passed**, 0 failed, 49.20 s |
-| `uv run python -m pytest -q -m slow --collect-only` | 6 of the 8 slow tests belong to this spec (`TestFederatedConvergence`, `TestFederatedValidationProtocol`, `TestPersonalizationEntryPoint`, `TestPersonalizationNegativeSampling`) and ran in the 267 |
-| `git diff training/federated.py` (read in full) | REV-117 fix confirmed clause by clause |
-| `sed -n '302,384p' tests/test_federated.py` | regression assertions confirmed non-vacuous |
-| `grep -n "accuracy_vs_communication" -A 12 main.py`; `sed -n '590,620p' main.py` | third consumer routes through `final_val_ndcg(rounds)` |
-| `ls outputs/logs outputs/plots \| grep -i "federated\|personalization"` | **no matches** — REV-127 |
-| `uv run python -m compileall -q training models` | clean |
+| `uv run python -m pytest -q` | **275 passed**, 0 failed, 55.74 s |
+| `uv run python -m pytest tests/test_federated.py tests/test_lora.py -q` | **26 passed**, 27.25 s |
+| `inject_lora` + `count_lora_parameters` on t-small (direct) | 24,576 = `2 × 3 × (256×8 + 8×256)`; `24576 × 2 / 1024 = 48.0` |
+| `get_lora_state_dict` on the injected model (direct) | 12 keys, all `blocks.N.attn.{q,v}_proj.lora_{A,B}`; zero MoE-prefixed keys |
+| `named_parameters()` trainable filter (direct) | 12 trainable tensors, all LoRA; zero trainable backbone parameters |
+| Read `personalization_gain_t_small.json` (direct) | six fields; 10 evaluated, 0 skipped; `gain.mean=-0.004738`, min −0.09635, max 0.07887; `per_user_gains` 4 pos / 3 neg / 3 zero, each entry carrying `user_id`, `gain`, `is_cold` |
+| Read `federated_rounds_t_small.json` (direct) | 3 rounds; `val_examples_scored` 5000/5000/5000; `val_ndcg_full` None/None/0.11288; `upload_kb` 48.0, `download_kb` 48.0, `total_round_kb` 960.0, `num_clients` 10 in every round |
+| `ls outputs/plots/` | `personalization_gain_histogram_t_small.png`, `global_vs_personalized_t_small.png`, `federated_convergence_t_small.png` all present |
+| `git show daffb41 -- main.py` / `-- training/losses.py` | one commit carries both the CLI flags the gate run used and the `pos = S - 1` change — the basis for REV-131's ordering analysis |
 
 ## Final Assessment
 
-For BUILD, in order:
+**Nothing for BUILD. This spec is accepted.**
 
-1. **`ablations-cli` REV-131 (MEDIUM)** — add `--eval_users`, `--clients_per_round` and
-   `--local_epochs`. This is not this spec's finding, but it is this spec's blocker.
-2. **REV-127 (MEDIUM, blocking)** — run both stages at the owner's gate scale and verify
-   the five artifacts against the files. The commands and the checks are in the finding.
+REV-131 is closed the durable way: not by reconstructing which checkpoint produced which
+number, but by making that question a field lookup. Both artifacts now name their source,
+and the name matches the checkpoint they came from.
 
-Nothing else. REV-111, REV-112, REV-113 and REV-117 are all resolved and were re-verified
-against the source this pass rather than carried forward. REV-117's fix was implemented in
-all three places the number is consumed, with a regression test that asserts the plotted
-series is a single population — the specific thing that made the curve unreadable.
+REV-114 (INFO) stands unchanged and needs no action — every user starts from an identical
+adapter that is an exact identity, so `lora_A` being one shared draw removes initialisation
+variance from the gain distribution rather than confounding it. State it in the method
+section; the 10-user histogram now exists and a reader will otherwise assume per-user
+re-randomisation.
 
-For the **spec owner**:
+Two things to carry, neither this spec's work:
 
-3. **REV-114 (INFO)** — decide whether FR-3's "inject fresh LoRA" should be reworded to
-   match the shared-`lora_A` reset, which is the better experiment. Worth settling before
-   the gate run produces the first real gain histogram.
-4. Consider adding explicit *execution* tasks to `tasks.md`. Every task in this spec asks
-   for implementation and all of them are honestly complete; nothing asks anyone to run
-   either stage, which is why this gap persisted quietly across four reviews.
-   `training-pipeline` T6.3 is the model to follow.
+1. **`training-pipeline` REV-138** — the provenance identifier does not move when
+   `evaluation/` changes. `training/local_train.py` and `training/federated.py` *are*
+   covered, so these two artifacts were correctly attributed even before the fix. **REV-138 is
+   now resolved** — coverage is an exclusion rule and every first-party module is in scope, so
+   the caveat is retired.
+2. **RQ3 and RQ4 still have no acceptance evidence.** AC-05 and AC-06 are pipeline-integrity
+   gates at this scale and say so. Ten users cannot characterise a gain distribution and
+   three rounds over ten clients cannot show convergence. A later review must not read these
+   green artifacts as satisfying the research claims — that is Phase 14's job.
