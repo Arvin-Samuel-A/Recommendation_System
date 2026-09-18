@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from configs.config import Config, OBJECTIVE_ORDER
+from utils import get_source_revision
 
 
 class Expert(nn.Module):
@@ -248,6 +249,12 @@ def count_router_parameters(config: Config, run_tag: Optional[str] = None) -> di
             suffix += f"_mmoeK{K_mmoe}"
     report["run_tag"] = run_tag
     report["report_suffix"] = suffix
+    # Provenance (steering/code-quality.md, "Artifact Provenance"; REV-136's closing note,
+    # owner-approved 2026-09-18). This report is a pure function of `config` and is NOT
+    # derived from a checkpoint, so it echoes the RUNNING revision rather than a
+    # checkpoint's -- `artifact_source_revision` would be the wrong call here, since there
+    # is no model whose provenance this could be reporting.
+    report["source_revision"] = get_source_revision()
     path = os.path.join(log_dir, f"moe_parameter_report_{suffix}.json")
     with open(path, "w") as f:
         json.dump(report, f, indent=2)

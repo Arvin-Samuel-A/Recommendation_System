@@ -4,7 +4,7 @@ import os
 import torch
 import pytest
 
-from configs.config import Config
+from configs.config import Config, OBJECTIVE_ORDER
 from models.transformer import TransformerModel
 from models.moe import MoELayer
 from training.pretrain import (
@@ -282,6 +282,303 @@ class TestFewStepSmokeViaRunPretrain:
         ):
             assert field in log_text, f"epoch log missing '{field}':\n{log_text}"
 
+        # (6) AC-09 / REV-136: the checkpoint records `source_revision`, and a real
+        # artifact derived from it echoes that revision VERBATIM. Both halves are read
+        # back out of the files -- a test that only asserted the writing code exists
+        # would not have caught the two dead stages REV-135 found in `ablations-cli`.
+        assert "source_revision" in ckpt, (
+            "FR-3 (amended 2026-09-18): every checkpoint must record source_revision. "
+            "`config` does not substitute -- the multi-step objective change at the "
+            "centre of REV-129 left `config` byte-identical."
+        )
+        revision = ckpt["source_revision"]
+        assert set(revision) >= {"commit", "dirty", "source_hash"}, revision
+        assert revision["source_hash"], "source_hash must identify the running source"
+
+        routing_path = os.path.join(
+            cfg.log_dir, "routing_diagnostics_t_small.json",
+        )
+        assert os.path.exists(routing_path), (
+            f"no routing diagnostics artifact at {routing_path}"
+        )
+        with open(routing_path) as f:
+            routing_report = json.load(f)
+        assert routing_report.get("source_revision") == revision, (
+            "AC-09: a derived artifact must echo its checkpoint's source_revision "
+            f"verbatim. checkpoint={revision} "
+            f"artifact={routing_report.get('source_revision')}"
+        )
+
+        # The lambda round log carries it too (steering: "metrics, diagnostics, reports,
+        # round logs").
+        jsonl_path = os.path.join(cfg.log_dir, "gradnorm_t_small.jsonl")
+        if os.path.exists(jsonl_path):
+            first = json.loads(open(jsonl_path).readline())
+            assert first.get("source_revision") == revision, first
+        # And the per-epoch log, which is the artifact REV-129 had to date by hand.
+        assert f"source_hash={revision['source_hash']}" in log_text
+
+
+class TestArtifactProvenance:
+    """AC-09 / REV-136 (owner, 2026-09-18) -- `steering/code-quality.md`, "Artifact
+    Provenance". Every artifact must be able to say which code produced it, from the
+    file itself and without reference to prose.
+    """
+
+    def test_source_revision_identifies_the_running_source(self):
+        from utils import get_source_revision
+
+        revision = get_source_revision(refresh=True)
+        assert set(revision) >= {"commit", "dirty", "source_hash"}
+        assert revision["source_hash"], "the content hash is what a dirty tree is by"
+        assert isinstance(revision["dirty"], bool)
+
+    def test_dirty_tree_is_never_attributed_to_its_nearest_commit(self):
+        """The inference that fails in REV-129: commit time is not edit time.
+
+        A dirty tree must be RECORDED as dirty, and the source hash must move when the
+        sources move -- otherwise two different runs share one identifier, which is
+        exactly the condition that made the multi-step dispute unresolvable.
+
+        The probe edits `evaluation/longtail.py`, a covered file under the widened rule
+        (REV-138) and the one the allowlist silently missed. It is restored byte-for-byte.
+        """
+        import utils
+
+        root = os.path.dirname(os.path.abspath(utils.__file__))
+        original = utils._hash_source_tree(root)
+        probe = os.path.join(root, "evaluation", "longtail.py")
+        with open(probe, "rb") as f:
+            before = f.read()
+        try:
+            with open(probe, "ab") as f:
+                f.write(b"\n# temporary provenance probe\n")
+            changed = utils._hash_source_tree(root)
+        finally:
+            with open(probe, "wb") as f:
+                f.write(before)
+        assert changed != original, (
+            "the source hash must change when a covered source changes; otherwise it "
+            "cannot distinguish two runs from one dirty tree"
+        )
+        assert utils._hash_source_tree(root) == original, (
+            "hash must be stable once the probe is removed"
+        )
+
+    def test_hashed_set_equals_the_set_the_coverage_rule_defines(self, monkeypatch):
+        """Coverage completeness, per `steering/code-quality.md` (amended 2026-09-18).
+
+        Asserting that *some* change moves the hash proves the mechanism works, not that
+        it covers what it must -- which is precisely how the allowlist shipped green
+        while omitting `evaluation/` (REV-138). So this observes the files the hash
+        ACTUALLY reads and compares them to the set the rule defines, derived
+        independently here from `git ls-files`.
+        """
+        import builtins
+        import subprocess
+
+        import utils
+
+        root = os.path.dirname(os.path.abspath(utils.__file__))
+
+        listed = subprocess.run(
+            ["git", "ls-files", "-z", "--", "*.py"],
+            cwd=root, capture_output=True, text=True, check=True,
+        ).stdout
+        excluded = ("tests/", ".venv/", "__pycache__/", "data/raw/", "data/processed/")
+        expected = {
+            p for p in listed.split("\0") if p and not p.startswith(excluded)
+        }
+        assert expected, "git ls-files returned nothing; the comparison would be vacuous"
+
+        real_open = builtins.open
+        read: set = set()
+
+        def recording_open(file, *args, **kwargs):
+            try:
+                rel = os.path.relpath(os.fspath(file), root)
+            except (TypeError, ValueError):
+                rel = None
+            if rel and rel.endswith(".py") and not rel.startswith(".."):
+                read.add(rel)
+            return real_open(file, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "open", recording_open)
+        try:
+            utils._hash_source_tree(root)
+        finally:
+            monkeypatch.undo()
+
+        assert read == expected, (
+            "the set of files actually hashed must equal the set the coverage rule "
+            f"defines. Missing: {sorted(expected - read)}; "
+            f"unexpected: {sorted(read - expected)}"
+        )
+
+        # The specific omission REV-138 was filed for: every derived artifact this
+        # project publishes is produced by code in `evaluation/`.
+        for must_be_covered in (
+            "evaluation/longtail.py",
+            "evaluation/cold_start.py",
+            "evaluation/metrics.py",
+            "evaluation/flops.py",
+            "evaluation/gradient_diagnostics.py",
+            "evaluation/routing_diagnostics.py",
+            "main.py",
+            "utils.py",
+            "training/pretrain.py",
+            "models/moe.py",
+            "configs/config.py",
+            "data/preprocessing.py",
+        ):
+            assert must_be_covered in read, f"{must_be_covered} is not hashed"
+        assert not any(p.startswith("tests/") for p in read), (
+            "a test cannot change a published artifact and must not be covered"
+        )
+
+    def test_dirtiness_and_hash_share_one_coverage_rule(self, monkeypatch):
+        """Both halves of a revision must ask the same question (steering, REV-139).
+
+        The old dirty predicate was `path.startswith(SOURCE_REVISION_DIRS)`, a parallel
+        string test under which an edit confined to `evaluation/` or `main.py` moved
+        NEITHER the hash nor the flag -- lost silently, not loudly.
+        """
+        import utils
+
+        root = os.path.dirname(os.path.abspath(utils.__file__))
+        real_git = utils._git
+
+        def with_status(text):
+            def _fake(*args, cwd):
+                if args[0] == "status":
+                    return text
+                if args[0] == "rev-parse":
+                    return "0" * 40
+                return real_git(*args, cwd=cwd)
+            return _fake
+
+        cases = {
+            " M evaluation/longtail.py": True,
+            " M main.py": True,
+            " M utils.py": True,
+            " M training/pretrain.py": True,
+            "R  models/old.py -> models/new.py": True,
+            " D configs/config.py": True,
+            " M tests/test_training.py": False,
+            " M specs/training-pipeline/tasks.md": False,
+            "?? scratch_untracked.py": False,
+            "": False,
+        }
+        try:
+            for status, expected_dirty in cases.items():
+                monkeypatch.setattr(utils, "_git", with_status(status))
+                revision = utils.get_source_revision(refresh=True)
+                assert revision["dirty"] is expected_dirty, (
+                    f"status {status!r} should report dirty={expected_dirty}"
+                )
+        finally:
+            monkeypatch.undo()
+            utils.get_source_revision(refresh=True)
+
+        # Every file the hash covers is a file the dirty predicate accepts, and the
+        # predicate is the same object -- not a second rule that happens to agree today.
+        for rel in utils._covered_source_files(root):
+            assert utils._is_covered_source(rel)
+
+    def test_checkpoint_without_revision_is_recorded_as_unestablished(self):
+        """A pre-AC-09 checkpoint must NOT be silently attributed to the running code.
+
+        Substituting the current revision would assert a provenance that does not hold
+        -- the silent-substitution failure `steering/code-quality.md` forbids, and the
+        precise inference that produced REV-129.
+        """
+        from utils import artifact_source_revision, get_source_revision
+
+        current = get_source_revision()
+        degraded = artifact_source_revision({"config": {}, "epoch": 0})
+        assert degraded["commit"] is None
+        assert degraded["source_hash"] is None
+        assert "NOT established" in degraded["note"]
+        assert degraded != current
+
+        echoed = artifact_source_revision({"source_revision": current})
+        assert echoed == current, "a real revision must be echoed verbatim"
+
+    def test_every_derived_artifact_writer_emits_the_field(self, tmp_path):
+        """Each writer named by REV-136 item 3 stamps the artifact it produces.
+
+        Checked by writing a real file with each writer and reading the field back out,
+        not by inspecting the writing code.
+        """
+        import json
+
+        import numpy as np
+        import torch as _torch
+
+        from evaluation.cold_start import _save_report as save_cold_start
+        from evaluation.longtail import _save_report as save_longtail
+        from evaluation.flops import save_efficiency_report
+        from evaluation.gradient_diagnostics import save_gradient_diagnostics
+        from evaluation.routing_diagnostics import save_routing_diagnostics
+        from training.local_train import _save_report as save_personalization
+
+        revision = {"commit": "deadbeef", "dirty": False, "source_hash": "0123456789abcdef"}
+
+        cfg = Config()
+        cfg.apply_model_config("t-small")
+        cfg.output_dir = str(tmp_path)
+        cfg.log_dir = str(tmp_path / "logs")
+        cfg.plot_dir = str(tmp_path / "plots")
+        os.makedirs(cfg.log_dir, exist_ok=True)
+        os.makedirs(cfg.plot_dir, exist_ok=True)
+
+        metric = {"ndcg": {"mean": 0.1, "std": 0.0}}
+        written = {}
+
+        save_cold_start(cfg, "t-small", {"cold_meta_on": metric}, source_revision=revision)
+        written["cold_start_t_small.json"] = None
+
+        save_longtail(cfg, "t-small", {"head": metric}, None, source_revision=revision)
+        written["longtail_t_small.json"] = None
+
+        save_efficiency_report(
+            cfg, "t-small",
+            {"ms_per_recommendation": 1.0},
+            {"total_parameters": 10, "model_size_bf16_mb": 1.0},
+            source_revision=revision,
+        )
+        written["efficiency_t_small.json"] = None
+
+        save_gradient_diagnostics(
+            _torch.eye(4), {"next_item": {"mean": 1.0}}, OBJECTIVE_ORDER,
+            cfg, "t-small", source_revision=revision,
+        )
+        written["gradient_diagnostics_t_small.json"] = None
+
+        routing = {
+            name: _torch.full((2, cfg.num_experts), 1.0 / cfg.num_experts)
+            for name in OBJECTIVE_ORDER
+        }
+        save_routing_diagnostics(routing, cfg, "t-small", source_revision=revision)
+        written["routing_diagnostics_t_small.json"] = None
+
+        save_personalization(
+            cfg, "t-small",
+            {"num_users_evaluated": 0, "num_users_skipped": 0},
+            source_revision=revision,
+        )
+        written["personalization_gain_t_small.json"] = None
+
+        for name in written:
+            path = os.path.join(cfg.log_dir, name)
+            assert os.path.exists(path), f"{name} was not written"
+            with open(path) as f:
+                payload = json.load(f)
+            assert payload.get("source_revision") == revision, (
+                f"{name} does not echo source_revision: "
+                f"{payload.get('source_revision')}"
+            )
+
 
 class TestFewStepsSmoke:
     """T6.2: one-batch / few-step T-Small gate on real MovieLens data.
@@ -501,7 +798,7 @@ class TestMoECacheLifetime:
         import torch
         from torch.optim.lr_scheduler import LambdaLR
 
-        from configs.config import Config
+        from configs.config import Config, OBJECTIVE_ORDER
         from training.pretrain import build_model, _build_loss_fns
 
         config = Config()

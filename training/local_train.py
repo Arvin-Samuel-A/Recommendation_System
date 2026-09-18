@@ -26,7 +26,7 @@ from data.sequence_generator import (
     filter_negatives, generate_sliding_window_examples, load_metadata_matrix,
     load_or_build_eval_candidates,
 )
-from utils import get_device, resolve_dtype
+from utils import get_device, resolve_dtype, artifact_source_revision
 
 logger = logging.getLogger(__name__)
 
@@ -272,7 +272,10 @@ def run_local_personalization(
     # reset between users. `lora_B` is zero-initialized, so a freshly-reset adapter is
     # an exact identity: the "without LoRA" measurement is unchanged.
     model, moe = build_model(config)
-    load_checkpoint(backbone_path, model, moe)
+    backbone_ckpt = load_checkpoint(backbone_path, model, moe)
+    # AC-09: the artifacts below are derived from THIS checkpoint, so they echo ITS
+    # source_revision -- not the revision of the code currently running, which may differ.
+    source_revision = artifact_source_revision(backbone_ckpt)
     frozen_cksum = compute_frozen_checksum(model, moe)
     inject_lora(model, config.lora_rank)
     pristine_lora = {k: v.detach().clone() for k, v in get_lora_state_dict(model).items()}
@@ -357,7 +360,7 @@ def run_local_personalization(
         })
 
     report = _build_report(results, num_users_skipped)
-    _save_report(config, model_name, report)
+    _save_report(config, model_name, report, source_revision=source_revision)
     _plot_personalization(config, model_name, results)
 
     return report
@@ -395,7 +398,12 @@ def _build_report(results: List[Dict], num_users_skipped: int) -> Dict:
     }
 
 
-def _save_report(config: Config, model_name: str, report: Dict) -> None:
+def _save_report(
+    config: Config,
+    model_name: str,
+    report: Dict,
+    source_revision: Optional[Dict] = None,
+) -> None:
     os.makedirs(config.log_dir, exist_ok=True)
     path = os.path.join(config.log_dir, f"personalization_gain_{model_name.replace('-', '_')}.json")
 
@@ -407,8 +415,13 @@ def _save_report(config: Config, model_name: str, report: Dict) -> None:
                 return obj.tolist()
             return super().default(obj)
 
+    payload = dict(report)
+    # AC-09: echo the source_revision of the checkpoint these numbers came from.
+    if source_revision is not None:
+        payload["source_revision"] = source_revision
+
     with open(path, "w") as f:
-        json.dump(report, f, indent=2, cls=NpEncoder)
+        json.dump(payload, f, indent=2, cls=NpEncoder)
 
 
 def _plot_personalization(config: Config, model_name: str, results: List[Dict]) -> None:

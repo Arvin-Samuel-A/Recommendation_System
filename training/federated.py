@@ -33,7 +33,7 @@ from data.sequence_generator import (
     filter_negatives,
     load_metadata_matrix,
 )
-from utils import get_device
+from utils import get_device, artifact_source_revision
 
 logger = logging.getLogger(__name__)
 
@@ -191,7 +191,10 @@ def run_federated(
             user_val_map.setdefault(uid, []).append(i)
 
     model, moe = build_model(config)
-    load_checkpoint(backbone_path, model, moe)
+    backbone_ckpt = load_checkpoint(backbone_path, model, moe)
+    # AC-09: the round log below is derived from THIS checkpoint, so it echoes ITS
+    # source_revision -- not the revision of the code currently running.
+    source_revision = artifact_source_revision(backbone_ckpt)
     inject_lora(model, config.lora_rank)
     global_lora_state = get_lora_state_dict(model)
 
@@ -315,6 +318,11 @@ def run_federated(
             round_log["val_ndcg_full"] = full_metrics.get("ndcg", {}).get("mean", 0.0)
             round_log["val_mrr_full"] = full_metrics.get("mrr", {}).get("mean", 0.0)
             round_log["val_examples_scored_full"] = int(len(val_sequences))
+
+        # AC-09: `federated_rounds_*.json` is a LIST of round records (read by index at
+        # main.py's plots stage), so the stamp goes on each record rather than on a new
+        # top-level wrapper that would break every existing reader.
+        round_log["source_revision"] = source_revision
 
         round_logs.append(round_log)
 

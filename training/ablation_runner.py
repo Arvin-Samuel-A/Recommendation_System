@@ -234,7 +234,7 @@ def _run_single_config(
     from data.sequence_generator import (
         load_tensorised, load_eval_candidates, load_metadata_matrix,
     )
-    from utils import get_device
+    from utils import get_device, artifact_source_revision
 
     label = getattr(cfg, "_study_label", "unknown")
     result = {
@@ -309,7 +309,11 @@ def _run_single_config(
     device = get_device(cfg)
     model, moe = build_model(cfg)
     loss_fns = _build_loss_fns(cfg, device)
-    load_checkpoint(ckpt_path, model, moe, loss_fns=loss_fns)
+    arm_ckpt = load_checkpoint(ckpt_path, model, moe, loss_fns=loss_fns)
+    # AC-09: an ablation JSON compares arms, so an unstamped one cannot prove its arms
+    # were produced by the same code. Each arm echoes the source_revision of the
+    # checkpoint IT was evaluated from, alongside `resolved_config` and `config_diff`.
+    result["source_revision"] = artifact_source_revision(arm_ckpt)
 
     # Evaluate on the FIXED stored candidate sets, so every ablation arm is scored
     # against identical candidates (data-pipeline REV-041).

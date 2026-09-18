@@ -42,7 +42,7 @@ from data.sequence_generator import (
 from evaluation.routing_diagnostics import save_routing_diagnostics
 from evaluation.gradient_diagnostics import run_gradient_diagnostics
 from evaluation.metrics import evaluate_model
-from utils import get_device, resolve_dtype
+from utils import get_device, resolve_dtype, get_source_revision
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +100,11 @@ def save_checkpoint(
         "val_recall": val_metrics.get("recall", {}).get("mean", 0.0),
         "val_precision": val_metrics.get("precision", {}).get("mean", 0.0),
         "config": asdict(config),
+        # FR-3 / AC-09 (owner, 2026-09-18): which code produced this checkpoint, answerable
+        # from the file. `config` does NOT substitute -- the multi-step objective change at
+        # the centre of REV-129 left `config` byte-identical, which is why that dispute
+        # could not be settled from the repository at all.
+        "source_revision": get_source_revision(),
     }
     if is_best:
         # REV-037: FR-3 requires these as named fields on the best checkpoint rather
@@ -393,6 +398,12 @@ def log_epoch(
         lambdas = gradnorm.lambdas.detach().cpu()
         for i, obj_name in enumerate(OBJECTIVE_ORDER):
             parts.append(f"lambda_{obj_name}={lambdas[i].item():.6f}")
+    # AC-09: the per-epoch log is the artifact REV-129 had to reconstruct a timeline to
+    # date. Stamping each line makes "which code wrote this number?" a lookup.
+    revision = get_source_revision()
+    parts.append(f"source_commit={revision.get('commit')}")
+    parts.append(f"source_hash={revision.get('source_hash')}")
+    parts.append(f"source_dirty={revision.get('dirty')}")
     epoch_logger.info(" | ".join(parts))
 
 
@@ -405,7 +416,11 @@ def log_gradnorm_lambdas(
     path = os.path.join(config.log_dir, f"gradnorm_{model_name.replace('-', '_')}.jsonl")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     lambdas = gradnorm.lambdas.detach().cpu()
-    record = {"step": step, "lambdas": {name: lambdas[i].item() for i, name in enumerate(OBJECTIVE_ORDER)}}
+    record = {
+        "step": step,
+        "lambdas": {name: lambdas[i].item() for i, name in enumerate(OBJECTIVE_ORDER)},
+        "source_revision": get_source_revision(),
+    }
     with open(path, "a") as f:
         f.write(json.dumps(record) + "\n")
 
@@ -497,7 +512,9 @@ def _emit_routing_diagnostics(
     buffer.clear()
     if not per_objective:
         return None
-    return save_routing_diagnostics(per_objective, config, model_name)
+    return save_routing_diagnostics(
+        per_objective, config, model_name, source_revision=get_source_revision(),
+    )
 
 
 def collect_validation_routing(
@@ -818,6 +835,7 @@ def run_pretrain(config: Config, model_name: str) -> Dict[str, float]:
                     negative_sampler=attach_negatives,
                     metadata_matrix=metadata_matrix_t,
                     augment_rng=rng,
+                    source_revision=get_source_revision(),
                 )
                 optimizer.zero_grad(set_to_none=True)
                 model.train()
@@ -895,7 +913,10 @@ def run_pretrain(config: Config, model_name: str) -> Dict[str, float]:
     routing_buffer.clear()
     val_routing = collect_validation_routing(model, moe, val_dataset, config)
     if val_routing:
-        save_routing_diagnostics(val_routing, config, model_name)
+        save_routing_diagnostics(
+            val_routing, config, model_name,
+            source_revision=get_source_revision(),
+        )
 
     if gradnorm is not None:
         plot_gradnorm_trajectory(config, model_name)

@@ -325,6 +325,35 @@ class TestParameterReportNamespacing:
         written = sorted(p.name for p in tmp_path.glob("moe_parameter_report_*.json"))
         assert len(written) == 4, f"untagged arms collided: {written}"
 
+    def test_report_carries_the_running_source_revision(self, tmp_path):
+        """`steering/code-quality.md` "Artifact Provenance"; REV-136 closing note.
+
+        This report is a pure function of `config` and is NOT derived from a checkpoint,
+        so the honest provenance is the RUNNING revision. `artifact_source_revision`
+        would be the wrong call: there is no model here whose provenance this could be
+        reporting. Read back off disk rather than off the returned dict, since the file
+        is the artifact.
+        """
+        import json
+
+        from configs.config import Config
+        from models.moe import count_router_parameters
+        from utils import get_source_revision
+
+        config = Config()
+        config.log_dir = str(tmp_path)
+        report = count_router_parameters(config, run_tag="C_arv_mmoe")
+
+        with open(tmp_path / f"moe_parameter_report_{report['report_suffix']}.json") as f:
+            on_disk = json.load(f)
+
+        revision = on_disk.get("source_revision")
+        assert revision, "the report must say which code produced it"
+        assert set(revision) >= {"commit", "dirty", "source_hash"}, revision
+        assert revision == get_source_revision(), (
+            "a config-derived report echoes the running revision verbatim"
+        )
+
     def test_report_contents_are_unchanged_by_the_naming(self, tmp_path):
         """The parameter accounting itself must be identical to the untagged call."""
         import json
