@@ -73,6 +73,7 @@ def save_routing_diagnostics(
     per_objective_routing: Dict[str, torch.Tensor],
     config,
     model_name: str,
+    source_revision: Optional[dict] = None,
 ) -> dict:
     report = {}
 
@@ -98,6 +99,10 @@ def save_routing_diagnostics(
     heatmap = objective_expert_heatmap(per_objective_routing)
     report["heatmap"] = heatmap.tolist()
     report["heatmap_shape"] = list(heatmap.shape)
+
+    # AC-09: echo the source_revision of the checkpoint these numbers came from.
+    if source_revision is not None:
+        report["source_revision"] = source_revision
 
     log_dir = config.log_dir
     os.makedirs(log_dir, exist_ok=True)

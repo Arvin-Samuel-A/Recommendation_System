@@ -1,6 +1,6 @@
 import json
 import os
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -78,12 +78,16 @@ def save_gradient_diagnostics(
     objective_names: List[str],
     config,
     model_name: str,
+    source_revision: Optional[dict] = None,
 ) -> dict:
     report = {
         "cosine_similarity": cos_sim.tolist(),
         "objective_names": objective_names,
         "gradient_norms": grad_norms,
     }
+    # AC-09: echo the source_revision of the checkpoint these numbers came from.
+    if source_revision is not None:
+        report["source_revision"] = source_revision
 
     log_dir = config.log_dir
     os.makedirs(log_dir, exist_ok=True)
@@ -111,6 +115,7 @@ def run_gradient_diagnostics(
     metadata_matrix=None,
     augment_rng=None,
     write_report: bool = True,
+    source_revision: Optional[dict] = None,
 ) -> dict:
     """Per-objective gradient conflict/dominance diagnostics.
 
@@ -278,7 +283,10 @@ def run_gradient_diagnostics(
             "objective_names": objective_names,
             "gradient_norms": avg_norms,
         }
-    return save_gradient_diagnostics(avg_cos, avg_norms, objective_names, config, model_name)
+    return save_gradient_diagnostics(
+        avg_cos, avg_norms, objective_names, config, model_name,
+        source_revision=source_revision,
+    )
 
 
 def plot_gradient_diagnostics(report: dict, config, model_name: str) -> None:

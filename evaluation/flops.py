@@ -209,6 +209,7 @@ def save_efficiency_report(
     latency: Dict[str, float],
     param_counts: Dict[str, int],
     overhead: Optional[Dict[str, float]] = None,
+    source_revision: Optional[Dict] = None,
 ) -> None:
     os.makedirs(config.log_dir, exist_ok=True)
     mn = model_name.replace("-", "_")
@@ -220,6 +221,9 @@ def save_efficiency_report(
     report["model_name"] = model_name
     if overhead:
         report["routing_overhead"] = overhead
+    # AC-09: echo the source_revision of the checkpoint these numbers came from.
+    if source_revision is not None:
+        report["source_revision"] = source_revision
     path = os.path.join(config.log_dir, f"efficiency_{mn}.json")
     with open(path, "w") as f:
         json.dump(report, f, indent=2)

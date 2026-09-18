@@ -170,6 +170,17 @@ class TestLongtailBucketPartition:
         zero_items = all_items - items_with_counts
         assert zero_items.issubset(buckets["tail"])
 
+        # Owner decision (2026-09-18): the 20/20/60 split is over the WHOLE CATALOGUE,
+        # not over the interacted subset. 20 items, 17 of them interacted -> 4 / 4 / 12.
+        # Under the superseded scheme this fixture gave 3 / 4 / 13 (int(17*.2)=3), so
+        # these assertions fail on it.
+        n = len(all_items)
+        assert len(buckets["head"]) == int(n * 0.20) == 4, (
+            f"head={len(buckets['head'])}, expected 4 of {n} catalogue items"
+        )
+        assert len(buckets["mid"]) == 4, f"mid={len(buckets['mid'])}, expected 4"
+        assert len(buckets["tail"]) == 12, f"tail={len(buckets['tail'])}, expected 12"
+
     def test_exact_20_20_60_proportions(self):
         """REV-028: T7.4's text is "correct percentiles", but the partition test only
         checked disjointness/completeness -- the proportions, which is precisely what

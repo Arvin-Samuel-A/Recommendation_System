@@ -19,7 +19,8 @@ from utils import get_device
 
 logger = logging.getLogger(__name__)
 
-# FR-5 / T3.1: head 20%, mid 20%, tail 60% of items ranked by training popularity.
+# FR-5 / T3.1: head 20%, mid 20%, tail 60% of the WHOLE CATALOGUE, ranked by training
+# popularity with zero-interaction items tying at the bottom (owner decision 2026-09-18).
 HEAD_FRACTION = 0.20
 MID_FRACTION = 0.20
 TAIL_FRACTION = 0.60
@@ -35,8 +36,23 @@ def compute_popularity_buckets(
         for item in user_items:
             item_counts[item] = item_counts.get(item, 0) + 1
 
+    # Owner decision (2026-09-18): the 20 / 20 / 60 split is over the WHOLE CATALOGUE.
+    # It used to rank only items with training interactions -- `sorted_items =
+    # sorted(item_counts.keys(), ...)`, `n = len(sorted_items)` -- and then append the
+    # zero-interaction items to tail, which made the realized catalogue fractions
+    # 0.162 / 0.162 / 0.676 on MovieLens-20M (3,939 of 20,720 items have no training
+    # interaction). FR-5 carries three clauses: "Head: top 20%, Mid: middle 20%, Tail:
+    # bottom 60%", "Zero-training items classified as tail", and "All item IDs
+    # partitioned". Ranking the full catalogue with zero-count items tying at the bottom
+    # satisfies all three exactly -- they sort last, so they land in tail structurally
+    # rather than by a separate append step.
+    #
+    # Ranking the full catalogue also ignores any count for an item outside
+    # `all_item_ids`, which the old form would have bucketed and then tripped the
+    # completeness assertion on.
+    #
     # Ties are broken by item id so the bucketing is deterministic.
-    sorted_items = sorted(item_counts.keys(), key=lambda x: (-item_counts[x], x))
+    sorted_items = sorted(all_item_ids, key=lambda x: (-item_counts.get(x, 0), x))
     n = len(sorted_items)
 
     # REV-007: `mid_cutoff` was computed as a POSITION (int(n*0.40)) but used as a
@@ -49,11 +65,23 @@ def compute_popularity_buckets(
     mid = set(sorted_items[head_end:mid_end])
     tail = set(sorted_items[mid_end:])
 
-    zero_items = all_item_ids - set(item_counts.keys())
-    tail = tail | zero_items
-
     assert head.isdisjoint(mid) and head.isdisjoint(tail) and mid.isdisjoint(tail)
     assert head | mid | tail == all_item_ids
+
+    # FR-5's zero-training clause is now a consequence of the ordering rather than a
+    # separate step, so assert it instead of enforcing it. It can only fail if
+    # zero-interaction items exceed the tail fraction, in which case FR-5's first and
+    # second clauses are genuinely incompatible for this dataset -- fail explicitly
+    # rather than silently choosing one (steering/code-quality.md).
+    zero_items = all_item_ids - set(item_counts.keys())
+    if not zero_items.issubset(tail):
+        raise ValueError(
+            f"{len(zero_items - tail)} zero-interaction items fell outside the tail "
+            f"bucket: zero-interaction items are {len(zero_items) / n:.1%} of the "
+            f"catalogue, which exceeds the {TAIL_FRACTION:.0%} tail. FR-5's "
+            f"'Head: top 20%' and 'Zero-training items classified as tail' cannot both "
+            f"hold for this dataset -- the spec owner must choose."
+        )
 
     buckets = {"head": head, "mid": mid, "tail": tail}
     if save_path:
@@ -69,6 +97,7 @@ def run_longtail_evaluation(
     moe_layer: Optional[torch.nn.Module],
     config: Config,
     model_name: str,
+    source_revision: Optional[Dict] = None,
 ) -> Dict:
     device = get_device(config)
     processed = config.processed_data_dir
@@ -152,7 +181,7 @@ def run_longtail_evaluation(
     for bucket in bucket_names:
         stacked = {k: torch.cat(v) for k, v in results[bucket].items()}
         report[bucket] = aggregate_metrics(stacked) if stacked else {}
-    _save_report(config, model_name, report, buckets)
+    _save_report(config, model_name, report, buckets, source_revision=source_revision)
     _plot_longtail(config, model_name, report)
     return report
 
@@ -162,6 +191,7 @@ def _save_report(
     model_name: str,
     report: Dict,
     buckets: Optional[Dict[str, Set[int]]] = None,
+    source_revision: Optional[Dict] = None,
 ) -> None:
     os.makedirs(config.log_dir, exist_ok=True)
     mn = model_name.replace("-", "_")
@@ -176,11 +206,11 @@ def _save_report(
     # metrics reached the artifact, so both had to be re-derived from the pickle by hand.
     # Recorded here so the numbers are self-describing: a tail NDCG means nothing without
     # knowing whether "tail" is 10 items or 14,000.
-    # NOTE for the reader (and for the spec owner): `head_fraction_of_catalogue` is
-    # deliberately reported ALONGSIDE the nominal 0.20/0.20/0.60. They differ because the
-    # 20/20/60 split is applied to items that HAVE training interactions, after which
-    # zero-training items are appended to tail per FR-5's second clause. See the note in
-    # `specs/evaluation-diagnostics/tasks.md` T3.3.
+    # T3.4 (owner, 2026-09-18): `realized_fractions_of_catalogue` is reported alongside
+    # the nominal 0.20/0.20/0.60 so their AGREEMENT is checkable from the file. Under the
+    # catalogue-wide ranking they are now identical; under the superseded scheme (rank
+    # only interacted items, then append zero-interaction items to tail) they differed
+    # -- 0.162/0.162/0.676. Keeping both fields is what makes a regression visible.
     if buckets is not None:
         populations = {b: len(items) for b, items in buckets.items()}
         total = sum(populations.values())
@@ -200,6 +230,10 @@ def _save_report(
                 b: (n / total if total else 0.0) for b, n in populations.items()
             },
         }
+
+    # AC-09: echo the source_revision of the checkpoint these numbers came from.
+    if source_revision is not None:
+        serializable["source_revision"] = source_revision
 
     with open(path, "w") as f:
         json.dump(serializable, f, indent=2)

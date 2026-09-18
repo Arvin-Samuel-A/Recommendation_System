@@ -188,6 +188,17 @@ def save_config_snapshot(config: Config) -> None:
         logger.warning("Could not fully resolve the runtime manifest: %s", exc)
         manifest.setdefault("runtime", {})["error"] = f"{type(exc).__name__}: {exc}"
 
+    # AC-09 / steering "Artifact Provenance": the run manifest records WHICH CODE this run
+    # executed, alongside which hardware and kernel it ran on. `steering/code-quality.md`
+    # already requires the torch version, device, dtype and resolved backend here; the
+    # source revision is the same kind of fact and the one REV-129 could not recover.
+    try:
+        from utils import get_source_revision
+
+        manifest["source_revision"] = get_source_revision()
+    except Exception as exc:  # never let manifest-writing abort a run
+        logger.warning("Could not resolve source_revision for the manifest: %s", exc)
+
     with open(path, "w") as f:
         json.dump(manifest, f, indent=2)
 
@@ -219,7 +230,7 @@ def run_evaluate_stage(config, args):
         load_tensorised, generate_eval_candidates, load_eval_candidates,
         load_metadata_matrix,
     )
-    from utils import get_device
+    from utils import get_device, artifact_source_revision
     import pickle
 
     config.apply_model_config(args.model)
@@ -238,7 +249,9 @@ def run_evaluate_stage(config, args):
     config.vocab_size = config.num_items + 2
 
     model, moe = build_model(config)
-    load_checkpoint(ckpt_path, model, moe)
+    ckpt = load_checkpoint(ckpt_path, model, moe)
+    # AC-09: the test metrics below are derived from THIS checkpoint.
+    source_revision = artifact_source_revision(ckpt)
 
     # REV-058/REV-072: one loader, so the (vocab, F) alignment applies uniformly.
     metadata_matrix = load_metadata_matrix(processed, config)
@@ -327,6 +340,7 @@ def run_evaluate_stage(config, args):
             "num_force_included": ann_report["num_force_included"],
             "num_examples": ann_report["num_examples"],
         }
+    payload["source_revision"] = source_revision
     with open(os.path.join(config.log_dir, f"test_metrics_{args.model.replace('-', '_')}.json"), "w") as f:
         json.dump(payload, f, indent=2)
 
@@ -334,7 +348,7 @@ def run_evaluate_stage(config, args):
 def run_cold_start_stage(config, args):
     from training.pretrain import build_model, load_checkpoint
     from evaluation.cold_start import run_cold_start_evaluation
-    from utils import get_device
+    from utils import get_device, artifact_source_revision
 
     config.apply_model_config(args.model)
     ckpt_path = os.path.join(config.model_checkpoint_dir(), "best.pt")
@@ -349,13 +363,17 @@ def run_cold_start_stage(config, args):
     config.vocab_size = config.num_items + 2
 
     model, moe = build_model(config)
-    load_checkpoint(ckpt_path, model, moe)
-    run_cold_start_evaluation(model, moe, config, args.model)
+    ckpt = load_checkpoint(ckpt_path, model, moe)
+    run_cold_start_evaluation(
+        model, moe, config, args.model,
+        source_revision=artifact_source_revision(ckpt),
+    )
 
 
 def run_longtail_stage(config, args):
     from training.pretrain import build_model, load_checkpoint
     from evaluation.longtail import run_longtail_evaluation
+    from utils import artifact_source_revision
 
     config.apply_model_config(args.model)
     ckpt_path = os.path.join(config.model_checkpoint_dir(), "best.pt")
@@ -370,8 +388,11 @@ def run_longtail_stage(config, args):
     config.vocab_size = config.num_items + 2
 
     model, moe = build_model(config)
-    load_checkpoint(ckpt_path, model, moe)
-    run_longtail_evaluation(model, moe, config, args.model)
+    ckpt = load_checkpoint(ckpt_path, model, moe)
+    run_longtail_evaluation(
+        model, moe, config, args.model,
+        source_revision=artifact_source_revision(ckpt),
+    )
 
 
 def run_latency_stage(config, args):
@@ -383,7 +404,7 @@ def run_latency_stage(config, args):
         measure_routing_overhead, estimate_flops_per_inference,
     )
     from models.moe import MoELayer
-    from utils import get_device, resolve_dtype
+    from utils import get_device, resolve_dtype, artifact_source_revision
 
     config.apply_model_config(args.model)
     ckpt_path = os.path.join(config.model_checkpoint_dir(), "best.pt")
@@ -403,7 +424,8 @@ def run_latency_stage(config, args):
         config.feature_dim = np.load(meta_path).shape[-1]
 
     model, moe = build_model(config)
-    load_checkpoint(ckpt_path, model, moe)
+    ckpt = load_checkpoint(ckpt_path, model, moe)
+    source_revision = artifact_source_revision(ckpt)
     latency = benchmark_latency(model, moe, config)
     params = count_parameters(model, moe)
 
@@ -426,7 +448,10 @@ def run_latency_stage(config, args):
     # REV-021b: FR-7 names flops_per_inference; accuracy_vs_flops.png has no other source.
     params["flops_per_inference"] = estimate_flops_per_inference(config, moe)
 
-    save_efficiency_report(config, args.model, latency, params, overhead=overhead)
+    save_efficiency_report(
+        config, args.model, latency, params, overhead=overhead,
+        source_revision=source_revision,
+    )
     logger.info(
         "Efficiency report written for %s: %.3f ms/rec, %d params, %.1f MB bf16",
         args.model, latency["ms_per_recommendation"],
@@ -438,7 +463,7 @@ def _load_trained_model(config, args):
     """Shared setup for the standalone diagnostics stages: stats, model, best.pt."""
     from training.pretrain import build_model, load_checkpoint, _build_loss_fns
     from data.sequence_generator import load_metadata_matrix
-    from utils import get_device
+    from utils import get_device, artifact_source_revision
 
     config.apply_model_config(args.model)
     processed = config.processed_data_dir
@@ -465,8 +490,10 @@ def _load_trained_model(config, args):
     device = get_device(config)
     model, moe = build_model(config)
     loss_fns = _build_loss_fns(config, device)
-    load_checkpoint(ckpt_path, model, moe, loss_fns=loss_fns)
-    return model, moe, loss_fns, metadata_matrix, device, processed
+    ckpt = load_checkpoint(ckpt_path, model, moe, loss_fns=loss_fns)
+    # AC-09: diagnostics derived from this checkpoint echo ITS source_revision.
+    source_revision = artifact_source_revision(ckpt)
+    return model, moe, loss_fns, metadata_matrix, device, processed, source_revision
 
 
 def run_routing_diagnostics_stage(config, args):
@@ -483,7 +510,7 @@ def run_routing_diagnostics_stage(config, args):
     loaded = _load_trained_model(config, args)
     if loaded is None:
         return
-    model, moe, _, metadata_matrix, _, processed = loaded
+    model, moe, _, metadata_matrix, _, processed, source_revision = loaded
 
     val_dataset = load_tensorised(
         os.path.join(processed, "val_tensorised.pt"), metadata_matrix,
@@ -495,7 +522,9 @@ def run_routing_diagnostics_stage(config, args):
             "weights.", config.moe_variant,
         )
         return
-    report = save_routing_diagnostics(per_objective, config, args.model)
+    report = save_routing_diagnostics(
+        per_objective, config, args.model, source_revision=source_revision,
+    )
     logger.info(
         "Routing diagnostics written for %s: overall_entropy_mean=%.4f",
         args.model, report["overall_entropy_mean"],
@@ -523,7 +552,7 @@ def run_gradient_diagnostics_stage(config, args):
     loaded = _load_trained_model(config, args)
     if loaded is None:
         return
-    model, moe, loss_fns, metadata_matrix, device, processed = loaded
+    model, moe, loss_fns, metadata_matrix, device, processed, source_revision = loaded
 
     train_dataset = load_tensorised(
         os.path.join(processed, "train_tensorised.pt"), metadata_matrix,
@@ -556,6 +585,7 @@ def run_gradient_diagnostics_stage(config, args):
         negative_sampler=attach_negatives,
         metadata_matrix=metadata_matrix_t,
         augment_rng=random.Random(config.seed),
+        source_revision=source_revision,
     )
     if not report:
         logger.warning("No diagnostic batches processed; no report written.")

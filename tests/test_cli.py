@@ -1,5 +1,7 @@
 import json
+import inspect
 import os
+import textwrap
 import pytest
 from unittest.mock import patch, MagicMock
 
@@ -417,10 +419,86 @@ class TestLoadTrainedModelResolvesItsNames:
             loaded = _load_trained_model(config, args)
 
         assert loaded is not None, "the checkpoint exists, so this must not skip"
-        model, moe, _, metadata_matrix, _, processed = loaded
+        model, moe, _, metadata_matrix, _, processed, source_revision = loaded
         assert model is sentinel_model and moe is sentinel_moe
         assert metadata_matrix is None
         assert processed == config.processed_data_dir
+        # AC-09: the helper also resolves the provenance the diagnostics artifacts echo.
+        # `load_checkpoint` is patched here, so it returns a MagicMock rather than a real
+        # checkpoint dict -- the helper must degrade to the "not established" record
+        # instead of inventing one.
+        assert isinstance(source_revision, dict)
+        assert "commit" in source_revision
+
+
+class TestEvaluationStagesResolveTheirNames:
+    """The REV-135 defect class, generalised: a stage whose body references a name it
+    never imported raises `NameError` only when the stage is actually RUN, and every
+    existing CLI test stops at argument parsing or returns at the checkpoint guard
+    above the faulty line.
+
+    This recurred while implementing AC-09: `run_longtail_stage` gained a call to
+    `artifact_source_revision` without the matching import, and `--stage longtail` died
+    on a NameError that the whole green suite did not see. One test per stage, driving
+    each past its checkpoint guard with the heavy collaborators mocked, so the names in
+    each body are resolved.
+    """
+
+    STAGES = [
+        ("run_evaluate_stage", "evaluate"),
+        ("run_cold_start_stage", "cold_start"),
+        ("run_longtail_stage", "longtail"),
+        ("run_latency_stage", "latency"),
+    ]
+
+    @pytest.mark.parametrize("func_name,stage", STAGES)
+    def test_stage_body_resolves_every_name(self, func_name, stage, tmp_path):
+        """Compile-level name resolution for each stage body.
+
+        Every global load in the function must resolve against `main`'s module
+        namespace or the function's own imports -- which is exactly what a missing
+        `from utils import ...` breaks.
+        """
+        import ast
+        import builtins
+
+        import main as main_module
+
+        source = inspect.getsource(getattr(main_module, func_name))
+        fn = ast.parse(textwrap.dedent(source)).body[0]
+
+        bound = {a.arg for a in fn.args.args}
+        for node in ast.walk(fn):
+            if isinstance(node, ast.ImportFrom):
+                bound |= {a.asname or a.name for a in node.names}
+            elif isinstance(node, ast.Import):
+                bound |= {(a.asname or a.name).split(".")[0] for a in node.names}
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                bound.add(node.id)
+            elif isinstance(node, ast.ExceptHandler) and node.name:
+                bound.add(node.name)
+            elif isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node is not fn:
+                bound.add(node.name)
+            elif isinstance(node, (ast.comprehension,)):
+                for t in ast.walk(node.target):
+                    if isinstance(t, ast.Name):
+                        bound.add(t.id)
+
+        module_ns = vars(main_module)
+        unresolved = sorted({
+            node.id
+            for node in ast.walk(fn)
+            if isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Load)
+            and node.id not in bound
+            and node.id not in module_ns
+            and not hasattr(builtins, node.id)
+        })
+        assert not unresolved, (
+            f"--stage {stage} references names it never imports: {unresolved}. "
+            "This raises NameError at runtime and no other test reaches the line "
+            "(REV-135)."
+        )
 
 
 class TestOverrideLogging:

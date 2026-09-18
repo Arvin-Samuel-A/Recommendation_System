@@ -25,6 +25,7 @@ def run_cold_start_evaluation(
     moe_layer: Optional[torch.nn.Module],
     config: Config,
     model_name: str,
+    source_revision: Optional[Dict] = None,
 ) -> Dict:
     device = get_device(config)
     processed = config.processed_data_dir
@@ -149,12 +150,17 @@ def run_cold_start_evaluation(
             stacked = {k: torch.cat(v) for k, v in results[bucket][meta].items()}
             report[key] = aggregate_metrics(stacked) if stacked else {}
 
-    _save_report(config, model_name, report)
+    _save_report(config, model_name, report, source_revision=source_revision)
     _plot_cold_start(config, model_name, report)
     return report
 
 
-def _save_report(config: Config, model_name: str, report: Dict) -> None:
+def _save_report(
+    config: Config,
+    model_name: str,
+    report: Dict,
+    source_revision: Optional[Dict] = None,
+) -> None:
     os.makedirs(config.log_dir, exist_ok=True)
     mn = model_name.replace("-", "_")
     path = os.path.join(config.log_dir, f"cold_start_{mn}.json")
@@ -162,6 +168,10 @@ def _save_report(config: Config, model_name: str, report: Dict) -> None:
     serializable = {}
     for k, v in report.items():
         serializable[k] = {mk: {sk: float(sv) for sk, sv in mv.items()} for mk, mv in v.items()}
+
+    # AC-09: echo the source_revision of the checkpoint these numbers came from.
+    if source_revision is not None:
+        serializable["source_revision"] = source_revision
 
     with open(path, "w") as f:
         json.dump(serializable, f, indent=2)
