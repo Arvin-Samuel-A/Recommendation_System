@@ -328,7 +328,6 @@ def identify_cold_items(
     config: Config,
 ) -> Tuple[Set[int], Set[int], Dict[int, List[int]]]:
     item_first_seen: Dict[int, float] = {}
-    item_first_seen_orig_id: Dict[int, int] = {}
 
     for user_id, items in user_sequences.items():
         ts = timestamps_per_user[user_id]
@@ -340,25 +339,50 @@ def identify_cold_items(
     for items in user_sequences.values():
         all_items.update(items)
 
-    # REV-011: the "timestamp_cutoff" protocol selects items first observed strictly
-    # after `global_training_cutoff`. On MovieLens-20M essentially every item appears
-    # early in the timeline, so that set came out EMPTY, the code logged an INFO line and
-    # continued, and the entire cold-start research question became vacuous --
-    # `evaluation/cold_start.py` classified 100% of targets as warm.
+    # REV-137 (owner decision 2026-09-18). Three strategies, of which the DEFAULT is
+    # "unseen_in_training". The distinction that matters is whether the strategy
+    # ACHIEVES the disjointness guarantee or CONSTRUCTS it:
     #
-    # "first_appearance_rank" (the default) instead holds out the latest-appearing
-    # `cold_start_ratio` fraction of items by first-appearance time. This is non-empty by
-    # construction, preserves the "these items are new relative to the rest of the
-    # catalogue" semantics, and keeps the disjoint-from-training guarantee because the
-    # selected items are stripped from the training sequences below.
-    strategy = getattr(config, "cold_start_strategy", "first_appearance_rank")
+    #   "unseen_in_training" -- cold = all_items - train_interacted_items. An item is
+    #       cold exactly when the model never saw it. The removal step below is a no-op
+    #       by construction (asserted, not assumed) and `cold_start_ratio` does not
+    #       apply: the size is data-determined.
+    #   "first_appearance_rank" -- holds out the latest-appearing `cold_start_ratio`
+    #       fraction, then DELETES those items' training interactions. Non-empty by
+    #       construction but INDUCED: measured on MovieLens-20M, 927 of 2,072 cold items
+    #       had 6,634 real training interactions removed across 2,192 users.
+    #   "timestamp_cutoff" -- items first seen strictly after `global_training_cutoff`.
+    #       Empty on this dataset, because that cutoff is the MAXIMUM over every user's
+    #       own training end and so lands 0.1 days before the final interaction -- not
+    #       because items appear early. An empty holdout is a hard error below.
+    strategy = getattr(config, "cold_start_strategy", "unseen_in_training")
 
     ranked = sorted(
         ((item_first_seen.get(item, 0.0), item) for item in all_items),
         key=lambda pair: (pair[0], pair[1]),
     )
 
-    if strategy == "timestamp_cutoff":
+    # The union over the UNFILTERED training split -- i.e. what the model would see if no
+    # holdout were applied. This is the quantity "unseen_in_training" is defined against.
+    pre_holdout_train_items: Set[int] = set()
+    for items in train_seqs.values():
+        pre_holdout_train_items.update(items)
+
+    if strategy == "unseen_in_training":
+        selected_cold = sorted(all_items - pre_holdout_train_items)
+        # FR-3's optional first-appearance threshold, applied only when configured.
+        threshold = getattr(config, "cold_start_first_seen_after", None)
+        if threshold is not None:
+            selected_cold = [
+                item
+                for item in selected_cold
+                if item_first_seen.get(item, 0.0) > threshold
+            ]
+            logger.info(
+                "Applied first-appearance threshold %.0f: %d items remain cold",
+                threshold, len(selected_cold),
+            )
+    elif strategy == "timestamp_cutoff":
         cold_candidates = [
             (t, item) for t, item in ranked if t > global_training_cutoff
         ]
@@ -371,7 +395,8 @@ def identify_cold_items(
     else:
         raise ValueError(
             f"Unknown cold_start_strategy '{strategy}'. "
-            "Choose from 'first_appearance_rank', 'timestamp_cutoff'"
+            "Choose from 'unseen_in_training', 'first_appearance_rank', "
+            "'timestamp_cutoff'"
         )
 
     cold_item_set = set(selected_cold)
@@ -382,8 +407,8 @@ def identify_cold_items(
             f"Cold-start holdout is EMPTY under strategy '{strategy}' with "
             f"cold_start_ratio={config.cold_start_ratio} over {len(all_items)} items. "
             "Cold-start evaluation would be vacuous. Use "
-            "cold_start_strategy='first_appearance_rank', which is non-empty by "
-            "construction."
+            "cold_start_strategy='unseen_in_training' (the default), which selects "
+            "every item the training split never contains."
         )
     warm_item_set = all_items - cold_item_set
 
@@ -396,6 +421,19 @@ def identify_cold_items(
     train_interacted_items: Set[int] = set()
     for items in filtered_train.values():
         train_interacted_items.update(items)
+
+    # AC-03 (amended 2026-09-18): under "unseen_in_training" no training interaction may
+    # be deleted to produce the cold set. Assert the no-op property rather than assuming
+    # it -- this is what distinguishes a natural cold set from an induced one, and it is
+    # the clause `first_appearance_rank` violates (6,634 deletions on the real data).
+    if strategy == "unseen_in_training":
+        assert filtered_train == train_seqs, (
+            "cold_start_strategy='unseen_in_training' must not delete any training "
+            "interaction, but the filtered training split differs from the input split. "
+            f"users before={len(train_seqs)} after={len(filtered_train)}, "
+            f"interactions before={sum(len(v) for v in train_seqs.values())} "
+            f"after={sum(len(v) for v in filtered_train.values())}"
+        )
 
     assert cold_item_set.isdisjoint(train_interacted_items), (
         "Cold items found in filtered training data!"
@@ -416,9 +454,15 @@ def identify_cold_items(
     with open(warm_path, "wb") as f:
         pickle.dump(warm_item_set, f)
 
+    removed_interactions = (
+        sum(len(v) for v in train_seqs.values())
+        - sum(len(v) for v in filtered_train.values())
+    )
     logger.info(
-        "Cold-start holdout (%s): %d cold items, %d warm items, %d total",
+        "Cold-start holdout (%s): %d cold items, %d warm items, %d total; "
+        "%d training interactions removed",
         strategy, len(cold_item_set), len(warm_item_set), len(all_items),
+        removed_interactions,
     )
     return cold_item_set, warm_item_set, filtered_train
 
@@ -544,9 +588,16 @@ def run_preprocessing(config: Config) -> None:
     )
 
     logger.info("=== Step 5/7: Identify cold items ===")
+    train_interactions_before = sum(len(v) for v in train_seqs.values())
     cold_item_set, warm_item_set, filtered_train = identify_cold_items(
         train_seqs, val_seqs, test_seqs,
         timestamps_per_user, user_sequences, global_cutoff, config,
+    )
+    # AC-03 (amended 2026-09-18): the before/after comparison is recorded in the manifest
+    # so "was any training interaction deleted to make this cold set?" is answerable from
+    # the artifact rather than from the code that wrote it.
+    train_interactions_removed = train_interactions_before - sum(
+        len(v) for v in filtered_train.values()
     )
 
     logger.info("=== Step 6/7: Extract metadata ===")
@@ -645,10 +696,12 @@ def run_preprocessing(config: Config) -> None:
         "feature_dim": int(config.feature_dim),
         "pool_size": pool_size,
         "pool_fingerprint": neg_pool.fingerprint,
-        "cold_start_strategy": getattr(config, "cold_start_strategy", "first_appearance_rank"),
+        "cold_start_strategy": getattr(config, "cold_start_strategy", "unseen_in_training"),
         "cold_start_ratio": config.cold_start_ratio,
         "num_cold_items": len(cold_item_set),
         "num_warm_items": len(warm_item_set),
+        "train_interactions_before_holdout": int(train_interactions_before),
+        "train_interactions_removed_by_holdout": int(train_interactions_removed),
         "num_sampled_negatives": config.num_sampled_negatives,
         "val_candidates_fingerprint": val_fp,
         "test_candidates_fingerprint": test_fp,

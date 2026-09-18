@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional
 
 
 OBJECTIVE_ORDER = ["next_item", "masked_item", "multi_step", "contrastive"]
@@ -25,13 +25,28 @@ class Config:
     min_interactions: int = 5
     train_ratio: float = 0.80
     val_ratio: float = 0.10
+    # NOTE: `cold_start_ratio` applies ONLY to "first_appearance_rank" and
+    # "timestamp_cutoff". Under the default "unseen_in_training" strategy the size of
+    # the cold set is data-determined and this field is not consulted (FR-3).
     cold_start_ratio: float = 0.10
-    # REV-011: "timestamp_cutoff" selects items first seen strictly after the global
-    # training cutoff -- on MovieLens-20M that set is empty, which made the whole
-    # cold-start research question vacuous. "first_appearance_rank" holds out the
-    # latest-appearing `cold_start_ratio` fraction of items, which is non-empty by
-    # construction.
-    cold_start_strategy: str = "first_appearance_rank"
+    # REV-137 (owner decision 2026-09-18): the DEFAULT is "unseen_in_training" -- an item
+    # is cold iff it has zero interactions in any user's training portion. Nothing is
+    # deleted to produce it, so the disjointness guarantee holds trivially rather than by
+    # construction-after-deletion.
+    #
+    # The two prior strategies remain selectable. "timestamp_cutoff" selects items first
+    # seen strictly after `global_training_cutoff`; that set is empty on MovieLens-20M --
+    # not because items appear early (43.5% of the catalogue is first seen after a p80
+    # global date) but because the cutoff is the MAXIMUM over every user's own training
+    # end, which lands 0.1 days before the dataset's final interaction.
+    # "first_appearance_rank" holds out the latest-appearing `cold_start_ratio` fraction
+    # and is non-empty by construction, but it is INDUCED: measured, 927 of its 2,072
+    # cold items had 6,634 real training interactions deleted to make them cold.
+    cold_start_strategy: str = "unseen_in_training"
+    # Optional first-appearance threshold for "unseen_in_training" (FR-3): when set to a
+    # POSIX timestamp, an item is cold only if it also has no interaction before it, so a
+    # strictly temporal set can be requested. `None` applies no threshold.
+    cold_start_first_seen_after: Optional[float] = None
 
     # --- Sequence ---
     max_seq_length: int = 50
@@ -284,10 +299,15 @@ class Config:
                 f"Unknown router_conditioning '{self.router_conditioning}'. "
                 "Choose from 'objective_conditioned', 'input_only'"
             )
-        if self.cold_start_strategy not in ("first_appearance_rank", "timestamp_cutoff"):
+        if self.cold_start_strategy not in (
+            "unseen_in_training",
+            "first_appearance_rank",
+            "timestamp_cutoff",
+        ):
             raise ValueError(
                 f"Unknown cold_start_strategy '{self.cold_start_strategy}'. "
-                "Choose from 'first_appearance_rank', 'timestamp_cutoff'"
+                "Choose from 'unseen_in_training', 'first_appearance_rank', "
+                "'timestamp_cutoff'"
             )
         if self.local_train_source not in ("train", "val"):
             raise ValueError(

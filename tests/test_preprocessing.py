@@ -309,6 +309,77 @@ class TestColdStartHoldout:
         with pytest.raises(ValueError, match="cold_start_strategy"):
             self._run("not_a_strategy", 0.3)
 
+    # --- REV-137: "unseen_in_training", the default since 2026-09-18 ---
+
+    def test_unseen_in_training_is_the_configured_default(self):
+        assert Config().cold_start_strategy == "unseen_in_training"
+
+    def test_unseen_in_training_selects_items_absent_from_training(self):
+        cold, warm, filtered = self._run("unseen_in_training", 0.3)
+        train_items = set()
+        for items in self.TRAIN.values():
+            train_items.update(items)
+        all_items = set()
+        for items in self.USER_SEQUENCES.values():
+            all_items.update(items)
+        # cold == all_items - train_interacted_items, exactly.
+        assert cold == all_items - train_items == {9, 10}
+        assert warm == train_items
+        self._assert_invariants(cold, warm, filtered)
+
+    def test_unseen_in_training_deletes_no_training_interaction(self):
+        """AC-03's new clause, and the test REV-137 asks to DISCRIMINATE between the
+        two defaults.
+
+        `unseen_in_training` must leave the training split byte-identical; the
+        superseded `first_appearance_rank` default removes item 8 from this fixture's
+        training sequence (and 6,634 interactions on the real MovieLens data), so this
+        assertion fails on it. That is what makes the test non-vacuous.
+        """
+        before = {u: list(v) for u, v in self.TRAIN.items()}
+
+        _, _, filtered = self._run("unseen_in_training", 0.3)
+        assert filtered == before, "the holdout must be a no-op on the training split"
+        assert sum(len(v) for v in filtered.values()) == sum(
+            len(v) for v in before.values()
+        )
+
+        # Non-vacuity: the superseded strategy DOES delete, on this same fixture.
+        _, _, induced = self._run("first_appearance_rank", 0.3)
+        assert induced != before, (
+            "fixture no longer discriminates: first_appearance_rank must delete "
+            "training interactions here for this test to have force"
+        )
+        assert sum(len(v) for v in induced.values()) < sum(
+            len(v) for v in before.values()
+        )
+
+    def test_unseen_in_training_ignores_cold_start_ratio(self):
+        """FR-3: the size is data-determined, so the ratio must not move it."""
+        cold_low, _, _ = self._run("unseen_in_training", 0.01)
+        cold_high, _, _ = self._run("unseen_in_training", 0.9)
+        assert cold_low == cold_high == {9, 10}
+
+    def test_unseen_in_training_applies_optional_first_seen_threshold(self):
+        """FR-3's optional temporal tightening, applied only when configured."""
+        config = Config()
+        config.cold_start_strategy = "unseen_in_training"
+        config.cold_start_first_seen_after = 185.0
+        config.processed_data_dir = tempfile.mkdtemp()
+        try:
+            cold, warm, filtered = identify_cold_items(
+                self.TRAIN, self.VAL, self.TEST, self.TS_PER_USER,
+                self.USER_SEQUENCES, self.CUTOFF, config,
+            )
+        finally:
+            import shutil
+            shutil.rmtree(config.processed_data_dir, ignore_errors=True)
+        # Item 9 first appears at 180 and is filtered out by the threshold; 10 at 190.
+        assert cold == {10}
+        assert 9 in warm
+        # The threshold must not turn the holdout into a deleting one either.
+        assert filtered == self.TRAIN
+
 
 class TestMetadataExtraction:
     def test_matrix_shape_and_padding_row(self, config):
@@ -487,37 +558,46 @@ class TestEndToEndPreprocessing:
             )
 
     def test_popularity_buckets_partition_the_catalogue(self):
-        """REV-007: the 20/20/60 split, checked on the real catalogue."""
+        """REV-007: the 20/20/60 split, checked on the real catalogue.
+
+        Owner decision (2026-09-18): the denominator is the WHOLE CATALOGUE. This test
+        previously asserted the split against the count of INTERACTED items and said so
+        explicitly ("the full catalogue is the wrong denominator"), which is what made
+        the realized catalogue fractions 0.162 / 0.162 / 0.676 acceptable to CI. The
+        denominator is now `num_items`, so this test fails on the superseded scheme.
+        """
         with open(os.path.join(PROCESSED_DIR, "popularity_buckets.pkl"), "rb") as f:
             buckets = pickle.load(f)
 
         head, mid, tail = buckets["head"], buckets["mid"], buckets["tail"]
         assert head.isdisjoint(mid) and head.isdisjoint(tail) and mid.isdisjoint(tail)
 
-        # The 20/20/60 split is over items that HAVE interactions; `tail` additionally
-        # absorbs every zero-interaction item, so the full catalogue is the wrong
-        # denominator.
+        with open(os.path.join(PROCESSED_DIR, "dataset_stats.json")) as f:
+            num_items = json.load(f)["num_items"]
+        assert head | mid | tail == set(range(1, num_items + 1))
+
+        # Integer truncation of the two cutoffs can move each bucket by at most one item,
+        # so a tolerance of a few items is exact rather than approximate.
+        for name, bucket, expected in (
+            ("head", head, 0.20), ("mid", mid, 0.20), ("tail", tail, 0.60),
+        ):
+            frac = len(bucket) / num_items
+            assert abs(frac - expected) < 1e-3, (
+                f"{name} is {frac:.4f} of the catalogue ({len(bucket)} of {num_items}), "
+                f"expected {expected:.2f}"
+            )
+
+        # FR-5's zero-training clause: those items rank last, so they land in tail.
         with open(os.path.join(PROCESSED_DIR, "train_user_history.pkl"), "rb") as f:
             train_user_history = pickle.load(f)
         interacted = set()
         for items in train_user_history.values():
             interacted.update(int(i) for i in items)
-        n_ranked = len(interacted)
-        assert n_ranked > 0
-
-        assert abs(len(head) / n_ranked - 0.20) < 0.01, (
-            f"head is {len(head) / n_ranked:.1%} of ranked items, expected ~20%"
+        zero_items = set(range(1, num_items + 1)) - interacted
+        assert zero_items, "expected some zero-interaction items in this catalogue"
+        assert zero_items.issubset(tail), (
+            f"{len(zero_items - tail)} zero-interaction items fell outside tail"
         )
-        assert abs(len(mid) / n_ranked - 0.20) < 0.01, (
-            f"mid is {len(mid) / n_ranked:.1%} of ranked items, expected ~20%"
-        )
-        assert abs(len(tail & interacted) / n_ranked - 0.60) < 0.01, (
-            f"tail is {len(tail & interacted) / n_ranked:.1%} of ranked items, "
-            f"expected ~60%"
-        )
-        # every zero-interaction item lands in tail
-        assert (tail - interacted), "expected some zero-interaction items in tail"
-        assert head.isdisjoint(tail - interacted)
 
     def test_dataset_stats_valid(self):
         stats_path = os.path.join("data", "processed", "dataset_stats.json")
