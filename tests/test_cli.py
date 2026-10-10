@@ -977,18 +977,15 @@ class TestSharedBackboneReuse:
                 patch("training.local_train.run_local_personalization", return_value={
                     "num_users_evaluated": 1, "with_lora": {}, "without_lora": {},
                     "gain": {}, "per_user_scores": []}):
-            registry = {}
             results = [
-                ar._run_single_config(
-                    cfg, "t-base", "A", base, True, trained_backbones=registry,
-                )
+                ar._run_single_config(cfg, "t-base", "A", base, True)
                 for cfg in arms
             ]
 
         assert trained == ["arv_mmoe_gradnorm"], (
             f"the paired arm retrained an identical model: {trained}"
         )
-        assert results[1]["shared_backbone_with"] == "arv_mmoe_gradnorm", (
+        assert results[1]["shared_backbone_with"] == "A_arv_mmoe_gradnorm", (
             "a reused backbone must be recorded, so identical metrics are not misread "
             "as a null result"
         )
@@ -998,3 +995,150 @@ class TestSharedBackboneReuse:
         # And the pair stays distinguishable on the dimension it exists to isolate.
         assert "personalization" not in results[0]
         assert "personalization" in results[1]
+
+
+class TestBackboneStore:
+    """Backbones are stored by training fingerprint and shared across studies.
+
+    Reuse used to be an in-memory dict scoped to ONE study, so the base config trained
+    separately for B, C, D, F, G and H, separate processes (one per GPU) could not see
+    each other's models, and a re-run retrained everything. The multi-seed stage's
+    per-seed checkpoints, which ARE the base config, were never consulted either.
+    """
+
+    @staticmethod
+    def _base(tmp_path, seed=42):
+        base = Config()
+        base.apply_model_config("t-base")
+        base.seed = seed
+        base.checkpoint_dir = str(tmp_path / "ckpt")
+        base.output_dir = str(tmp_path / "out")
+        base.processed_data_dir = str(tmp_path / "processed")
+        os.makedirs(base.processed_data_dir, exist_ok=True)
+        with open(os.path.join(base.processed_data_dir, "dataset_stats.json"), "w") as f:
+            json.dump({"num_items": 100, "num_users": 10, "MASK_ID": 101}, f)
+        return base
+
+    @staticmethod
+    def _fake_pretrain(trained):
+        """Mutates the config exactly as `run_pretrain` does, then writes `best.pt`."""
+        def fake(cfg, model_name):
+            cfg.apply_model_config(model_name)
+            with open(os.path.join(cfg.processed_data_dir, "dataset_stats.json")) as f:
+                stats = json.load(f)
+            cfg.num_items, cfg.num_users = stats["num_items"], stats["num_users"]
+            cfg.vocab_size = cfg.num_items + 2
+            trained.append(getattr(cfg, "_study_label", f"seed_{cfg.seed}"))
+            os.makedirs(cfg.model_checkpoint_dir(), exist_ok=True)
+            with open(os.path.join(cfg.model_checkpoint_dir(), "best.pt"), "wb") as f:
+                f.write(b"checkpoint")
+            return {"best_val_ndcg": 0.42, "best_epoch": 3}
+        return fake
+
+    @staticmethod
+    def _run_arms(base, study_arms, trained, train=True):
+        import numpy as np
+        import torch
+
+        import training.ablation_runner as ar
+
+        class FakeDataset:
+            sequences = torch.zeros(2, 50, dtype=torch.long)
+            metadata_matrix = None
+
+            def __len__(self):
+                return 2
+
+        loaded = []
+        with patch("training.pretrain.run_pretrain",
+                   side_effect=TestBackboneStore._fake_pretrain(trained)), \
+                patch("training.pretrain.build_model", return_value=(MagicMock(), MagicMock())), \
+                patch("training.pretrain._build_loss_fns", return_value={}), \
+                patch("training.pretrain.load_checkpoint",
+                      side_effect=lambda path, *a, **k: loaded.append(path)), \
+                patch("data.sequence_generator.load_metadata_matrix", return_value=None), \
+                patch("data.sequence_generator.load_tensorised", return_value=FakeDataset()), \
+                patch("data.sequence_generator.load_eval_candidates",
+                      return_value=np.zeros((2, 11), dtype=np.int64)), \
+                patch("evaluation.metrics.evaluate_model",
+                      return_value={"ndcg": {"mean": 0.1, "std": 0.0}}), \
+                patch("training.pretrain.collect_validation_routing", return_value={}):
+            results = []
+            for study, cfg in study_arms:
+                results.append(ar._run_single_config(cfg, "t-base", study, base, train))
+        return results, loaded
+
+    def test_identical_arms_in_different_studies_train_once(self, tmp_path):
+        base = self._base(tmp_path)
+        b_arm = resolve_study_configs("B", base)[0]   # objective_conditioned == base
+        f_arm = resolve_study_configs("F", base)[0]   # full_reference == base
+        trained = []
+        _, loaded = self._run_arms(base, [("B", b_arm), ("F", f_arm)], trained)
+
+        assert trained == ["objective_conditioned"], f"base config retrained: {trained}"
+        assert len(loaded) == 2 and loaded[0] == loaded[1], (
+            "both arms must evaluate the same stored checkpoint"
+        )
+
+    def test_reuse_survives_a_new_process(self, tmp_path):
+        """The store is on disk, so a second run (or another GPU's process) reuses it."""
+        base = self._base(tmp_path)
+        trained = []
+        self._run_arms(base, [("B", resolve_study_configs("B", base)[0])], trained)
+        self._run_arms(base, [("F", resolve_study_configs("F", base)[0])], trained)
+        assert trained == ["objective_conditioned"], trained
+
+    def test_unfinished_run_is_retrained_not_reused(self, tmp_path):
+        """`best.pt` exists after epoch 0; without the marker it is not a trained model."""
+        from training.ablation_runner import _training_fingerprint, backbone_store_dir
+
+        base = self._base(tmp_path)
+        arm = resolve_study_configs("B", base)[0]
+        probe = resolve_study_configs("B", base)[0]
+        probe.num_items, probe.num_users, probe.vocab_size = 100, 10, 102
+        crashed = os.path.join(
+            backbone_store_dir(base.checkpoint_dir, _training_fingerprint(probe)), "t_base",
+        )
+        os.makedirs(crashed)
+        with open(os.path.join(crashed, "best.pt"), "wb") as f:
+            f.write(b"partial")
+
+        trained = []
+        self._run_arms(base, [("B", arm)], trained)
+        assert trained == ["objective_conditioned"], "a partial checkpoint was reused"
+
+        no_train = []
+        results, _ = self._run_arms(
+            self._base(tmp_path / "other"),
+            [("B", resolve_study_configs("B", self._base(tmp_path / "other"))[0])],
+            no_train, train=False,
+        )
+        assert no_train == [] and results[0]["status"] == "skipped_no_checkpoint"
+
+    def test_multi_seed_backbones_are_reused_by_base_config_arms(self, tmp_path):
+        import argparse
+
+        from main import run_multi_seed_stage
+
+        base = self._base(tmp_path)
+        base.final_seeds = [42, 123]
+        trained = []
+        args = argparse.Namespace(model="t-base")
+        with patch("training.pretrain.run_pretrain",
+                   side_effect=self._fake_pretrain(trained)), \
+                patch("main.run_evaluate_stage"):
+            run_multi_seed_stage(base, args)
+        assert trained == ["seed_42", "seed_123"]
+
+        # The ablation for seed 123 (`--stage ablation --seed 123`) reuses that seed's
+        # backbone; an arm that changes training (B's input_only) still trains.
+        abl = self._base(tmp_path, seed=123)
+        b_arms = resolve_study_configs("B", abl)
+        trained.clear()
+        results, loaded = self._run_arms(abl, [("B", b_arms[0]), ("B", b_arms[1])], trained)
+
+        assert trained == ["input_only"], trained
+        assert loaded[0] == os.path.join(
+            str(tmp_path / "out"), "seed_123", "checkpoints", "t_base", "best.pt",
+        )
+        assert results[0]["shared_backbone_with"] == "multi_seed_123"

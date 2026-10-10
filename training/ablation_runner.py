@@ -192,6 +192,12 @@ _PATH_FIELDS = frozenset({
     "checkpoint_dir", "output_dir", "log_dir", "plot_dir", "ablation_dir",
 })
 
+#: Fields that choose WHICH runs to launch, not how one trains. `final_seeds` is read
+#: only by the multi-seed loop; each run's own `seed` stays in the fingerprint. Keeping
+#: it in would stop a multi-seed checkpoint from matching an ablation arm whenever the
+#: seed list differs, even though the trained model is identical.
+_RUN_SELECTION_FIELDS = frozenset({"final_seeds"})
+
 
 def _training_fingerprint(cfg: Config) -> str:
     """Hash of everything about `cfg` that actually changes the trained model.
@@ -206,9 +212,75 @@ def _training_fingerprint(cfg: Config) -> str:
     fields = {
         k: v for k, v in asdict(cfg).items()
         if k not in POST_TRAINING_ONLY_FIELDS and k not in _PATH_FIELDS
+        and k not in _RUN_SELECTION_FIELDS
     }
     payload = json.dumps(fields, sort_keys=True, default=str)
     return hashlib.sha256(payload.encode()).hexdigest()[:12]
+
+
+#: Marker written only once a backbone has FINISHED training. `run_pretrain` writes
+#: `best.pt` after its first epoch, so a crashed run leaves a checkpoint that must never
+#: be mistaken for a trained model; the marker is what makes a store entry reusable.
+BACKBONE_MARKER = "backbone.json"
+
+
+def backbone_store_dir(checkpoint_root: str, fingerprint: str) -> str:
+    """Checkpoint namespace for one training fingerprint, shared by every study.
+
+    Keyed by fingerprint rather than by `{study}_{label}`, so any arm in any study, in
+    any process, and on any re-run that trains the same model finds the same directory.
+    The fingerprint covers the seed and the model dimensions, so seeds and model sizes
+    never collide.
+    """
+    return os.path.join(checkpoint_root, "ablations", "by_fingerprint", fingerprint)
+
+
+def find_backbone(checkpoint_root: str, fingerprint: str) -> Optional[Dict]:
+    """The completed backbone registered for `fingerprint`, or None."""
+    path = os.path.join(backbone_store_dir(checkpoint_root, fingerprint), BACKBONE_MARKER)
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        entry = json.load(f)
+    if not os.path.exists(entry["checkpoint_path"]):
+        logger.warning(
+            "Backbone %s is registered but %s is missing -- it will be retrained",
+            fingerprint, entry["checkpoint_path"],
+        )
+        return None
+    return entry
+
+
+def register_backbone(
+    checkpoint_root: str,
+    fingerprint: str,
+    trained_cfg: Config,
+    trained_by: str,
+    train_result: Optional[Dict] = None,
+) -> Dict:
+    """Record a finished backbone so later arms load it instead of retraining it.
+
+    The entry records `trained_cfg.checkpoint_dir`, not just the file, because the
+    personalization and federated stages re-read `model_checkpoint_dir()/best.pt` from
+    the arm's config. It may live outside the store: the multi-seed stage registers its
+    per-seed checkpoint, so ablation arms on the base config reuse that model.
+    """
+    entry = {
+        "fingerprint": fingerprint,
+        "checkpoint_dir": trained_cfg.checkpoint_dir,
+        "checkpoint_path": os.path.join(trained_cfg.model_checkpoint_dir(), "best.pt"),
+        "trained_by": trained_by,
+    }
+    for key in ("best_val_ndcg", "best_epoch"):
+        if train_result and key in train_result:
+            entry[key] = train_result[key]
+    store = backbone_store_dir(checkpoint_root, fingerprint)
+    os.makedirs(store, exist_ok=True)
+    tmp = os.path.join(store, BACKBONE_MARKER + ".tmp")
+    with open(tmp, "w") as f:
+        json.dump(entry, f, indent=2)
+    os.replace(tmp, os.path.join(store, BACKBONE_MARKER))  # atomic: never half-written
+    return entry
 
 
 def _run_single_config(
@@ -217,7 +289,6 @@ def _run_single_config(
     study: str,
     base_config: Config,
     train: bool,
-    trained_backbones: Optional[Dict[str, Dict]] = None,
 ) -> Dict:
     """Train (or load), evaluate and diagnose one ablation config.
 
@@ -261,50 +332,50 @@ def _run_single_config(
     if metadata_matrix is not None:
         cfg.feature_dim = metadata_matrix.shape[-1]
 
-    # Each config gets its own checkpoint/log namespace so studies never overwrite
-    # each other's artifacts.
+    # Logs and diagnostics stay namespaced per arm; the CHECKPOINT is namespaced by
+    # training fingerprint instead (see `backbone_store_dir`).
     run_tag = f"{study}_{label}"
-    cfg.checkpoint_dir = os.path.join(base_config.checkpoint_dir, "ablations", run_tag)
 
-    # REV-084: arms that differ only in post-training fields train the SAME model. Reuse
-    # the first such arm's checkpoint instead of retraining it, and say so in the result
-    # so identical `metrics` between paired arms read as a shared backbone rather than as
-    # a null result for the dimension the pair is supposed to isolate.
+    # REV-084: arms that differ only in post-training fields train the SAME model. The
+    # store is keyed by fingerprint and shared across studies, processes and re-runs, so
+    # e.g. the base config trains once for B, C, D, F, G and H rather than once per
+    # study, and the multi-seed stage's per-seed checkpoint is reused when it matches.
+    # Reuse is recorded in the result so identical `metrics` between arms read as a
+    # shared backbone rather than as a null result for the dimension they isolate.
     fingerprint = _training_fingerprint(cfg)
     result["training_fingerprint"] = fingerprint
-    shared = (trained_backbones or {}).get(fingerprint)
+    cfg.checkpoint_dir = backbone_store_dir(base_config.checkpoint_dir, fingerprint)
+    ckpt_path = os.path.join(cfg.model_checkpoint_dir(), "best.pt")
+
+    shared = find_backbone(base_config.checkpoint_dir, fingerprint)
     if shared is not None:
         cfg.checkpoint_dir = shared["checkpoint_dir"]
-        result["shared_backbone_with"] = shared["label"]
+        ckpt_path = shared["checkpoint_path"]
+        result["shared_backbone_with"] = shared["trained_by"]
         for key in ("best_val_ndcg", "best_epoch"):
             if key in shared:
                 result[key] = shared[key]
         logger.info(
             "  %s: training-relevant config matches '%s' -- reusing its backbone "
-            "instead of retraining an identical model", label, shared["label"],
+            "instead of retraining an identical model", label, shared["trained_by"],
         )
-        train = False
-
-    ckpt_path = os.path.join(cfg.model_checkpoint_dir(), "best.pt")
-
-    if train:
+    elif train:
         train_result = run_pretrain(cfg, model_name)
         result["best_val_ndcg"] = train_result["best_val_ndcg"]
         result["best_epoch"] = train_result["best_epoch"]
-    elif not os.path.exists(ckpt_path):
+        register_backbone(
+            base_config.checkpoint_dir, fingerprint, cfg, run_tag, train_result,
+        )
+    else:
+        # `--no_train`: only a COMPLETED backbone is evaluated. A bare `best.pt` without
+        # the marker is a run that did not finish.
         result["status"] = "skipped_no_checkpoint"
         result["checkpoint_path"] = ckpt_path
         logger.warning(
-            "  %s: no checkpoint at %s and train=False -- skipping", label, ckpt_path,
+            "  %s: no completed backbone for fingerprint %s and train=False -- skipping",
+            label, fingerprint,
         )
         return result
-
-    if trained_backbones is not None and fingerprint not in trained_backbones:
-        entry = {"label": label, "checkpoint_dir": cfg.checkpoint_dir}
-        for key in ("best_val_ndcg", "best_epoch"):
-            if key in result:
-                entry[key] = result[key]
-        trained_backbones[fingerprint] = entry
 
     device = get_device(cfg)
     model, moe = build_model(cfg)
@@ -485,9 +556,6 @@ def run_ablation(
         logger.info(f"Running ablation study {s}")
         configs = resolve_study_configs(s, config)
         study_results = []
-        # REV-084: fingerprint -> the arm that already trained that exact backbone.
-        # Scoped to one study, so arms never reuse a model across studies.
-        trained_backbones: Dict[str, Dict] = {}
 
         for cfg in configs:
             label = getattr(cfg, "_study_label", "unknown")
@@ -495,7 +563,6 @@ def run_ablation(
             try:
                 result = _run_single_config(
                     cfg, model_name, s, config, train,
-                    trained_backbones=trained_backbones,
                 )
             except Exception as exc:  # one arm failing must not lose the others
                 logger.exception("  Config %s failed: %s", label, exc)

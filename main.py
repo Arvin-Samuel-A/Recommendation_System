@@ -797,6 +797,7 @@ def run_multi_seed_stage(config, args):
     aggregation, so the only thing possible was manufacturing a std from repeated
     evaluation of ONE seed -- which FR-15 explicitly warns against.
     """
+    from training.ablation_runner import _training_fingerprint, register_backbone
     from training.pretrain import run_pretrain
 
     seeds = list(config.final_seeds)
@@ -819,6 +820,14 @@ def run_multi_seed_stage(config, args):
         setup_seed(cfg)
         logger.info("=== seed %d -> %s ===", seed, seed_root)
         train_result = run_pretrain(cfg, args.model)
+        # Register the finished per-seed backbone in the ablation store, so ablation arms
+        # whose training config matches it (the base config, run with `--seed <seed>`)
+        # load this model instead of retraining an identical one. The fingerprint is
+        # taken AFTER `run_pretrain`, which resolves the dataset-derived fields.
+        register_backbone(
+            config.checkpoint_dir, _training_fingerprint(cfg), cfg,
+            f"multi_seed_{seed}", train_result,
+        )
 
         seed_args = argparse.Namespace(**vars(args))
         run_evaluate_stage(cfg, seed_args)
