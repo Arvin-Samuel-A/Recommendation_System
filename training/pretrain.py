@@ -248,8 +248,10 @@ def train_one_step(
 
         B, S = seq.shape
         aug_seqs = []
+        # One device->host copy for the batch, not one sync per row.
+        seq_rows = seq.cpu().tolist()
         for i in range(B):
-            real = seq[i][seq[i] != 0].tolist()
+            real = [item for item in seq_rows[i] if item != 0]
             if len(real) == 0:
                 real = [1]
             aug = augment_sequence(real, mask_id, rng, config.crop_ratio, config.mask_ratio)
@@ -317,12 +319,11 @@ def train_one_step(
     # REV-022c: FR-7 and AC-08 both require finite-value assertions on GRADIENTS.
     # A NaN appearing in gradients rather than in the loss scalar previously passed
     # every assertion and silently corrupted the weights.
-    for p in trainable:
-        if p.grad is not None:
-            assert torch.isfinite(p.grad).all(), "Non-finite gradient detected"
-
+    # The total norm is finite iff every gradient is, so one check replaces a per-tensor
+    # assert that forced a device->host sync for each of the ~91 parameter tensors.
     # REV-047: clipping must cover the loss functions' own parameters too.
-    torch.nn.utils.clip_grad_norm_(trainable, config.max_grad_norm)
+    total_grad_norm = torch.nn.utils.clip_grad_norm_(trainable, config.max_grad_norm)
+    assert torch.isfinite(total_grad_norm), "Non-finite gradient detected"
     optimizer.step()
     scheduler.step()
 
@@ -710,6 +711,7 @@ def run_pretrain(config: Config, model_name: str) -> Dict[str, float]:
         collect_trainable_parameters(model, moe, loss_fns),
         lr=config.learning_rate,
         weight_decay=config.weight_decay,
+        fused=True,
     )
     optimizer.zero_grad(set_to_none=True)
     scheduler = build_scheduler(optimizer, config, total_steps)
