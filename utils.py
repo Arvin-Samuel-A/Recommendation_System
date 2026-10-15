@@ -18,13 +18,40 @@ def get_device(config) -> torch.device:
     return torch.device(config.device)
 
 
+_DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16}
+
+
 def resolve_dtype(config) -> torch.dtype:
-    if config.dtype != "bf16":
+    """The compute dtype. Under mixed precision this is the autocast dtype."""
+    if config.dtype not in _DTYPES:
         raise ValueError(
-            f"Only bf16 dtype is supported, got '{config.dtype}'. "
-            "No FP16 autocast or GradScaler allowed."
+            f"Unknown dtype '{config.dtype}'. Choose from {list(_DTYPES)}"
         )
-    return torch.bfloat16
+    if config.dtype == "fp16" and not getattr(config, "mixed_precision", False):
+        raise ValueError("dtype='fp16' requires mixed_precision=True")
+    return _DTYPES[config.dtype]
+
+
+def resolve_param_dtype(config) -> torch.dtype:
+    """The storage dtype of parameters: fp32 master weights under mixed precision."""
+    if getattr(config, "mixed_precision", False):
+        return torch.float32
+    return resolve_dtype(config)
+
+
+def autocast_context(config):
+    """torch.autocast in the compute dtype when mixed precision is on, else a no-op."""
+    return torch.autocast(
+        device_type=get_device(config).type,
+        dtype=resolve_dtype(config),
+        enabled=getattr(config, "mixed_precision", False),
+    )
+
+
+def make_grad_scaler(config) -> "torch.amp.GradScaler":
+    """A GradScaler, enabled only for fp16 mixed precision (bf16 needs no loss scaling)."""
+    enabled = getattr(config, "mixed_precision", False) and config.dtype == "fp16"
+    return torch.amp.GradScaler(get_device(config).type, enabled=enabled)
 
 
 def set_seed(seed: int) -> None:

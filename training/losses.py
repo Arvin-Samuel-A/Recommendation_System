@@ -174,6 +174,12 @@ class InfoNCELoss(nn.Module):
         self.temperature = temperature
 
     def forward(self, z_orig: torch.Tensor, z_aug: torch.Tensor) -> torch.Tensor:
+        # InfoNCE is computed in fp32 by design; under mixed precision autocast would
+        # otherwise run `z @ z.T` in fp16, where the -1e9 diagonal fill overflows.
+        with torch.autocast(device_type=z_orig.device.type, enabled=False):
+            return self._forward_fp32(z_orig.float(), z_aug.float())
+
+    def _forward_fp32(self, z_orig: torch.Tensor, z_aug: torch.Tensor) -> torch.Tensor:
         z_orig = F.normalize(z_orig, p=2, dim=-1)
         z_aug = F.normalize(z_aug, p=2, dim=-1)
 

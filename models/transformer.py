@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from configs.config import Config
-from utils import get_device, resolve_dtype
+from utils import get_device, resolve_dtype, resolve_param_dtype
 
 logger = logging.getLogger(__name__)
 
@@ -179,7 +179,7 @@ class AttentionBackend:
         padding_mask: Optional[torch.Tensor],
         is_causal: bool,
     ) -> Optional[torch.Tensor]:
-        """Build SDPA's additive mask from `(padding_mask, is_causal)`.
+        """Build SDPA's attention mask (boolean, True = attend) from `(padding_mask, is_causal)`.
 
         Returns `None` when there is no key padding, so the unpadded path keeps using
         SDPA's native `is_causal` fast path. `padding_mask` is True at REAL positions.
@@ -193,10 +193,11 @@ class AttentionBackend:
                 torch.ones(S, S, device=q.device, dtype=torch.bool), diagonal=1
             )
             blocked = blocked | causal.unsqueeze(0).unsqueeze(0)
-        blocked = blocked.expand(B, H, S, S)
-        attn_float = torch.zeros(blocked.shape, device=q.device, dtype=q.dtype)
-        attn_float.masked_fill_(blocked, float("-inf"))
-        return attn_float
+        # A boolean (B, 1, S, S) mask (True = attend) is equivalent to the additive -inf
+        # mask in every SDPA backend, but broadcasts over heads instead of materialising
+        # a (B, H, S, S) float tensor per layer, and leaves SDPA free to pick its fused
+        # memory-efficient kernel on CUDA.
+        return ~blocked
 
     @staticmethod
     def _flash_attention_4(
@@ -390,7 +391,7 @@ class TransformerModel(nn.Module):
         self.vocab_size = config.num_items + 2
 
         device = get_device(config)
-        dtype = resolve_dtype(config)
+        dtype = resolve_param_dtype(config)
 
         self.backend = AttentionBackend(config)
 

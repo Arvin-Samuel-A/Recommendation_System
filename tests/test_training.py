@@ -893,3 +893,75 @@ class TestMoECacheLifetime:
             f"experts ran {len(calls)} times in one step; the shared-expert cache "
             f"should compute them once for every objective scoring the same sequence"
         )
+
+
+class TestMixedPrecision:
+    """fp32 master weights + autocast; fp16 additionally uses a GradScaler.
+
+    Pure fp16 weights underflow small updates, so `dtype="fp16"` is only valid with
+    `mixed_precision=True`. The default pure-bf16 path is unchanged.
+    """
+
+    @staticmethod
+    def _setup(dtype):
+        config, model, moe, loss_fns, optimizer, scheduler, rng = TestMoECacheLifetime._setup()
+        config.dtype = dtype
+        config.mixed_precision = True
+        config.validate()
+        torch.manual_seed(0)
+        model, moe = build_model(config)
+        from training.pretrain import _build_loss_fns
+
+        loss_fns = _build_loss_fns(config, torch.device("cpu"))
+        params = list(model.parameters()) + list(moe.parameters())
+        for fn in loss_fns.values():
+            params += list(fn.parameters())
+        optimizer = torch.optim.AdamW(params, lr=1e-3)
+        return config, model, moe, loss_fns, optimizer, scheduler, rng
+
+    def test_fp16_requires_mixed_precision(self):
+        config = Config()
+        config.dtype = "fp16"
+        with pytest.raises(ValueError, match="mixed_precision"):
+            config.validate()
+        with pytest.raises(ValueError, match="mixed_precision"):
+            resolve_dtype(config)
+
+    @pytest.mark.parametrize("dtype", ["fp16", "bf16"])
+    def test_step_trains_fp32_master_weights_under_autocast(self, dtype):
+        from torch.optim.lr_scheduler import LambdaLR
+
+        from training.pretrain import train_one_step
+        from utils import autocast_context, make_grad_scaler
+
+        config, model, moe, loss_fns, optimizer, _, rng = self._setup(dtype)
+        scheduler = LambdaLR(optimizer, lr_lambda=lambda step: 1.0)
+        gradnorm = GradNormController(config.gradnorm_alpha, config.gradnorm_lr)
+        scaler = make_grad_scaler(config)
+        assert scaler.is_enabled() == (dtype == "fp16")
+
+        before = model.item_emb_weight.detach().clone()
+        for step in range(4):  # step 0 runs the contrastive objective too
+            with autocast_context(config):
+                loss_values, _ = train_one_step(
+                    model, moe, TestMoECacheLifetime._batch(config), config, loss_fns,
+                    gradnorm, optimizer, scheduler, step, rng, scaler=scaler,
+                )
+            assert all(math.isfinite(v) for k, v in loss_values.items() if not k.startswith("_"))
+
+        for p in list(model.parameters()) + list(moe.parameters()):
+            assert p.dtype == torch.float32
+        assert not torch.equal(before, model.item_emb_weight.detach()), "no update was applied"
+
+    def test_step_refuses_to_run_without_autocast(self):
+        from torch.optim.lr_scheduler import LambdaLR
+
+        from training.pretrain import train_one_step
+
+        config, model, moe, loss_fns, optimizer, _, rng = self._setup("fp16")
+        scheduler = LambdaLR(optimizer, lr_lambda=lambda step: 1.0)
+        with pytest.raises(AssertionError, match="autocast is not active"):
+            train_one_step(
+                model, moe, TestMoECacheLifetime._batch(config), config, loss_fns,
+                None, optimizer, scheduler, 0, rng,
+            )

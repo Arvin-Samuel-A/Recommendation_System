@@ -492,7 +492,7 @@ The complete resolved configuration (including any CLI overrides) is saved to `o
 | Development | Apple Silicon Mac (MPS) | SDPA | Full T-Small training feasible |
 | Final experiments | NVIDIA H100 (CUDA) | FlashAttention-4 | All model sizes, all seeds, all ablations |
 
-**Dtype:** BF16 everywhere on both platforms. No FP16 autocast, no GradScaler.
+**Dtype:** BF16 by default (`dtype="bf16"`, pure bf16 weights). `--mixed_precision` switches to fp32 master weights with autocast in `--dtype` (bf16 or fp16); fp16 is only allowed with mixed precision and adds a GradScaler. Use `--dtype fp16 --mixed_precision` on GPUs without native bf16 (e.g. T4).
 
 **Fail-fast policy:** The MPS smoke test fails immediately if SDPA cannot execute. The H100 final run fails immediately if FlashAttention-4 cannot initialize. Silent fallback to vanilla attention is forbidden.
 
@@ -565,7 +565,7 @@ This project uses a spec-driven development workflow. Implementation contracts l
 ## Strict Rules
 
 1. All model components implemented manually in PyTorch — no external recommendation libraries.
-2. BF16 everywhere — no FP16 autocast, no GradScaler, no silent dtype substitution.
+2. BF16 by default; FP16 only via `--mixed_precision` (fp32 master weights + GradScaler). No silent dtype substitution.
 3. `configs/config.py` is the single source of truth — no hardcoded hyperparameters elsewhere.
 4. Test data is never used for model selection, threshold tuning, or diagnostic decisions.
 5. Attention backends must pass a startup self-test and never silently fall back.

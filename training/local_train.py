@@ -26,7 +26,7 @@ from data.sequence_generator import (
     filter_negatives, generate_sliding_window_examples, load_metadata_matrix,
     load_or_build_eval_candidates,
 )
-from utils import get_device, resolve_dtype, artifact_source_revision
+from utils import get_device, resolve_dtype, make_grad_scaler, artifact_source_revision
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +111,8 @@ def train_user_lora(
 
     lora_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(lora_params, lr=config.lora_lr, weight_decay=config.lora_weight_decay)
+    # fp16 mixed precision only; with it disabled every scaler call is a pass-through.
+    scaler = make_grad_scaler(config)
     # REV-061: the positional argument here was the negative COUNT binding to
     # `normalize_embeddings`, a boolean flag. It happened to behave correctly only
     # because 100 is truthy and `normalize_embeddings` defaults to True; with
@@ -156,9 +158,11 @@ def train_user_lora(
 
             loss = loss_fn(user_emb, target_t, neg_ids.unsqueeze(0), model.item_emb_weight)
             optimizer.zero_grad(set_to_none=True)
-            loss.backward()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(lora_params, config.max_grad_norm)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
 
 
 def evaluate_user(

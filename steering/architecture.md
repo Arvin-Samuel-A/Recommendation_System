@@ -9,7 +9,7 @@ ARV-MMoE is a communication-efficient multi-objective federated sequential recom
 - **Framework:** PyTorch 2.x+ (manual implementation — no external recommendation libraries)
 - **Python:** 3.10+
 - **Environment manager:** `uv venv` only (no conda, no `python -m venv`)
-- **Dtype:** BF16 everywhere (`torch.bfloat16`) — no FP16 autocast, no GradScaler
+- **Dtype:** BF16 by default (`torch.bfloat16`). Optional mixed precision (`mixed_precision=True`): fp32 master weights + autocast in bf16 or fp16; fp16 requires it and adds a GradScaler
 - **Dataset:** MovieLens-20M via Kaggle API
 - **Dev hardware:** Apple Silicon Mac (MPS, SDPA)
 - **Prod hardware:** NVIDIA H100 (CUDA, FlashAttention-4)

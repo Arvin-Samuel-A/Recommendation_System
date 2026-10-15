@@ -51,6 +51,15 @@ def parse_args(argv=None):
              "each arm. Arms with no checkpoint are skipped, not failed.",
     )
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument(
+        "--dtype", default=None, choices=["bf16", "fp16"],
+        help="Compute dtype. fp16 requires --mixed_precision.",
+    )
+    parser.add_argument(
+        "--mixed_precision", action="store_true", default=False,
+        help="fp32 master weights + autocast in --dtype (+ GradScaler for fp16). "
+             "Use on GPUs without native bf16, e.g. T4.",
+    )
     # Owner decision (2026-09-17): Phase 17's gate is a few-step run of `run_pretrain` on
     # REAL data, not a full epoch. `max_steps_per_epoch` already existed as a Config
     # field but had no CLI surface, so running the gate meant editing source -- which
@@ -115,6 +124,12 @@ def apply_cli_overrides(config: Config, args) -> None:
     if args.seed is not None:
         overrides.append(("seed", config.seed, args.seed))
         config.seed = args.seed
+    if getattr(args, "dtype", None) is not None:
+        overrides.append(("dtype", config.dtype, args.dtype))
+        config.dtype = args.dtype
+    if getattr(args, "mixed_precision", False):
+        overrides.append(("mixed_precision", config.mixed_precision, True))
+        config.mixed_precision = True
     if getattr(args, "max_steps", None) is not None:
         overrides.append(
             ("max_steps_per_epoch", config.max_steps_per_epoch, args.max_steps)
@@ -404,7 +419,7 @@ def run_latency_stage(config, args):
         measure_routing_overhead, estimate_flops_per_inference,
     )
     from models.moe import MoELayer
-    from utils import get_device, resolve_dtype, artifact_source_revision
+    from utils import get_device, resolve_param_dtype, artifact_source_revision
 
     config.apply_model_config(args.model)
     ckpt_path = os.path.join(config.model_checkpoint_dir(), "best.pt")
@@ -437,7 +452,7 @@ def run_latency_stage(config, args):
         none_config = deepcopy(config)
         none_config.moe_variant = "none"
         moe_none = MoELayer(none_config).to(
-            device=get_device(config), dtype=resolve_dtype(config),
+            device=get_device(config), dtype=resolve_param_dtype(config),
         )
         overhead = measure_routing_overhead(model, moe, moe_none, config)
         logger.info(
@@ -547,7 +562,7 @@ def run_gradient_diagnostics_stage(config, args):
     from data.sequence_generator import (
         load_tensorised, build_dataloader, GlobalNegativePool, load_metadata_matrix,
     )
-    from utils import resolve_dtype
+    from utils import resolve_param_dtype
 
     loaded = _load_trained_model(config, args)
     if loaded is None:
@@ -576,7 +591,7 @@ def run_gradient_diagnostics_stage(config, args):
         )
 
     metadata_matrix_t = (
-        metadata_matrix.to(resolve_dtype(config)) if metadata_matrix is not None else None
+        metadata_matrix.to(resolve_param_dtype(config)) if metadata_matrix is not None else None
     )
 
     report = run_gradient_diagnostics(
@@ -967,7 +982,11 @@ def main(argv=None):
     _resolve_before_snapshot(config, args)
     setup_seed(config)
     save_config_snapshot(config)
-    STAGE_MAP[args.stage](config, args)
+    # Every stage's forward passes (training, evaluation, LoRA, federated, ablations) run
+    # under one autocast region; it is a no-op unless mixed_precision is on.
+    from utils import autocast_context
+    with autocast_context(config):
+        STAGE_MAP[args.stage](config, args)
 
 
 if __name__ == "__main__":

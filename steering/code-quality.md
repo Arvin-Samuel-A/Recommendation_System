@@ -2,7 +2,7 @@
 
 ## Dtype Discipline
 
-- All model and data computation uses `torch.bfloat16`. No FP16, no autocast, no GradScaler.
+- Model and data computation uses `torch.bfloat16` by default. FP16 is allowed only under `mixed_precision=True` (fp32 master weights, autocast, GradScaler); pure FP16 weights are rejected by `Config.validate`.
 - `resolve_dtype(config)` must raise if dtype is not `"bf16"`.
 - Never silently change dtype if a numerical issue occurs — fail explicitly.
 
@@ -94,7 +94,7 @@ in question did not touch. Provenance belongs in the artifact, not in prose abou
 
 - No external recommendation libraries (RecBole, Surprise, pytorch-fm, etc.)
 - No sinusoidal positional embeddings (learnable `nn.Embedding` only)
-- No GradScaler or FP16 mixed-precision policy
+- GradScaler only on the fp16 mixed-precision path; never with pure-dtype weights
 - No `num_items` as mask token (that collides with the last real item ID)
 - No test data for model selection, threshold tuning, or diagnostic decisions
 - No silent dtype/backend substitution

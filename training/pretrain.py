@@ -42,7 +42,9 @@ from data.sequence_generator import (
 from evaluation.routing_diagnostics import save_routing_diagnostics
 from evaluation.gradient_diagnostics import run_gradient_diagnostics
 from evaluation.metrics import evaluate_model
-from utils import get_device, resolve_dtype, get_source_revision
+from utils import (
+    get_device, resolve_dtype, resolve_param_dtype, make_grad_scaler, get_source_revision,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +63,7 @@ def build_scheduler(optimizer: torch.optim.Optimizer, config: Config, total_step
 
 def build_model(config: Config) -> Tuple[TransformerModel, MoELayer]:
     device = get_device(config)
-    dtype = resolve_dtype(config)
+    dtype = resolve_param_dtype(config)
     model = TransformerModel(config)
     moe = MoELayer(config).to(device=device, dtype=dtype)
     return model, moe
@@ -162,9 +164,18 @@ def train_one_step(
     rng: random.Random,
     mask_rng: Optional[torch.Generator] = None,
     metadata_matrix: Optional[torch.Tensor] = None,
+    scaler: Optional[torch.amp.GradScaler] = None,
 ) -> Tuple[Dict[str, float], Optional[Dict[str, torch.Tensor]]]:
     device = get_device(config)
     mask_id = config.num_items + 1
+    # Mixed precision keeps fp32 master weights; without an active autocast the step
+    # would silently run in fp32 instead of the configured compute dtype.
+    if config.mixed_precision:
+        assert torch.is_autocast_enabled(device.type), (
+            "mixed_precision=True but autocast is not active; wrap the call in "
+            "utils.autocast_context(config)"
+        )
+    use_scaler = scaler is not None and scaler.is_enabled()
 
     seq = batch["sequences"]
     targets = batch["targets"]
@@ -285,14 +296,20 @@ def train_one_step(
         assert torch.isfinite(loss), f"{name} loss is not finite: {loss.item()}"
 
     # REV-022b: T5.2 requires dtype assertions on outputs as well as parameters.
-    assert all_hidden.dtype == torch.bfloat16, (
-        f"Model output dtype {all_hidden.dtype}, expected bfloat16"
-    )
+    # Under mixed precision autocast picks per-op dtypes (layer norm and the losses run
+    # in fp32), so the output check applies to the pure-dtype path only and every loss
+    # is expected in fp32.
+    compute_dtype = resolve_dtype(config)
+    if not config.mixed_precision:
+        assert all_hidden.dtype == compute_dtype, (
+            f"Model output dtype {all_hidden.dtype}, expected {compute_dtype}"
+        )
     for name, loss in active_losses.items():
         # The contrastive objective is computed on fp32-normalized embeddings
         # (InfoNCE's similarity matrix is numerically fragile in bf16); this is a
         # deliberate, documented exception recorded in design.md.
-        expected = torch.float32 if name == "contrastive" else torch.bfloat16
+        fp32_loss = name == "contrastive" or config.mixed_precision
+        expected = torch.float32 if fp32_loss else compute_dtype
         assert loss.dtype == expected, (
             f"Loss '{name}' dtype {loss.dtype}, expected {expected}"
         )
@@ -306,7 +323,12 @@ def train_one_step(
 
     # REV-022a: code-quality.md requires set_to_none=True on the hot path.
     optimizer.zero_grad(set_to_none=True)
-    L_total.backward(retain_graph=(gradnorm is not None))
+    # fp16 only: scale the loss so small gradients do not underflow. GradNorm below
+    # differentiates the UNSCALED losses -- it needs only norms, which are dominated by
+    # the large components that fp16 represents fine, and scaling would add overflow.
+    (scaler.scale(L_total) if use_scaler else L_total).backward(
+        retain_graph=(gradnorm is not None),
+    )
 
     if gradnorm is not None:
         anchor_params = get_anchor_layer_params(model, config)
@@ -322,9 +344,17 @@ def train_one_step(
     # The total norm is finite iff every gradient is, so one check replaces a per-tensor
     # assert that forced a device->host sync for each of the ~91 parameter tensors.
     # REV-047: clipping must cover the loss functions' own parameters too.
+    # With a GradScaler, an fp16 overflow is expected while the scale calibrates: the
+    # scaler detects the non-finite gradients and skips that optimizer step instead.
+    if use_scaler:
+        scaler.unscale_(optimizer)
     total_grad_norm = torch.nn.utils.clip_grad_norm_(trainable, config.max_grad_norm)
-    assert torch.isfinite(total_grad_norm), "Non-finite gradient detected"
-    optimizer.step()
+    if use_scaler:
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        assert torch.isfinite(total_grad_norm), "Non-finite gradient detected"
+        optimizer.step()
     scheduler.step()
 
     loss_values = {name: loss.detach().item() for name, loss in active_losses.items()}
@@ -345,13 +375,13 @@ def train_one_step(
     return loss_values, routing_snapshots if routing_snapshots else None
 
 
-def assert_bf16_params(model: TransformerModel, moe: MoELayer) -> None:
+def assert_param_dtype(model: TransformerModel, moe: MoELayer, dtype: torch.dtype) -> None:
     for name, p in model.named_parameters():
-        assert p.dtype == torch.bfloat16, f"Model param {name} has dtype {p.dtype}, expected bfloat16"
+        assert p.dtype == dtype, f"Model param {name} has dtype {p.dtype}, expected {dtype}"
     for name, p in moe.named_parameters():
         if "log_lambdas" in name:
             continue
-        assert p.dtype == torch.bfloat16, f"MoE param {name} has dtype {p.dtype}, expected bfloat16"
+        assert p.dtype == dtype, f"MoE param {name} has dtype {p.dtype}, expected {dtype}"
 
 
 def assert_finite_step(loss_values: Dict[str, float], gradnorm: Optional[GradNormController]) -> None:
@@ -458,7 +488,7 @@ def plot_gradnorm_trajectory(config: Config, model_name: str) -> None:
 
 
 def _build_loss_fns(config: Config, device: torch.device) -> dict:
-    dtype = resolve_dtype(config)
+    dtype = resolve_param_dtype(config)
     norm = config.normalize_embeddings
     loss_fns = {
         "next_item": SampledSoftmaxLoss(normalize_embeddings=norm),
@@ -667,7 +697,7 @@ def run_pretrain(config: Config, model_name: str) -> Dict[str, float]:
     config.apply_model_config(model_name)
     config.validate()
     device = get_device(config)
-    dtype = resolve_dtype(config)
+    dtype = resolve_param_dtype(config)
     rng = random.Random(config.seed)
 
     processed = config.processed_data_dir
@@ -702,7 +732,7 @@ def run_pretrain(config: Config, model_name: str) -> Dict[str, float]:
     total_steps = num_batches_per_epoch * config.pretrain_epochs
 
     model, moe = build_model(config)
-    assert_bf16_params(model, moe)
+    assert_param_dtype(model, moe, resolve_param_dtype(config))
 
     # REV-047: loss functions are built BEFORE the optimizer so their parameters are
     # registered in it.
@@ -722,6 +752,9 @@ def run_pretrain(config: Config, model_name: str) -> Dict[str, float]:
             assert id(p) in _opt_ids, (
                 f"Loss parameter {fn_name}.{pname} is not registered in the optimizer"
             )
+
+    # Enabled only for fp16 mixed precision; a no-op otherwise.
+    scaler = make_grad_scaler(config)
 
     gradnorm = None
     if config.use_gradnorm:
@@ -813,7 +846,7 @@ def run_pretrain(config: Config, model_name: str) -> Dict[str, float]:
             loss_values, snapshots = train_one_step(
                 model, moe, batch, config, loss_fns, gradnorm,
                 optimizer, scheduler, batch_idx, rng,
-                mask_rng=mask_rng, metadata_matrix=metadata_matrix_t,
+                mask_rng=mask_rng, metadata_matrix=metadata_matrix_t, scaler=scaler,
             )
 
             assert_finite_step(loss_values, gradnorm)

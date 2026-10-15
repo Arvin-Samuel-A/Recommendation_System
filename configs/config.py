@@ -214,7 +214,12 @@ class Config:
 
     # --- Device / Dtype ---
     device: str = "auto"
+    # Compute dtype: "bf16" or "fp16". "fp16" requires `mixed_precision=True`.
     dtype: str = "bf16"
+    # False: parameters are stored in `dtype` (pure bf16, the original design).
+    # True: fp32 master weights, forward/backward under torch.autocast(dtype), and a
+    # GradScaler when dtype is fp16. Needed for GPUs without native bf16 (e.g. T4).
+    mixed_precision: bool = False
 
     # --- DataLoader ---
     num_workers: int = 0
@@ -273,8 +278,13 @@ class Config:
                 f"Unknown personalization_mode '{self.personalization_mode}'. "
                 f"Choose from {list(self.PERSONALIZATION_MODES)}"
             )
-        if self.dtype != "bf16":
-            raise ValueError(f"Only bf16 dtype is supported, got '{self.dtype}'")
+        if self.dtype not in ("bf16", "fp16"):
+            raise ValueError(f"Unknown dtype '{self.dtype}'. Choose from 'bf16', 'fp16'")
+        if self.dtype == "fp16" and not self.mixed_precision:
+            raise ValueError(
+                "dtype='fp16' requires mixed_precision=True: pure fp16 weights underflow "
+                "small updates and gradients without fp32 master weights and loss scaling."
+            )
         if self.hidden_dim % self.num_heads != 0:
             raise ValueError(
                 f"hidden_dim ({self.hidden_dim}) must be divisible by "
