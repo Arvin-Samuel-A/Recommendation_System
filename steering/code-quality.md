@@ -3,7 +3,8 @@
 ## Dtype Discipline
 
 - Model and data computation uses `torch.bfloat16` by default. FP16 is allowed only under `mixed_precision=True` (fp32 master weights, autocast, GradScaler); pure FP16 weights are rejected by `Config.validate`.
-- `resolve_dtype(config)` must raise if dtype is not `"bf16"`.
+- `resolve_dtype(config)` must raise for an unknown dtype and for `"fp16"` without `mixed_precision` (this line previously read "must raise if dtype is not bf16", which stopped matching the code when optional mixed precision landed in `c293616`).
+- Experiment runs (ablations, final runs) use `--dtype bf16 --mixed_precision` — owner decision 2026-10-15; see `architecture.md`. The default is not changed to get there.
 - Never silently change dtype if a numerical issue occurs — fail explicitly.
 
 ## Device Handling
@@ -14,11 +15,14 @@
 
 ## Attention Backend Discipline
 
-- MPS/CPU → SDPA (`F.scaled_dot_product_attention`). CUDA/H100 → FlashAttention-4. `"auto"` resolves by hardware.
-- SDPA is the sanctioned local/dev kernel, not a fallback. FlexAttention is not a supported backend in this project: it cannot run a backward pass on MPS in the pinned PyTorch build, so it can never satisfy the training gates on the dev host.
-- Each backend must pass a startup self-test — forward **and** backward — before training.
-- Final H100 run must fail fast if FA4 cannot initialize — no silent fallback.
+- Sanctioned backends: `auto`, `flash_attention_3`, `sdpa`. **Owner decision 2026-10-15** (supersedes "CUDA/H100 → FlashAttention-4"): Hopper CUDA (compute capability 9.x) → FlashAttention-3 (`flash_attn_interface`); any other CUDA GPU → SDPA; MPS/CPU → SDPA. `"auto"` resolves by hardware. The former `flash_attention_4` backend was misnamed — it called the FA2 `flash_attn` API — and is removed.
+- SDPA is the sanctioned kernel on MPS/CPU and non-Hopper CUDA, not a fallback. FlexAttention is not a supported backend in this project: it cannot run a backward pass on MPS in the pinned PyTorch build, so it can never satisfy the training gates on the dev host.
+- FlashAttention-3 is an **optional, lazily imported** dependency: no module import, test collection or dev-host code path may require it. Tests exercise our side of the FA3 path (unpad/repad, causality, dispatch) with a pure-torch reference module; real-kernel tests are skipped unless Hopper + FA3 are present.
+- Padded batches on FA3 go through our own differentiable unpad → varlen kernel → repad (FA3 ships no `bert_padding`). Causality is passed to every kernel as a flag (REV-122), never encoded in a mask only one backend reads.
+- Each backend must pass a startup self-test — forward **and** backward, unpadded **and** left-padded, at the model's real head dimension — before training.
+- A run that requests `flash_attention_3` explicitly must fail fast if it cannot initialize — no silent fallback. Experiment run commands always name the backend explicitly.
 - MPS smoke test must fail fast if SDPA cannot execute — no silent fallback.
+- Arms that are compared with each other must have run on the same backend; every ablation arm result records the backend and device it actually ran on.
 - "No silent fallback" is about *honesty of the manifest*, not about kernel preference: the backend that actually ran is the backend that gets recorded, and `require_attention_backend=True` turns any substitution into a hard failure.
 - Record PyTorch version, device, dtype, and resolved attention backend in every run manifest.
 
@@ -79,9 +83,23 @@ in question did not touch. Provenance belongs in the artifact, not in prose abou
 
 ## Numerical Safety
 
-- Assert finite losses, finite GradNorm loss, and finite active lambdas on every training step.
+- Assert finite losses, finite GradNorm loss, and finite active lambdas on every training step. The checks may be **batched** into stacked tensors (one host sync per check point) but never deferred past that step's `optimizer.step()`.
 - Gradient clipping: `clip_grad_norm_(model.parameters(), max_norm=1.0)` on every step.
 - `optimizer.zero_grad(set_to_none=True)` — use `set_to_none` for memory efficiency.
+
+## Training Hot Path and Reproducibility
+
+- Throughput changes must leave training semantics **bit-for-bit identical** (owner decision 2026-10-15): same batches, same RNG draws, same arithmetic. A change that alters an RNG stream (e.g. moving negative sampling to a device generator) or a kernel choice is a semantic change, not an optimisation.
+- Batch size is a training hyperparameter, not a utilisation knob: it sets InfoNCE's in-batch negatives, the number of optimizer and GradNorm steps, and the LR schedule. Do not change it for throughput.
+- No per-step `.item()` / `.cpu()` / Python `bool()` of a device tensor in the training loop beyond the batched finite checks and syncs that are inherent to the computation (data-dependent shapes, the Python-side augmentation). Per-step loss values stay on the device and are materialised once per epoch.
+- DataLoader workers must yield the same batch sequence as `num_workers=0` (tested). `persistent_workers` stays `False` for training: a persistent iterator does not redraw its base seed between epochs, which changes the loader generator's consumption and so the data order.
+- Characterisation ("golden") tests that pin a tiny run's parameters, loss trace and LR trace are captured **before** a hot-path refactor and must stay green through it.
+
+## Checkpoints and Resume
+
+- Every checkpoint is written atomically (temporary file + `os.replace`); a crash mid-write never leaves a truncated file under a checkpoint's final name.
+- Resume restores **all** state that affects the next step: model, MoE, loss-function parameters, optimizer, scheduler, GradScaler, GradNorm (incl. its optimizer and initial losses), every RNG (Python, NumPy, torch generators, global CPU/accelerator) and the DataLoader generators.
+- Resume refuses — loudly, naming the checkpoint and the remedy — when the training fingerprint, `total_steps` or `source_revision` differ. A run assembled from two code revisions would violate "Artifact Provenance" below.
 
 ## Error Handling
 
@@ -89,6 +107,8 @@ in question did not touch. Provenance belongs in the artifact, not in prose abou
 - Missing checkpoint at evaluate stage → print skip message with remedy command, return — never raise exception.
 - Negative pool exhaustion → fail with clear dataset/configuration error.
 - `contrastive_interval = 0` is invalid; use `use_contrastive = False` to disable.
+- Out-of-memory → the process exits with status 75 (`utils.OOM_EXIT_CODE`) so a launcher can retry; code that catches broad exceptions per item (e.g. per ablation arm) must re-raise OOM rather than record it as an ordinary failure.
+- Data shape mismatches fail loudly at the boundary: a loader asked for more positions than are stored, a model fed more positions than it was built for, or a processed directory whose sampling parameters differ from the config all raise with the remedy command in the message.
 
 ## Anti-Patterns (Forbidden)
 

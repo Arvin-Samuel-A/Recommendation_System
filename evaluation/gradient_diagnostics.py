@@ -164,8 +164,8 @@ def run_gradient_diagnostics(
                 break
 
             device = next(model.parameters()).device
-            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-
+            # specs/ablation-run D4: negatives are drawn from the loader's CPU batch
+            # BEFORE the host->device copy (identical draws, no device->host round trip).
             if "neg_ids" not in batch:
                 if negative_sampler is None:
                     raise ValueError(
@@ -173,6 +173,7 @@ def run_gradient_diagnostics(
                         "dataloader does not already provide `neg_ids`."
                     )
                 batch = negative_sampler(batch)
+            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
             seq = batch["sequences"]
             targets = batch["targets"]

@@ -44,6 +44,7 @@ from evaluation.gradient_diagnostics import run_gradient_diagnostics
 from evaluation.metrics import evaluate_model
 from utils import (
     get_device, resolve_dtype, resolve_param_dtype, make_grad_scaler, get_source_revision,
+    atomic_torch_save,
 )
 
 logger = logging.getLogger(__name__)
@@ -51,12 +52,18 @@ logger = logging.getLogger(__name__)
 
 def build_scheduler(optimizer: torch.optim.Optimizer, config: Config, total_steps: int) -> LambdaLR:
     warmup_steps = int(total_steps * config.warmup_ratio)
+    # specs/ablation-run FR-5 / D5 (owner decision 4): the cosine decays to a floor of
+    # `min_lr_ratio` x peak instead of 0. `min_lr_ratio = 0` is the previous schedule for
+    # every step <= total_steps; the clamp only affects steps past the end, which
+    # `run_pretrain` never takes.
+    min_lr_ratio = config.min_lr_ratio
 
     def lr_lambda(step):
         if step < warmup_steps:
             return float(step) / max(1, warmup_steps)
-        progress = float(step - warmup_steps) / max(1, total_steps - warmup_steps)
-        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+        progress = min(1.0, float(step - warmup_steps) / max(1, total_steps - warmup_steps))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
 
     return LambdaLR(optimizer, lr_lambda)
 
@@ -81,6 +88,7 @@ def save_checkpoint(
     config: Config,
     loss_fns: Optional[dict] = None,
     is_best: bool = False,
+    resume_state: Optional[dict] = None,
 ) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     checkpoint = {
@@ -123,7 +131,11 @@ def save_checkpoint(
             "use_gradnorm": config.use_gradnorm,
             "num_experts": config.num_experts,
         })
-    torch.save(checkpoint, path)
+    if resume_state is not None:
+        # specs/ablation-run D8: `last.pt` carries everything needed to continue exactly.
+        checkpoint["resume_state"] = resume_state
+    # specs/ablation-run FR-8: a crash mid-write never leaves a truncated checkpoint.
+    atomic_torch_save(checkpoint, path)
 
 
 def load_checkpoint(
@@ -134,8 +146,10 @@ def load_checkpoint(
     scheduler: Optional[LambdaLR] = None,
     gradnorm: Optional[GradNormController] = None,
     loss_fns: Optional[dict] = None,
+    checkpoint: Optional[dict] = None,
 ) -> dict:
-    checkpoint = torch.load(path, weights_only=False)
+    if checkpoint is None:
+        checkpoint = torch.load(path, weights_only=False)
     model.load_state_dict(checkpoint["model_state_dict"])
     moe.load_state_dict(checkpoint["moe_state_dict"])
     if loss_fns is not None:
@@ -292,9 +306,6 @@ def train_one_step(
         if r_cl is not None:
             routing_snapshots["contrastive"] = r_cl.detach()
 
-    for name, loss in active_losses.items():
-        assert torch.isfinite(loss), f"{name} loss is not finite: {loss.item()}"
-
     # REV-022b: T5.2 requires dtype assertions on outputs as well as parameters.
     # Under mixed precision autocast picks per-op dtypes (layer norm and the losses run
     # in fp32), so the output check applies to the pure-dtype path only and every loss
@@ -319,7 +330,17 @@ def train_one_step(
     else:
         L_total = static_weighted_sum(active_losses, config)
 
-    assert torch.isfinite(L_total), "Total loss not finite"
+    # Check A (specs/ablation-run D4): every active loss and the total, finite, in ONE
+    # stacked check (one host sync instead of one per loss), still before backward. Only
+    # on failure are the per-loss values read, to name the offending objective.
+    finite = torch.isfinite(torch.stack(
+        [loss.detach().float() for loss in active_losses.values()]
+        + [L_total.detach().float()]
+    )).all()
+    if not bool(finite):
+        for name, loss in active_losses.items():
+            assert torch.isfinite(loss), f"{name} loss is not finite: {loss.item()}"
+        raise AssertionError(f"Total loss not finite: {L_total.item()}")
 
     # REV-022a: code-quality.md requires set_to_none=True on the hot path.
     optimizer.zero_grad(set_to_none=True)
@@ -349,16 +370,22 @@ def train_one_step(
     if use_scaler:
         scaler.unscale_(optimizer)
     total_grad_norm = torch.nn.utils.clip_grad_norm_(trainable, config.max_grad_norm)
+    # Check B (specs/ablation-run D4): the gradient norm (non-scaler path; with a scaler
+    # an fp16 overflow is expected while the scale calibrates and the scaler skips that
+    # step) and the GradNorm lambdas, in ONE stacked check, before `optimizer.step()`.
+    _assert_finite_grads_and_lambdas(total_grad_norm, gradnorm, check_grad_norm=not use_scaler)
     if use_scaler:
         scaler.step(optimizer)
         scaler.update()
     else:
-        assert torch.isfinite(total_grad_norm), "Non-finite gradient detected"
         optimizer.step()
     scheduler.step()
 
-    loss_values = {name: loss.detach().item() for name, loss in active_losses.items()}
-    loss_values["total"] = L_total.detach().item()
+    # specs/ablation-run D4: 0-d device tensors, not `.item()` (one sync each). They
+    # support float()/format()/math.isfinite(); `run_pretrain` materialises them once per
+    # epoch, producing the same floats.
+    loss_values = {name: loss.detach() for name, loss in active_losses.items()}
+    loss_values["total"] = L_total.detach()
     if skipped_objectives:
         loss_values["_skipped"] = skipped_objectives
 
@@ -375,6 +402,28 @@ def train_one_step(
     return loss_values, routing_snapshots if routing_snapshots else None
 
 
+def _assert_finite_grads_and_lambdas(
+    total_grad_norm: torch.Tensor,
+    gradnorm: Optional[GradNormController],
+    check_grad_norm: bool,
+) -> None:
+    """Check B of D4: one host sync for the grad norm and the active lambdas together."""
+    parts = []
+    if check_grad_norm:
+        parts.append(total_grad_norm.detach().float().reshape(1))
+    if gradnorm is not None:
+        lambdas = gradnorm.lambdas.detach().float().reshape(-1)
+        parts.append(lambdas.to(parts[0].device) if parts else lambdas)
+    if not parts:
+        return
+    if bool(torch.isfinite(torch.cat(parts)).all()):
+        return
+    if check_grad_norm:
+        assert torch.isfinite(total_grad_norm), "Non-finite gradient detected"
+    lambdas = gradnorm.lambdas.detach()
+    raise AssertionError(f"GradNorm lambdas not finite: {lambdas}")
+
+
 def assert_param_dtype(model: TransformerModel, moe: MoELayer, dtype: torch.dtype) -> None:
     for name, p in model.named_parameters():
         assert p.dtype == dtype, f"Model param {name} has dtype {p.dtype}, expected {dtype}"
@@ -385,6 +434,11 @@ def assert_param_dtype(model: TransformerModel, moe: MoELayer, dtype: torch.dtyp
 
 
 def assert_finite_step(loss_values: Dict[str, float], gradnorm: Optional[GradNormController]) -> None:
+    """Finite check over a step's loss values and lambdas, for callers outside the loop.
+
+    specs/ablation-run D4: `run_pretrain` no longer calls this per step -- the same checks
+    run inside `train_one_step` (checks A and B), batched, before `optimizer.step()`.
+    """
     for name, val in loss_values.items():
         if name.startswith("_"):
             continue
@@ -394,14 +448,19 @@ def assert_finite_step(loss_values: Dict[str, float], gradnorm: Optional[GradNor
         assert torch.all(torch.isfinite(lambdas)), f"GradNorm lambdas not finite: {lambdas}"
 
 
-def setup_epoch_logger(config: Config, model_name: str) -> logging.Logger:
+def setup_epoch_logger(
+    config: Config, model_name: str, append: bool = False,
+) -> logging.Logger:
+    """The per-epoch log. `append=True` (a resumed run) keeps the existing lines."""
     log_path = os.path.join(config.log_dir, f"pretrain_{model_name.replace('-', '_')}.log")
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
 
     epoch_logger = logging.getLogger(f"pretrain.{model_name}")
     epoch_logger.setLevel(logging.INFO)
+    for handler in list(epoch_logger.handlers):
+        handler.close()
     epoch_logger.handlers.clear()
-    fh = logging.FileHandler(log_path, mode="w")
+    fh = logging.FileHandler(log_path, mode="a" if append else "w")
     fh.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
     epoch_logger.addHandler(fh)
     return epoch_logger
@@ -599,6 +658,17 @@ def collect_validation_routing(
     return {name: torch.cat(v, dim=0) for name, v in collected.items() if v}
 
 
+def _host_numpy(t: torch.Tensor) -> np.ndarray:
+    """A NumPy view of a host tensor; a device tensor is copied back (one sync).
+
+    specs/ablation-run D4: the training loop now samples negatives on the CPU batch
+    BEFORE the host->device copy, so this is a zero-copy view there.
+    """
+    if t.device.type == "cpu":
+        return t.detach().numpy()
+    return t.detach().cpu().numpy()
+
+
 def attach_training_negatives(
     batch: dict,
     pool: np.ndarray,
@@ -617,8 +687,8 @@ def attach_training_negatives(
     """
     neg_ids = sample_training_negatives(
         pool=pool,
-        targets=batch["targets"].detach().cpu().numpy(),
-        user_ids=batch["user_ids"].detach().cpu().numpy(),
+        targets=_host_numpy(batch["targets"]),
+        user_ids=_host_numpy(batch["user_ids"]),
         history_arrays=history_arrays,
         num_negatives=config.num_sampled_negatives,
         num_items=config.num_items,
@@ -693,9 +763,132 @@ def _load_or_build_val_candidates(
     return torch.as_tensor(np.asarray(candidates), dtype=torch.long)
 
 
+# ---------------- epoch-granular exact resume (specs/ablation-run FR-8, design D8) ----------
+
+LAST_CHECKPOINT = "last.pt"
+#: GradNorm lambdas are appended to `gradnorm_{model}.jsonl` every this many global steps.
+GRADNORM_LOG_INTERVAL_STEPS = 100
+RESUME_FORMAT = 1
+_REVISION_KEYS = ("commit", "source_hash", "dirty")
+
+
+def _capture_rng_state(
+    rng: random.Random,
+    neg_rng: np.random.RandomState,
+    mask_rng: torch.Generator,
+    device: torch.device,
+) -> dict:
+    return {
+        "python": rng.getstate(),
+        "numpy_neg": neg_rng.get_state(),
+        "torch_mask": mask_rng.get_state(),
+        "torch_cpu": torch.get_rng_state(),
+        "torch_cuda": torch.cuda.get_rng_state_all() if device.type == "cuda" else None,
+        "torch_mps": torch.mps.get_rng_state() if device.type == "mps" else None,
+        # Not read by the training step today; saved so a future reader cannot drift.
+        "python_global": random.getstate(),
+        "numpy_global": np.random.get_state(),
+    }
+
+
+def _restore_rng_state(
+    state: dict,
+    rng: random.Random,
+    neg_rng: np.random.RandomState,
+    mask_rng: torch.Generator,
+    device: torch.device,
+) -> None:
+    rng.setstate(state["python"])
+    neg_rng.set_state(state["numpy_neg"])
+    mask_rng.set_state(state["torch_mask"])
+    torch.set_rng_state(state["torch_cpu"])
+    if device.type == "cuda" and state.get("torch_cuda") is not None:
+        torch.cuda.set_rng_state_all(state["torch_cuda"])
+    if device.type == "mps" and state.get("torch_mps") is not None:
+        torch.mps.set_rng_state(state["torch_mps"])
+    if state.get("python_global") is not None:
+        random.setstate(state["python_global"])
+    if state.get("numpy_global") is not None:
+        np.random.set_state(state["numpy_global"])
+
+
+def _training_fingerprint_of(config: Config) -> str:
+    # Lazy: `ablation_runner` imports this module inside its functions only.
+    from training.ablation_runner import _training_fingerprint
+
+    return _training_fingerprint(config)
+
+
+def _load_resume_checkpoint(path: str, config: Config, total_steps: int) -> dict:
+    """Load `last.pt` and refuse it unless it belongs to THIS run (D8)."""
+    checkpoint = torch.load(path, weights_only=False)
+    state = checkpoint.get("resume_state")
+    remedy = f"delete {path} or pass --no_resume to train from scratch"
+    if not isinstance(state, dict) or state.get("format") != RESUME_FORMAT:
+        raise RuntimeError(f"Cannot resume from {path}: no resume_state (format {RESUME_FORMAT}); {remedy}.")
+    current_fp = _training_fingerprint_of(config)
+    if state.get("training_fingerprint") != current_fp:
+        raise RuntimeError(
+            f"Refusing to resume from {path}: training_fingerprint differs (checkpoint "
+            f"{state.get('training_fingerprint')}, this run {current_fp}) -- the config "
+            f"changed; {remedy}."
+        )
+    if state.get("total_steps") != total_steps:
+        raise RuntimeError(
+            f"Refusing to resume from {path}: total_steps differs (checkpoint "
+            f"{state.get('total_steps')}, this run {total_steps}); {remedy}."
+        )
+    stored_rev = checkpoint.get("source_revision") or {}
+    current_rev = get_source_revision()
+    for key in _REVISION_KEYS:
+        if stored_rev.get(key) != current_rev.get(key):
+            raise RuntimeError(
+                f"Refusing to resume from {path}: source_revision.{key} differs "
+                f"(checkpoint {stored_rev.get(key)}, this code {current_rev.get(key)}) -- "
+                f"a run assembled from two code revisions has no single provenance; {remedy}."
+            )
+    return checkpoint
+
+
+def _truncate_epoch_log(path: str, start_epoch: int) -> None:
+    """Drop per-epoch log lines for epochs >= start_epoch (they will be rewritten)."""
+    if not os.path.exists(path):
+        return
+    import re
+
+    kept = []
+    with open(path) as f:
+        for line in f:
+            match = re.search(r"\bepoch=(\d+)\b", line)
+            if match and int(match.group(1)) >= start_epoch:
+                continue
+            kept.append(line)
+    with open(path, "w") as f:
+        f.writelines(kept)
+
+
+def _truncate_gradnorm_log(path: str, global_step: int) -> None:
+    """Keep only GradNorm JSONL records for steps already taken."""
+    if not os.path.exists(path):
+        return
+    kept = []
+    with open(path) as f:
+        for line in f:
+            try:
+                if json.loads(line)["step"] < global_step:
+                    kept.append(line)
+            except (json.JSONDecodeError, KeyError, TypeError):
+                continue
+    with open(path, "w") as f:
+        f.writelines(kept)
+
+
 def run_pretrain(config: Config, model_name: str) -> Dict[str, float]:
     config.apply_model_config(model_name)
     config.validate()
+    # specs/ablation-run FR-7 / AC-20: never train on a different user sample than asked.
+    from data.preprocessing import check_processed_dir
+    check_processed_dir(config)
     device = get_device(config)
     dtype = resolve_param_dtype(config)
     rng = random.Random(config.seed)
@@ -812,13 +1005,13 @@ def run_pretrain(config: Config, model_name: str) -> Dict[str, float]:
         config, processed, val_dataset, neg_array, eval_user_history, device,
     )
 
-    epoch_logger = setup_epoch_logger(config, model_name)
-
     best_val_ndcg = -1.0
     best_epoch = -1
     global_step = 0
+    start_epoch = 0
     ckpt_dir = config.model_checkpoint_dir()
     os.makedirs(ckpt_dir, exist_ok=True)
+    last_path = os.path.join(ckpt_dir, LAST_CHECKPOINT)
 
     # REV-010: the buffer spans the diagnostic interval, not a single epoch, and is
     # cleared by `_emit_routing_diagnostics` once consumed.
@@ -828,10 +1021,47 @@ def run_pretrain(config: Config, model_name: str) -> Dict[str, float]:
     epoch_mean_losses: List[float] = []
 
     gradnorm_log_path = os.path.join(config.log_dir, f"gradnorm_{model_name.replace('-', '_')}.jsonl")
-    if os.path.exists(gradnorm_log_path):
+    epoch_log_path = os.path.join(config.log_dir, f"pretrain_{model_name.replace('-', '_')}.log")
+
+    # specs/ablation-run FR-8 / D8: resume from `last.pt` at the next epoch. Every object
+    # above is constructed first; restoring the RNGs AFTER construction is what makes the
+    # next epoch see exactly the state an uninterrupted run would.
+    resumed = None
+    if config.resume_training and os.path.exists(last_path):
+        resumed = _load_resume_checkpoint(last_path, config, total_steps)
+        state = resumed["resume_state"]
+        load_checkpoint(
+            last_path, model, moe, optimizer=optimizer, scheduler=scheduler,
+            gradnorm=gradnorm, loss_fns=loss_fns, checkpoint=resumed,
+        )
+        if state.get("scaler") is not None and scaler.is_enabled():
+            scaler.load_state_dict(state["scaler"])
+        _restore_rng_state(state["rng"], rng, neg_rng, mask_rng, device)
+        train_loader.generator.set_state(state["loader_generators"]["train"])
+        diag_loader.generator.set_state(state["loader_generators"]["diag"])
+        start_epoch = int(state["epoch"]) + 1
+        global_step = int(state["global_step"])
+        best_val_ndcg = float(state["best_val_ndcg"])
+        best_epoch = int(state["best_epoch"])
+        epoch_mean_losses = list(state["epoch_mean_losses"])
+        epoch_loss_windows = list(state["epoch_loss_windows"])
+        assert scheduler.last_epoch == global_step, (
+            f"restored scheduler.last_epoch={scheduler.last_epoch} != global_step={global_step}"
+        )
+        logger.info(
+            "Resuming %s from %s at epoch %d (global step %d)",
+            model_name, last_path, start_epoch, global_step,
+        )
+        _truncate_epoch_log(epoch_log_path, start_epoch)
+        _truncate_gradnorm_log(gradnorm_log_path, global_step)
+    elif os.path.exists(gradnorm_log_path):
         os.remove(gradnorm_log_path)
 
-    for epoch in range(config.pretrain_epochs):
+    epoch_logger = setup_epoch_logger(config, model_name, append=resumed is not None)
+
+    non_blocking = device.type == "cuda" and config.pin_memory
+
+    for epoch in range(start_epoch, config.pretrain_epochs):
         model.train()
         moe.train()
         epoch_losses: Dict[str, List[float]] = {}
@@ -839,9 +1069,15 @@ def run_pretrain(config: Config, model_name: str) -> Dict[str, float]:
         for batch_idx, batch in enumerate(train_loader):
             if config.max_steps_per_epoch > 0 and batch_idx >= config.max_steps_per_epoch:
                 break
-            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-
+            # specs/ablation-run D4: negatives are drawn from the CPU batch the loader
+            # yielded (same inputs, same `neg_rng` draws, same output), so the step no
+            # longer copies `targets`/`user_ids` device->host. Then one host->device move,
+            # asynchronous from pinned memory on CUDA.
             batch = attach_negatives(batch)
+            batch = {
+                k: v.to(device, non_blocking=non_blocking) if isinstance(v, torch.Tensor) else v
+                for k, v in batch.items()
+            }
 
             loss_values, snapshots = train_one_step(
                 model, moe, batch, config, loss_fns, gradnorm,
@@ -849,9 +1085,11 @@ def run_pretrain(config: Config, model_name: str) -> Dict[str, float]:
                 mask_rng=mask_rng, metadata_matrix=metadata_matrix_t, scaler=scaler,
             )
 
-            assert_finite_step(loss_values, gradnorm)
-
+            # specs/ablation-run D4: the finite checks ran inside `train_one_step`;
+            # values stay on the device until the epoch ends.
             for name, val in loss_values.items():
+                if name.startswith("_"):
+                    continue
                 epoch_losses.setdefault(name, []).append(val)
 
             if snapshots is not None:
@@ -876,11 +1114,17 @@ def run_pretrain(config: Config, model_name: str) -> Dict[str, float]:
                 model.train()
                 moe.train()
 
-            if gradnorm is not None and global_step % 100 == 0:
+            if gradnorm is not None and global_step % GRADNORM_LOG_INTERVAL_STEPS == 0:
                 log_gradnorm_lambdas(config, model_name, global_step, gradnorm)
 
             global_step += 1
 
+        # One materialisation per objective per epoch (was one `.item()` per loss per
+        # step); the floats are identical to the per-step `.item()` values.
+        epoch_losses = {
+            name: torch.stack([v.float() for v in vals]).tolist()
+            for name, vals in epoch_losses.items()
+        }
         avg_losses = {name: sum(vals) / len(vals) for name, vals in epoch_losses.items()}
 
         # AC-04 / REV-005: record the first- and last-window means of the per-batch total
@@ -937,6 +1181,31 @@ def run_pretrain(config: Config, model_name: str) -> Dict[str, float]:
                 best_path, epoch, model, moe, optimizer, scheduler, gradnorm,
                 val_metrics, config, loss_fns=loss_fns, is_best=True,
             )
+
+        # specs/ablation-run FR-8 / D8: the full resume state, written last (after best.pt)
+        # and atomically. A crash before this line redoes the epoch on resume, which
+        # reproduces the same best.pt because training is deterministic given this state.
+        resume_state = {
+            "format": RESUME_FORMAT,
+            "epoch": epoch,
+            "global_step": global_step,
+            "total_steps": total_steps,
+            "training_fingerprint": _training_fingerprint_of(config),
+            "best_val_ndcg": best_val_ndcg,
+            "best_epoch": best_epoch,
+            "epoch_mean_losses": list(epoch_mean_losses),
+            "epoch_loss_windows": list(epoch_loss_windows),
+            "scaler": scaler.state_dict() if scaler.is_enabled() else None,
+            "rng": _capture_rng_state(rng, neg_rng, mask_rng, device),
+            "loader_generators": {
+                "train": train_loader.generator.get_state(),
+                "diag": diag_loader.generator.get_state(),
+            },
+        }
+        save_checkpoint(
+            last_path, epoch, model, moe, optimizer, scheduler, gradnorm,
+            val_metrics, config, loss_fns=loss_fns, resume_state=resume_state,
+        )
 
         logger.info(
             f"Epoch {epoch}: train_loss={avg_losses.get('total', 0.0):.4f} "

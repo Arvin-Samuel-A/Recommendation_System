@@ -705,3 +705,37 @@ class TestLambdaGradientEquivalence:
             "and pins that graph alive across steps (design D7)"
         )
         assert gn.log_lambdas.grad.grad_fn is None
+
+
+class TestVectorisedRenormalisation:
+    """specs/ablation-run T5.2 / AC-13: the branch-free renorm equals the old loop."""
+
+    @staticmethod
+    def _old_loop(log_lambdas, active_indices):
+        """Verbatim from HEAD 0a91094 (`GradNormController.update`)."""
+        lambdas = lambda: log_lambdas.exp()  # noqa: E731
+        num_active = len(active_indices)
+        with torch.no_grad():
+            active_lams = lambdas()[active_indices]
+            renorm = active_lams.sum()
+            if renorm > 0:
+                scale = num_active / renorm
+                for idx in active_indices:
+                    log_lambdas[idx] = (lambdas()[idx] * scale).log()
+
+    def test_matches_the_per_index_loop_bit_for_bit(self):
+        import random
+
+        rnd = random.Random(0)
+        gen = torch.Generator().manual_seed(0)
+        for trial in range(100):
+            gn = GradNormController(alpha=1.5, lr=1e-2)
+            start = torch.randn(4, generator=gen) * (3.0 if trial % 2 else 0.5)
+            k = rnd.randint(1, 4)
+            active = sorted(rnd.sample(range(4), k))
+            expected = start.clone()
+            self._old_loop(expected, active)
+            with torch.no_grad():
+                gn.log_lambdas.copy_(start)
+            gn._renormalize(active)
+            assert torch.equal(gn.log_lambdas.detach(), expected), (trial, active)

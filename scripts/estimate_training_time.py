@@ -228,13 +228,18 @@ class Bench:
             return None
         from evaluation.metrics import evaluate_model
         try:
+            # specs/ablation-run FR-7: narrow to THIS config's width (was a hardcoded 50,
+            # which silently fed a seq100/seq200 config 50 positions).
             if not hasattr(self, "_val"):
-                vds = load_tensorised(vt, meta, max_seq_length=50)
+                self._val = {}
+            if cfg.max_seq_length not in self._val:
+                vds = load_tensorised(vt, meta, max_seq_length=cfg.max_seq_length)
                 cands = load_eval_candidates(vc, verify=False, mmap=True)
-                self._val = (vds, len(vds), torch.as_tensor(np.array(cands[:n]), dtype=torch.long))
-            vds, n_val, cands = self._val
-            seqs = vds.sequences[:n, -cfg.max_seq_length:] if cfg.max_seq_length < 50 \
-                else vds.sequences[:n]
+                self._val[cfg.max_seq_length] = (
+                    vds, len(vds), torch.as_tensor(np.array(cands[:n]), dtype=torch.long),
+                )
+            vds, n_val, cands = self._val[cfg.max_seq_length]
+            seqs = vds.sequences[:n]
             model.eval(); moe.eval()
             with torch.no_grad(), self._amp(cfg):
                 sync(); t0 = time.perf_counter()

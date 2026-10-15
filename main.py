@@ -6,11 +6,13 @@ import os
 import random
 import sys
 from dataclasses import asdict
+from typing import Optional
 
 import numpy as np
 import torch
 
 from configs.config import Config
+from models.transformer import VALID_BACKENDS
 from utils import set_seed
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -91,7 +93,57 @@ def parse_args(argv=None):
         "--local_epochs", type=int, default=None,
         help="Override local_epochs for per-user LoRA training.",
     )
+    # specs/ablation-run (owner decisions 2026-10-15). Every flag defaults to None/False
+    # so the configured values stay authoritative when it is absent.
+    parser.add_argument(
+        "--user_sample_fraction", type=float, default=None,
+        help="Keep a seeded random fraction of users (0, 1]. Below 1 the processed "
+             "directory moves to data/processed_users{pct}pct unless one is set.",
+    )
+    parser.add_argument(
+        "--user_sample_seed", type=int, default=None,
+        help="Seed of the user sample (independent of --seed).",
+    )
+    parser.add_argument(
+        "--sequence_length_grid", type=int, nargs="+", default=None,
+        help="Ablation H2 sequence lengths; preprocessing stores every split at "
+             "max(grid + [max_seq_length]).",
+    )
+    parser.add_argument(
+        "--attention_backend", default=None, choices=list(VALID_BACKENDS),
+        help="Attention kernel. Experiment runs always name it explicitly.",
+    )
+    parser.add_argument(
+        "--num_workers", type=int, default=None,
+        help="DataLoader worker processes (does not change the batch sequence).",
+    )
+    parser.add_argument(
+        "--min_lr_ratio", type=float, default=None,
+        help="Cosine LR floor as a fraction of the peak LR, in [0, 1].",
+    )
+    parser.add_argument(
+        "--no_resume", action="store_true", default=False,
+        help="Ignore last.pt and persisted ablation arms; train/evaluate from scratch.",
+    )
     return parser.parse_args(argv)
+
+
+def derive_processed_dir(config: Config) -> Optional[str]:
+    """The processed directory a user sample lives in, or None for the full dataset.
+
+    specs/ablation-run FR-6: `data/processed_users{pct}pct`, with `_seed{S}` when
+    `user_sample_seed` differs from its default, so a sampled dataset never overwrites
+    `data/processed`. Shared with `scripts/package_ablation_run.py`.
+    """
+    fraction = config.user_sample_fraction
+    if fraction >= 1.0:
+        return None
+    pct = format(round(fraction * 100, 6), "g")
+    name = f"processed_users{pct}pct"
+    if config.user_sample_seed != Config.user_sample_seed:
+        name += f"_seed{config.user_sample_seed}"
+    base = os.path.dirname(Config.processed_data_dir) or "."
+    return f"{base}/{name}"
 
 
 def apply_cli_overrides(config: Config, args) -> None:
@@ -151,6 +203,33 @@ def apply_cli_overrides(config: Config, args) -> None:
     if getattr(args, "local_epochs", None) is not None:
         overrides.append(("local_epochs", config.local_epochs, args.local_epochs))
         config.local_epochs = args.local_epochs
+
+    # specs/ablation-run T1.2.
+    for flag, field_name in (
+        ("user_sample_fraction", "user_sample_fraction"),
+        ("user_sample_seed", "user_sample_seed"),
+        ("attention_backend", "attention_backend"),
+        ("num_workers", "num_workers"),
+        ("min_lr_ratio", "min_lr_ratio"),
+    ):
+        value = getattr(args, flag, None)
+        if value is not None:
+            overrides.append((field_name, getattr(config, field_name), value))
+            setattr(config, field_name, value)
+    if getattr(args, "sequence_length_grid", None) is not None:
+        grid = list(args.sequence_length_grid)
+        overrides.append(("sequence_length_grid", config.sequence_length_grid, grid))
+        config.sequence_length_grid = grid
+    if getattr(args, "no_resume", False):
+        overrides.append(("resume_training", config.resume_training, False))
+        config.resume_training = False
+    # FR-6: a sample gets its own directory, but an explicitly chosen one is never
+    # rewritten.
+    if config.processed_data_dir == Config.processed_data_dir:
+        derived = derive_processed_dir(config)
+        if derived is not None:
+            overrides.append(("processed_data_dir", config.processed_data_dir, derived))
+            config.processed_data_dir = derived
 
     for name, old, new in overrides:
         logger.info(f"CLI override: {name} {old} -> {new}")
@@ -273,7 +352,11 @@ def run_evaluate_stage(config, args):
     if metadata_matrix is not None:
         config.feature_dim = metadata_matrix.shape[-1]
 
-    test_dataset = load_tensorised(os.path.join(processed, "test_tensorised.pt"), metadata_matrix)
+    # specs/ablation-run FR-7: splits are stored wider than the model; narrow on read.
+    test_dataset = load_tensorised(
+        os.path.join(processed, "test_tensorised.pt"), metadata_matrix,
+        max_seq_length=config.max_seq_length,
+    )
     with open(os.path.join(processed, "eval_user_history.pkl"), "rb") as f:
         eval_user_history = pickle.load(f)
 
@@ -529,6 +612,7 @@ def run_routing_diagnostics_stage(config, args):
 
     val_dataset = load_tensorised(
         os.path.join(processed, "val_tensorised.pt"), metadata_matrix,
+        max_seq_length=config.max_seq_length,
     )
     per_objective = collect_validation_routing(model, moe, val_dataset, config)
     if not per_objective:
@@ -571,6 +655,7 @@ def run_gradient_diagnostics_stage(config, args):
 
     train_dataset = load_tensorised(
         os.path.join(processed, "train_tensorised.pt"), metadata_matrix,
+        max_seq_length=config.max_seq_length,
     )
     loader = build_dataloader(train_dataset, config, shuffle=True)
 
@@ -984,9 +1069,21 @@ def main(argv=None):
     save_config_snapshot(config)
     # Every stage's forward passes (training, evaluation, LoRA, federated, ablations) run
     # under one autocast region; it is a no-op unless mixed_precision is on.
-    from utils import autocast_context
-    with autocast_context(config):
-        STAGE_MAP[args.stage](config, args)
+    from utils import OOM_EXIT_CODE, autocast_context, is_oom_error
+    try:
+        with autocast_context(config):
+            STAGE_MAP[args.stage](config, args)
+    except Exception as exc:
+        # specs/ablation-run FR-9: an out-of-memory error (often another user's job on a
+        # shared GPU) exits with a status the retry launcher understands; completed work
+        # (last.pt, persisted ablation arms) is picked up by the re-run.
+        if is_oom_error(exc):
+            logger.error(
+                "OOM in stage %s: %s -- exiting with status %d for the retry launcher",
+                args.stage, exc, OOM_EXIT_CODE,
+            )
+            raise SystemExit(OOM_EXIT_CODE) from exc
+        raise
 
 
 if __name__ == "__main__":

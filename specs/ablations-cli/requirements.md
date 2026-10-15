@@ -53,7 +53,7 @@ The research project requires 8 ablation studies (A–H), each comparing multipl
 - Runner resolves study-specific sub-configurations internally
 - Every resolved configuration saved with result
 - `--study all` runs A–H sequentially; writes `outputs/ablations/summary_{model}.json`
-- Each study writes `outputs/ablations/{study}_{model}.json`
+- Each study writes `outputs/ablations/{study}_{model}.json` *(superseded by `ablation-run` FR-11: `outputs/ablations/seed_{seed}/{study}_{model}.json`, and the summary likewise)*
 
 ### FR-6: Ablation A — Architecture Progression
 - 6 configurations: single-objective baseline → +all objectives → +MMoE → +ARV-MMoE → +GradNorm → +federated
@@ -113,7 +113,7 @@ The research project requires 8 ablation studies (A–H), each comparing multipl
 
 - Model checkpoint missing for an ablation config: skip with message
 - Ablation study requires model not yet pretrained: fail with clear remedy
-- `--study all` with partial prior results: re-run all (no incremental resume)
+- `--study all` with partial prior results: re-run all (no incremental resume) *(superseded by `ablation-run` FR-11: completed arms are persisted and reused unless `--no_resume`)*
 
 ## Constraints
 

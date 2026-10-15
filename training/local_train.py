@@ -24,7 +24,7 @@ from training.pretrain import build_model, load_checkpoint
 from evaluation.metrics import evaluate_model, score_candidates, compute_metrics
 from data.sequence_generator import (
     filter_negatives, generate_sliding_window_examples, load_metadata_matrix,
-    load_or_build_eval_candidates,
+    load_or_build_eval_candidates, load_examples,
 )
 from utils import get_device, resolve_dtype, make_grad_scaler, artifact_source_revision
 
@@ -226,8 +226,10 @@ def run_local_personalization(
         with open(cold_items_path, "rb") as f:
             cold_items = set(pickle.load(f))
 
-    with open(os.path.join(processed, "test_examples.pkl"), "rb") as f:
-        test_examples = pickle.load(f)
+    # specs/ablation-run FR-7: splits are stored wider than the model; narrow on read.
+    test_examples = load_examples(
+        os.path.join(processed, "test_examples.pkl"), config.max_seq_length,
+    )
 
     # REV-003: the local training source. The test split -- which the gain is measured
     # on -- is never one of the options; `Config.validate()` restricts the flag to
@@ -235,8 +237,9 @@ def run_local_personalization(
     val_examples = None
     user_val_map: Optional[Dict[int, List[int]]] = None
     if config.local_train_source == "val":
-        with open(os.path.join(processed, "val_examples.pkl"), "rb") as f:
-            val_examples = pickle.load(f)
+        val_examples = load_examples(
+            os.path.join(processed, "val_examples.pkl"), config.max_seq_length,
+        )
         user_val_map = {}
         for i, uid in enumerate(val_examples["user_ids"]):
             user_val_map.setdefault(uid, []).append(i)

@@ -119,15 +119,27 @@ class GradNormController:
         self.log_lambdas.grad = lambda_grad.detach()
         self.optimizer.step()
 
-        with torch.no_grad():
-            active_lams = self.lambdas[active_indices]
-            renorm = active_lams.sum()
-            if renorm > 0:
-                scale = num_active / renorm
-                for idx in active_indices:
-                    self.log_lambdas[idx] = (self.lambdas[idx] * scale).log()
+        self._renormalize(active_indices)
 
         return gradnorm_loss.detach()
+
+    def _renormalize(self, active_indices: List[int]) -> None:
+        """Rescale the active lambdas to sum to the number of active objectives.
+
+        specs/ablation-run D4: branch-free. `if renorm > 0:` was a host sync every step.
+        Same elementwise arithmetic as the previous per-index loop (each index reads the
+        lambdas before any of them is rewritten), and when renorm <= 0 the old values are
+        kept exactly, as the branch did.
+        """
+        num_active = len(active_indices)
+        with torch.no_grad():
+            idx = torch.tensor(active_indices, device=self.log_lambdas.device)
+            lam = self.lambdas[idx]
+            renorm = lam.sum()
+            scale = num_active / renorm
+            self.log_lambdas[idx] = torch.where(
+                renorm > 0, (lam * scale).log(), self.log_lambdas[idx],
+            )
 
     def state_dict(self) -> dict:
         return {

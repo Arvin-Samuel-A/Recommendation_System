@@ -28,6 +28,7 @@ from training.local_train import (
 from evaluation.metrics import evaluate_model
 from data.sequence_generator import (
     load_tensorised,
+    load_examples,
     build_dataloader,
     load_or_build_eval_candidates,
     filter_negatives,
@@ -131,7 +132,11 @@ def run_federated(
     with open(os.path.join(processed, "eval_user_history.pkl"), "rb") as f:
         eval_user_history = pickle.load(f)
 
-    val_dataset = load_tensorised(os.path.join(processed, "val_tensorised.pt"), metadata_matrix)
+    # specs/ablation-run FR-7: splits are stored wider than the model; narrow on read.
+    val_dataset = load_tensorised(
+        os.path.join(processed, "val_tensorised.pt"), metadata_matrix,
+        max_seq_length=config.max_seq_length,
+    )
     val_examples = {
         "targets": val_dataset.targets.numpy().tolist(),
         "user_ids": val_dataset.user_ids.numpy().tolist(),
@@ -174,8 +179,9 @@ def run_federated(
             n_round_eval, len(val_dataset),
         )
 
-    with open(os.path.join(processed, "test_examples.pkl"), "rb") as f:
-        test_examples = pickle.load(f)
+    test_examples = load_examples(
+        os.path.join(processed, "test_examples.pkl"), config.max_seq_length,
+    )
     # The client roster is the set of users with test examples -- who participates, not
     # what they train on. REV-004: their LOCAL TRAINING data comes from
     # `config.local_train_source`, never from the test split.
@@ -184,8 +190,9 @@ def run_federated(
     val_examples_raw = None
     user_val_map: Optional[Dict[int, List[int]]] = None
     if config.local_train_source == "val":
-        with open(os.path.join(processed, "val_examples.pkl"), "rb") as f:
-            val_examples_raw = pickle.load(f)
+        val_examples_raw = load_examples(
+            os.path.join(processed, "val_examples.pkl"), config.max_seq_length,
+        )
         user_val_map = {}
         for i, uid in enumerate(val_examples_raw["user_ids"]):
             user_val_map.setdefault(uid, []).append(i)

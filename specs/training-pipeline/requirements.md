@@ -26,7 +26,7 @@ The pretraining loop must correctly orchestrate: masked input preparation, trans
 ## Functional Requirements
 
 ### FR-1: LR Scheduler (Step 14)
-- Linear warmup for first `warmup_ratio` fraction of total steps, then cosine decay to 0
+- Linear warmup for first `warmup_ratio` fraction of total steps, then cosine decay to 0 *(superseded by `ablation-run` FR-5, owner decision 2026-10-15: decay to the floor `min_lr_ratio × learning_rate`, default 10% of peak)*
 - `total_steps = num_batches_per_epoch * pretrain_epochs`
 - Call `scheduler.step()` after every batch (not every epoch)
 - Log current LR at end of each epoch

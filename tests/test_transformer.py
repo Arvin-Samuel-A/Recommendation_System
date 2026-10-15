@@ -114,8 +114,8 @@ class TestAttentionBackendGate:
     backend into a hard failure, as `steering/code-quality.md` requires ("no silent
     fallback"). The gate exists and works; nothing covered it.
 
-    The sanctioned preferred kernel is now SDPA on MPS/CPU and FlashAttention-4 on CUDA
-    (FR-4, design D2b). These tests force `_probe` to fail rather than naming a kernel,
+    The sanctioned preferred kernel is SDPA on MPS/CPU/non-Hopper CUDA and FlashAttention-3
+    on Hopper CUDA (specs/ablation-run FR-2). These tests force `_probe` to fail rather than naming a kernel,
     so they exercise the gate itself and are unaffected by which backend is preferred.
     """
 
@@ -136,7 +136,7 @@ class TestAttentionBackendGate:
         """Without the flag the fallback is permitted -- but never silent: the resolved
         backend and the reason must both be reportable into the run manifest.
 
-        T1.3: the preferred kernel is pinned to FA4 here rather than left to the host.
+        T1.3: the preferred kernel is pinned to FA3 here rather than left to the host.
         MPS and CPU now both PREFER sdpa, so relying on the host's preference would make
         the fallback path unreachable and the test vacuous -- it would assert that no
         fallback happened while claiming to test that one was recorded.
@@ -150,7 +150,7 @@ class TestAttentionBackendGate:
 
         base_config.attention_backend = "auto"
         base_config.require_attention_backend = False
-        monkeypatch.setattr(AttentionBackend, "_preferred_backend", lambda self: "flash_attention_4")
+        monkeypatch.setattr(AttentionBackend, "_preferred_backend", lambda self: "flash_attention_3")
         monkeypatch.setattr(AttentionBackend, "_probe", fail_preferred)
 
         backend = AttentionBackend(base_config)
@@ -158,14 +158,14 @@ class TestAttentionBackendGate:
         assert result["backend"] == "sdpa"
         assert result["requested_backend"] == "auto"
         assert result["fallback_reason"], "the fallback reason must be recorded"
-        assert "flash_attention_4" in result["fallback_reason"], (
+        assert "flash_attention_3" in result["fallback_reason"], (
             "the reason must name the kernel that was substituted for"
         )
 
     def test_explicit_unavailable_backend_raises(self, base_config, monkeypatch):
         from models.transformer import AttentionBackendError
 
-        base_config.attention_backend = "flash_attention_4"
+        base_config.attention_backend = "flash_attention_3"
         base_config.require_attention_backend = False
 
         def always_fails(self, backend):
@@ -196,8 +196,9 @@ class TestNarrowedBackendSurface:
         assert "flex" not in message.split("'flex_attention'")[-1], (
             "the error message still offers flex_attention as a choice"
         )
-        for choice in ("auto", "flash_attention_4", "sdpa"):
+        for choice in ("auto", "flash_attention_3", "sdpa"):
             assert choice in message, f"the message does not name '{choice}'"
+        assert "flash_attention_4" not in message
 
     def test_flex_attention_is_not_a_resolvable_backend(self, base_config):
         """AC-09: not in the enum, and not reachable through the dispatcher."""
@@ -411,178 +412,393 @@ class TestSmoke:
         assert has_grad, "No gradients computed"
 
 
-class TestFlashAttentionVarlen:
-    """REV-081: the FA4 path raised on any padded batch, so CUDA could not train.
+def _reference_varlen(calls=None):
+    """A pure-torch stand-in for FA3's `flash_attn_varlen_func`: per-sequence SDPA."""
+    import torch.nn.functional as F
 
-    `CausalSelfAttention.forward` passes `padding_mask` whenever the batch contains a
-    pad token, and every training batch is left-padded, so the first real batch on the
-    H100 aborted the run (FR-4, AC-03). Padded batches now go through the variable-length
-    API.
+    def flash_attn_varlen_func(
+        q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal=False,
+        **_ignored,
+    ):
+        if calls is not None:
+            calls.append({"causal": causal, "cu_seqlens": cu_seqlens_q.clone(),
+                          "max_seqlen": max_seqlen_q})
+        outs = []
+        for i in range(len(cu_seqlens_q) - 1):
+            start, end = int(cu_seqlens_q[i]), int(cu_seqlens_q[i + 1])
+            qi, ki, vi = (t[start:end].transpose(0, 1).unsqueeze(0) for t in (q, k, v))
+            out = F.scaled_dot_product_attention(qi, ki, vi, is_causal=causal)
+            outs.append(out.squeeze(0).transpose(0, 1))
+        return torch.cat(outs, dim=0)
 
-    The CUDA kernel itself cannot run on this host, so it is replaced with an exact SDPA
-    reference. What that leaves under test is everything this repository owns: the mask
-    convention, the cumulative sequence lengths, the ordering assumption that makes
-    left-padding safe to strip, and the repadding.
+    return flash_attn_varlen_func
+
+
+def install_reference_fa3(monkeypatch, returns_lse=False, calls=None):
+    """Install a reference `flash_attn_interface` into `sys.modules`.
+
+    `returns_lse=True` mimics FA3 builds whose functions return `(out, softmax_lse)`.
     """
+    import sys
+    import types
 
-    @staticmethod
-    def _install_reference_flash_attn(monkeypatch):
+    import torch.nn.functional as F
+
+    varlen = _reference_varlen(calls)
+
+    def flash_attn_func(q, k, v, causal=False, **_ignored):
+        if calls is not None:
+            calls.append({"causal": causal, "dense": True})
+        out = F.scaled_dot_product_attention(
+            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=causal,
+        ).transpose(1, 2)
+        return (out, torch.zeros(1)) if returns_lse else out
+
+    def flash_attn_varlen_func(*args, **kwargs):
+        out = varlen(*args, **kwargs)
+        return (out, torch.zeros(1)) if returns_lse else out
+
+    module = types.ModuleType("flash_attn_interface")
+    module.flash_attn_func = flash_attn_func
+    module.flash_attn_varlen_func = flash_attn_varlen_func
+    monkeypatch.setitem(sys.modules, "flash_attn_interface", module)
+    return module
+
+
+def _left_padded_qkv(lengths, S=8, H=2, D=4, dtype=torch.float32, seed=0):
+    torch.manual_seed(seed)
+    B = len(lengths)
+    q, k, v = (torch.randn(B, H, S, D, dtype=dtype, requires_grad=True) for _ in range(3))
+    padding_mask = torch.zeros(B, S, dtype=torch.bool)
+    for i, length in enumerate(lengths):
+        padding_mask[i, S - length:] = True
+    return q, k, v, padding_mask
+
+
+def _masked_sdpa(q, k, v, padding_mask):
+    """Causal attention with a key-padding mask -- the SDPA semantics FA3 must match."""
+    S = q.shape[2]
+    blocked = ~padding_mask[:, None, None, :] | torch.triu(
+        torch.ones(S, S, dtype=torch.bool), diagonal=1,
+    )
+    return torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=~blocked)
+
+
+def _fa3_backend(dtype=torch.bfloat16):
+    """An `AttentionBackend` on CPU pinned to `flash_attention_3` (built via SDPA)."""
+    cfg = Config()
+    cfg.device = "cpu"
+    cfg.attention_backend = "sdpa"
+    backend = AttentionBackend(cfg)
+    backend.backend_name = "flash_attention_3"
+    backend.dtype = dtype
+    return backend
+
+
+class TestVarlenCore:
+    """specs/ablation-run T4.1 / AC-05: our own unpad -> varlen -> repad, on CPU."""
+
+    def test_roundtrip_keeps_real_positions_and_zeros_pads(self):
+        from models.transformer import repad, unpad, varlen_meta
+
+        S = 8
+        _, _, _, mask = _left_padded_qkv([S, 5, 1], S=S)
+        x = torch.randn(3, S, 2, 4)
+        meta = varlen_meta(mask)
+        back = repad(unpad(x, meta), meta, 3, S)
+        assert torch.equal(back[mask], x[mask])
+        assert torch.count_nonzero(back[~mask]) == 0
+
+    def test_metadata_for_lengths_s_5_1(self):
+        from models.transformer import varlen_meta
+
+        S = 8
+        _, _, _, mask = _left_padded_qkv([S, 5, 1], S=S)
+        meta = varlen_meta(mask)
+        assert meta.cu_seqlens.tolist() == [0, S, S + 5, S + 6]
+        assert meta.cu_seqlens.dtype == torch.int32
+        assert meta.max_seqlen == S
+        assert meta.all_real is False
+        assert meta.indices.numel() == S + 6
+
+    def test_unpadded_mask_is_all_real(self):
+        from models.transformer import varlen_meta
+
+        meta = varlen_meta(torch.ones(3, 8, dtype=torch.bool))
+        assert meta.all_real is True
+        assert meta.max_seqlen == 8
+
+    def test_output_and_gradients_match_masked_sdpa(self):
+        from models.transformer import varlen_attention
+
+        lengths = [8, 5, 1]
+        q, k, v, mask = _left_padded_qkv(lengths)
+        calls = []
+        out = varlen_attention(q, k, v, mask, True, _reference_varlen(calls))
+        ref_q, ref_k, ref_v = (t.detach().clone().requires_grad_(True) for t in (q, k, v))
+        ref = _masked_sdpa(ref_q, ref_k, ref_v, mask)
+
+        real = mask[:, None, :, None].expand_as(out)
+        assert torch.allclose(out[real], ref[real], atol=1e-5)
+        assert torch.count_nonzero(out[~real]) == 0
+
+        # Gradients through real outputs only: pads are never read by a loss.
+        weight = torch.randn_like(out) * real
+        (out * weight).sum().backward()
+        (ref * weight).sum().backward()
+        for got, exp in ((q.grad, ref_q.grad), (k.grad, ref_k.grad), (v.grad, ref_v.grad)):
+            assert torch.allclose(got[real], exp[real], atol=1e-5)
+
+        assert calls and all(c["causal"] is True for c in calls)
+
+    def test_metadata_is_computed_once_per_model_forward(self, monkeypatch):
+        import models.transformer as tm
+
+        install_reference_fa3(monkeypatch)
+        cfg = Config()
+        cfg.device = "cpu"
+        cfg.apply_model_config("t-small")
+        assert cfg.num_layers == 3
+        cfg.num_items, cfg.feature_dim, cfg.use_metadata = 50, 0, False
+        cfg.max_seq_length = 8
+        cfg.attention_backend = "sdpa"
+        model = TransformerModel(cfg)
+        model.backend.backend_name = "flash_attention_3"
+        model.eval()
+
+        counter = {"n": 0}
+        real_meta = tm.varlen_meta
+
+        def counting(mask):
+            counter["n"] += 1
+            return real_meta(mask)
+
+        monkeypatch.setattr(tm, "varlen_meta", counting)
+        seq = torch.tensor([[0, 0, 0, 4, 5, 6, 7, 8], [1, 2, 3, 4, 5, 6, 7, 8]])
+        with torch.no_grad():
+            model(seq)
+        assert counter["n"] == 1, f"varlen_meta ran {counter['n']} times for 3 layers"
+        with torch.no_grad():
+            model(seq)
+        assert counter["n"] == 2, "a new forward (new mask object) must recompute"
+
+
+class TestFlashAttention3Backend:
+    """specs/ablation-run T4.2 / AC-03, AC-04, AC-06 on a host without FA3."""
+
+    @pytest.mark.parametrize("device_type,capability,expected", [
+        ("cuda", (9, 0), "flash_attention_3"),
+        ("cuda", (8, 0), "sdpa"),
+        ("cuda", (8, 9), "sdpa"),
+        ("cuda", (7, 5), "sdpa"),
+        ("mps", None, "sdpa"),
+        ("cpu", None, "sdpa"),
+    ])
+    def test_preferred_backend(self, device_type, capability, expected):
+        from models.transformer import preferred_backend
+
+        assert preferred_backend(device_type, capability) == expected
+
+    def test_valid_backends_are_exactly_three(self):
+        from models.transformer import VALID_BACKENDS
+
+        assert set(VALID_BACKENDS) == {"auto", "flash_attention_3", "sdpa"}
+        assert not any(name.startswith("_flash_attention_4") for name in dir(AttentionBackend))
+
+    @pytest.mark.parametrize("bad", ["flash_attention_4", "flex_attention"])
+    def test_config_rejects_removed_backends_naming_the_three(self, bad):
+        cfg = Config()
+        cfg.attention_backend = bad
+        with pytest.raises(ValueError) as exc:
+            cfg.validate()
+        message = str(exc.value).split("Choose from")[-1]
+        for choice in ("auto", "flash_attention_3", "sdpa"):
+            assert choice in message
+        assert "flash_attention_4" not in message and "flex" not in message
+
+    def _mock_hopper(self, monkeypatch):
         import sys
-        import types
 
-        import torch
-        import torch.nn.functional as F
+        from models.transformer import preferred_backend
 
-        def unpad_input(hidden, attention_mask):
-            batch, seqlen = attention_mask.shape
-            seqlens = attention_mask.sum(dim=1, dtype=torch.int32)
-            indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
-            flat = hidden.reshape(batch * seqlen, *hidden.shape[2:])
-            cu = torch.cat([
-                torch.zeros(1, dtype=torch.int32),
-                seqlens.cumsum(0, dtype=torch.int32),
-            ])
-            return flat[indices], indices, cu, int(seqlens.max()), None
-
-        def pad_input(hidden, indices, batch, seqlen):
-            out = torch.zeros(batch * seqlen, *hidden.shape[1:], dtype=hidden.dtype)
-            out[indices] = hidden
-            return out.reshape(batch, seqlen, *hidden.shape[1:])
-
-        def flash_attn_varlen_func(
-            q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
-            causal=False,
-        ):
-            outs = []
-            for i in range(len(cu_seqlens_q) - 1):
-                start, end = int(cu_seqlens_q[i]), int(cu_seqlens_q[i + 1])
-                qi, ki, vi = (
-                    t[start:end].transpose(0, 1).unsqueeze(0) for t in (q, k, v)
-                )
-                out = F.scaled_dot_product_attention(qi, ki, vi, is_causal=causal)
-                outs.append(out.squeeze(0).transpose(0, 1))
-            return torch.cat(outs, dim=0)
-
-        def flash_attn_func(q, k, v, causal=False):
-            out = F.scaled_dot_product_attention(
-                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
-                is_causal=causal,
-            )
-            return out.transpose(1, 2)
-
-        module = types.ModuleType("flash_attn")
-        module.flash_attn_func = flash_attn_func
-        module.flash_attn_varlen_func = flash_attn_varlen_func
-        bert_padding = types.ModuleType("flash_attn.bert_padding")
-        bert_padding.unpad_input = unpad_input
-        bert_padding.pad_input = pad_input
-        module.bert_padding = bert_padding
-
-        monkeypatch.setitem(sys.modules, "flash_attn", module)
-        monkeypatch.setitem(sys.modules, "flash_attn.bert_padding", bert_padding)
-
-    @staticmethod
-    def _inputs():
-        import torch
-
-        torch.manual_seed(0)
-        b, h, s, d = 3, 2, 8, 4
-        q, k, v = (torch.randn(b, h, s, d) for _ in range(3))
-        # Left-padded rows of differing real lengths, as the data pipeline produces.
-        padding_mask = torch.zeros(b, s, dtype=torch.bool)
-        real_lens = [8, 5, 1]
-        for i, length in enumerate(real_lens):
-            padding_mask[i, s - length:] = True
-        return q, k, v, padding_mask, real_lens, s
-
-    def test_padded_batch_no_longer_raises(self, monkeypatch):
-        from models.transformer import AttentionBackend
-
-        self._install_reference_flash_attn(monkeypatch)
-        q, k, v, padding_mask, _, _ = self._inputs()
-
-        out = AttentionBackend._flash_attention_4(q, k, v, padding_mask, is_causal=True)
-        assert out.shape == q.shape
-
-    def test_varlen_matches_per_row_dense_causal_attention(self, monkeypatch):
-        import torch
-        import torch.nn.functional as F
-
-        from models.transformer import AttentionBackend
-
-        self._install_reference_flash_attn(monkeypatch)
-        q, k, v, padding_mask, real_lens, s = self._inputs()
-
-        got = AttentionBackend._flash_attention_4_varlen(
-            q, k, v, padding_mask, is_causal=True,
+        monkeypatch.setitem(sys.modules, "flash_attn_interface", None)  # FA3 unavailable
+        monkeypatch.setattr(
+            AttentionBackend, "_preferred_backend",
+            lambda self: preferred_backend("cuda", (9, 0)),
         )
 
-        for i, length in enumerate(real_lens):
-            rows = slice(s - length, s)
-            expected = F.scaled_dot_product_attention(
-                q[i:i + 1, :, rows, :], k[i:i + 1, :, rows, :],
-                v[i:i + 1, :, rows, :], is_causal=True,
-            )[0]
-            assert torch.allclose(got[i, :, rows, :], expected, atol=1e-5), (
-                f"row {i} (real length {length}) does not match dense attention"
-            )
-            padded = got[i, :, :s - length, :]
-            if padded.numel():
-                assert padded.abs().max() == 0, f"row {i} wrote into its padding"
+    def test_auto_on_hopper_without_fa3_falls_back_with_a_reason(self, monkeypatch):
+        self._mock_hopper(monkeypatch)
+        cfg = Config()
+        cfg.device = "cpu"
+        cfg.attention_backend = "auto"
+        backend = AttentionBackend(cfg)
+        assert backend.backend_name == "sdpa"
+        assert "flash_attention_3" in backend.fallback_reason
 
-    def test_unpadded_batch_still_uses_the_dense_kernel(self, monkeypatch):
-        import torch
-        import torch.nn.functional as F
+    def test_auto_on_hopper_without_fa3_raises_when_required(self, monkeypatch):
+        from models.transformer import AttentionBackendError
 
-        from models.transformer import AttentionBackend
+        self._mock_hopper(monkeypatch)
+        cfg = Config()
+        cfg.device = "cpu"
+        cfg.attention_backend = "auto"
+        cfg.require_attention_backend = True
+        with pytest.raises(AttentionBackendError, match="flash_attention_3"):
+            AttentionBackend(cfg)
 
-        self._install_reference_flash_attn(monkeypatch)
-        q, k, v, _, _, s = self._inputs()
-        full = torch.ones(q.shape[0], s, dtype=torch.bool)
-
-        got = AttentionBackend._flash_attention_4(q, k, v, full, is_causal=True)
-        expected = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        assert torch.allclose(got, expected, atol=1e-5)
-
-    def test_missing_varlen_api_raises_a_clear_error(self, monkeypatch):
+    def test_explicit_fa3_without_the_package_raises(self, monkeypatch):
         import sys
-        import types
 
-        import torch
+        from models.transformer import AttentionBackendError
 
-        from models.transformer import AttentionBackend, AttentionBackendError
+        monkeypatch.setitem(sys.modules, "flash_attn_interface", None)
+        cfg = Config()
+        cfg.device = "cpu"
+        cfg.attention_backend = "flash_attention_3"
+        with pytest.raises(AttentionBackendError, match="flash_attn_interface"):
+            AttentionBackend(cfg)
 
-        # A flash-attn build without the variable-length API must say so, not fail
-        # obscurely deep in the call.
-        module = types.ModuleType("flash_attn")
-        module.flash_attn_func = lambda *a, **k: None
-        monkeypatch.setitem(sys.modules, "flash_attn", module)
-        monkeypatch.setitem(sys.modules, "flash_attn.bert_padding", None)
+    def test_import_and_sdpa_build_need_no_fa3(self):
+        """AC-04, in a fresh interpreter so the module import itself is exercised."""
+        import subprocess
+        import sys
 
-        q, k, v, padding_mask, _, _ = self._inputs()
-        with pytest.raises(AttentionBackendError, match="variable-length"):
-            AttentionBackend._flash_attention_4_varlen(
-                q, k, v, padding_mask, is_causal=True,
-            )
+        code = (
+            "import sys; sys.modules['flash_attn_interface'] = None\n"
+            "import models.transformer as tm\n"
+            "from configs.config import Config\n"
+            "c = Config(); c.device = 'cpu'; c.attention_backend = 'sdpa'\n"
+            "c.num_items = 20; c.use_metadata = False; c.apply_model_config('t-small')\n"
+            "m = tm.TransformerModel(c)\n"
+            "assert m.backend.backend_name == 'sdpa'\n"
+            "assert 'flash_attn_interface' not in [k for k, v in sys.modules.items() if v]\n"
+            "print('ok')\n"
+        )
+        out = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True, timeout=120,
+        )
+        assert out.returncode == 0, out.stderr[-2000:]
+        assert out.stdout.strip().endswith("ok")
+
+    @pytest.mark.parametrize("returns_lse", [False, True])
+    def test_padded_batch_matches_masked_sdpa(self, monkeypatch, returns_lse):
+        install_reference_fa3(monkeypatch, returns_lse=returns_lse)
+        backend = _fa3_backend()
+        q, k, v, mask = _left_padded_qkv([8, 5, 1], dtype=torch.bfloat16)
+        out = backend.forward(q, k, v, padding_mask=mask, is_causal=True)
+        ref = _masked_sdpa(q.float(), k.float(), v.float(), mask)
+        real = mask[:, None, :, None].expand_as(out)
+        assert torch.allclose(out.float()[real], ref[real], atol=2e-2)
+        assert torch.count_nonzero(out[~real]) == 0
+
+    @pytest.mark.parametrize("returns_lse", [False, True])
+    def test_unpadded_batch_takes_the_dense_call(self, monkeypatch, returns_lse):
+        calls = []
+        install_reference_fa3(monkeypatch, returns_lse=returns_lse, calls=calls)
+        backend = _fa3_backend()
+        q, k, v, mask = _left_padded_qkv([8, 8], dtype=torch.bfloat16)
+        assert mask.all()
+        out = backend.forward(q, k, v, padding_mask=mask, is_causal=True)
+        ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
+        assert torch.allclose(out.float(), ref.float(), atol=2e-2)
+        assert [c.get("dense") for c in calls] == [True]
+
+    def test_length_one_and_full_rows_take_the_varlen_call(self, monkeypatch):
+        calls = []
+        install_reference_fa3(monkeypatch, calls=calls)
+        backend = _fa3_backend()
+        q, k, v, mask = _left_padded_qkv([1, 8], dtype=torch.bfloat16)
+        backend.forward(q, k, v, padding_mask=mask, is_causal=True)
+        assert len(calls) == 1 and "dense" not in calls[0]
+        assert calls[0]["cu_seqlens"].tolist() == [0, 1, 9]
+
+    def test_fp32_input_raises_naming_the_dtype(self, monkeypatch):
+        from models.transformer import AttentionBackendError
+
+        install_reference_fa3(monkeypatch)
+        backend = _fa3_backend(dtype=torch.float32)
+        q, k, v, mask = _left_padded_qkv([8, 5], dtype=torch.float32)
+        with pytest.raises(AttentionBackendError, match="float32"):
+            backend.forward(q, k, v, padding_mask=mask, is_causal=True)
+
+    def test_probe_uses_the_model_head_dimension(self, monkeypatch):
+        cfg = Config()
+        cfg.device = "cpu"
+        cfg.apply_model_config("t-base")
+        backend = AttentionBackend(cfg)
+        seen = []
+        original = backend._dispatch
+
+        def spy(name, q, k, v, padding_mask, is_causal):
+            seen.append(q.shape[-1])
+            return original(name, q, k, v, padding_mask, is_causal)
+
+        backend._dispatch = spy
+        ok, reason = backend._probe("sdpa")
+        assert ok, reason
+        assert seen and set(seen) == {80}
+
+
+def _hopper_with_fa3() -> bool:
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9:
+        return False
+    try:
+        import flash_attn_interface  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+@pytest.mark.skipif(
+    not _hopper_with_fa3(),
+    reason="real FlashAttention-3 kernel test: needs CUDA capability 9.x and flash_attn_interface",
+)
+class TestRealFlashAttention3Kernel:
+    """AC-07 (target machine): the real kernel matches SDPA on a left-padded batch."""
+
+    def test_left_padded_parity_against_sdpa(self):
+        cfg = Config()
+        cfg.device = "cuda"
+        cfg.attention_backend = "flash_attention_3"
+        backend = AttentionBackend(cfg)
+        assert backend.backend_name == "flash_attention_3"
+        torch.manual_seed(0)
+        B, H, S, D = 3, 4, 50, 80
+        q, k, v = (
+            torch.randn(B, H, S, D, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+            for _ in range(3)
+        )
+        mask = torch.zeros(B, S, dtype=torch.bool, device="cuda")
+        for i, length in enumerate([S, 25, 1]):
+            mask[i, S - length:] = True
+        out = backend.forward(q, k, v, padding_mask=mask, is_causal=True)
+        blocked = ~mask[:, None, None, :] | torch.triu(
+            torch.ones(S, S, dtype=torch.bool, device="cuda"), diagonal=1,
+        )
+        ref = torch.nn.functional.scaled_dot_product_attention(
+            q.float(), k.float(), v.float(), attn_mask=~blocked,
+        )
+        real = mask[:, None, :, None].expand_as(out)
+        assert torch.allclose(out.float()[real], ref[real], atol=2e-2, rtol=2e-2)
 
 
 class TestCausalIntentReachesEveryBackend:
     """REV-122: causality must survive the trip from the layer to whichever kernel runs.
 
     `CausalSelfAttention.forward` used to hardcode `is_causal=False` on the padded branch
-    and encode causality in an additive mask instead. SDPA reads that mask, so MPS was
-    correct; the FA4 branch discards it and takes causality only from the flag, so on CUDA
+    and encode causality in an additive mask instead. SDPA reads that mask; the
+    FlashAttention branch discards it and takes causality only from the flag, so on CUDA
     every left-padded batch -- i.e. every training batch -- attended BIDIRECTIONALLY.
 
-    These tests go through `CausalSelfAttention.forward`, which is the whole point. The
-    four `TestFlashAttentionVarlen` tests call the private helpers directly with
-    `is_causal=True`, so none of them could fail on this defect; that is why it survived
-    two reviews.
+    These tests go through `CausalSelfAttention.forward`, which is the whole point.
+    The FlashAttention-3 kernel is replaced by a pure-torch reference
+    (`install_reference_fa3`); FA3 takes bf16 only, so that branch runs in bf16.
     """
 
     @staticmethod
-    def _backend(backend_name, monkeypatch=None):
-        """An `AttentionBackend` pinned to `backend_name`, on cpu in fp32.
+    def _backend(backend_name, dtype):
+        """An `AttentionBackend` pinned to `backend_name`, on cpu.
 
         Construction probes `sdpa` (which runs here), then the name is overridden so
         `_dispatch` routes to the branch under test.
@@ -592,40 +808,38 @@ class TestCausalIntentReachesEveryBackend:
         cfg.attention_backend = "sdpa"
         backend = AttentionBackend(cfg)
         backend.backend_name = backend_name
-        backend.dtype = torch.float32
+        backend.dtype = dtype
         return backend
 
     @staticmethod
-    def _attention(backend, D=8, H=2):
+    def _attention(backend, dtype, D=8, H=2):
         from models.transformer import CausalSelfAttention
 
         torch.manual_seed(0)
-        attn = CausalSelfAttention(D, H, 0.0, backend).to(dtype=torch.float32)
+        attn = CausalSelfAttention(D, H, 0.0, backend).to(dtype=dtype)
         attn.eval()
         return attn
 
     @staticmethod
-    def _left_padded_input(B=1, S=8, D=8, n_pad=3):
+    def _left_padded_input(dtype, B=1, S=8, D=8, n_pad=3):
         torch.manual_seed(1)
-        x = torch.randn(B, S, D, dtype=torch.float32)
+        x = torch.randn(B, S, D, dtype=torch.float32).to(dtype)
         x[:, :n_pad, :] = 0.0
         padding_mask = torch.ones(B, S, dtype=torch.bool)
         padding_mask[:, :n_pad] = False
         return x, padding_mask, n_pad
 
-    @pytest.mark.parametrize("backend_name", ["sdpa", "flash_attention_4"])
-    def test_future_token_cannot_reach_earlier_positions(self, backend_name, monkeypatch):
-        """Perturbing position S-1 must leave every earlier position bit-identical.
+    @pytest.mark.parametrize("backend_name,dtype", [
+        ("sdpa", torch.float32), ("flash_attention_3", torch.bfloat16),
+    ])
+    def test_future_token_cannot_reach_earlier_positions(self, backend_name, dtype, monkeypatch):
+        """Perturbing position S-1 must leave every earlier position bit-identical."""
+        if backend_name == "flash_attention_3":
+            install_reference_fa3(monkeypatch)
 
-        This is the exact probe that measured the defect: under the old code the FA4
-        branch shifted real positions 3-6 by ~0.13 when only position 7 changed.
-        """
-        if backend_name == "flash_attention_4":
-            TestFlashAttentionVarlen._install_reference_flash_attn(monkeypatch)
-
-        backend = self._backend(backend_name)
-        attn = self._attention(backend)
-        x, padding_mask, n_pad = self._left_padded_input()
+        backend = self._backend(backend_name, dtype)
+        attn = self._attention(backend, dtype)
+        x, padding_mask, n_pad = self._left_padded_input(dtype)
         S = x.shape[1]
 
         with torch.no_grad():
@@ -634,61 +848,37 @@ class TestCausalIntentReachesEveryBackend:
             perturbed_in[:, S - 1, :] += 1.0
             perturbed = attn(perturbed_in, padding_mask)
 
-        delta = (perturbed - base).abs().amax(dim=-1)[0]
+        delta = (perturbed.float() - base.float()).abs().amax(dim=-1)[0]
         for pos in range(n_pad, S - 1):
             assert delta[pos].item() == 0.0, (
                 f"[{backend_name}] position {pos} moved by {delta[pos].item():.6f} when "
                 f"only position {S - 1} changed -- attention is not causal"
             )
-        # Non-vacuity: the perturbed position itself must actually move, otherwise the
-        # assertions above would hold for a layer that ignores its input entirely.
+        # Non-vacuity: the perturbed position itself must actually move.
         assert delta[S - 1].item() > 0.0
 
     def test_flash_attention_kernel_receives_causal_true_on_padded_batches(self, monkeypatch):
-        """The flag itself, not only its effect: FA4 takes causality ONLY from here."""
-        import sys
-        import types
+        """The flag itself, not only its effect: FA3 takes causality ONLY from here."""
+        calls = []
+        install_reference_fa3(monkeypatch, calls=calls)
 
-        import torch.nn.functional as F
-
-        TestFlashAttentionVarlen._install_reference_flash_attn(monkeypatch)
-        seen = []
-
-        flash_attn = sys.modules["flash_attn"]
-        real_varlen = flash_attn.flash_attn_varlen_func
-        real_dense = flash_attn.flash_attn_func
-
-        def spy_varlen(*args, causal=False, **kwargs):
-            seen.append(causal)
-            return real_varlen(*args, causal=causal, **kwargs)
-
-        def spy_dense(q, k, v, causal=False):
-            seen.append(causal)
-            return real_dense(q, k, v, causal=causal)
-
-        monkeypatch.setattr(flash_attn, "flash_attn_varlen_func", spy_varlen)
-        monkeypatch.setattr(flash_attn, "flash_attn_func", spy_dense)
-
-        backend = self._backend("flash_attention_4")
-        attn = self._attention(backend)
-        x, padding_mask, _ = self._left_padded_input()
+        backend = self._backend("flash_attention_3", torch.bfloat16)
+        attn = self._attention(backend, torch.bfloat16)
+        x, padding_mask, _ = self._left_padded_input(torch.bfloat16)
 
         with torch.no_grad():
             attn(x, padding_mask)          # padded -> varlen
             attn(x, None)                  # unpadded -> dense
 
-        assert seen, "the stubbed FlashAttention kernel was never reached"
-        assert all(seen), (
-            f"FlashAttention received causal={seen}; every call from CausalSelfAttention "
+        assert len(calls) == 2, "the stubbed FlashAttention-3 kernel was not reached twice"
+        assert [c.get("dense", False) for c in calls] == [False, True]
+        assert all(c["causal"] is True for c in calls), (
+            f"FlashAttention-3 received {calls}; every call from CausalSelfAttention "
             f"must be causal. `causal=False` here is silent label leakage on CUDA."
         )
 
     def test_probe_covers_the_padded_branch(self, base_config):
-        """REV-122: the startup gate must exercise the branch training actually takes.
-
-        `_probe` previously attended an unpadded input only, so the H100 self-test would
-        have passed while training ran non-causally.
-        """
+        """REV-122: the startup gate must exercise the branch training actually takes."""
         backend = AttentionBackend(base_config)
         seen = []
         original = backend._dispatch
@@ -705,3 +895,22 @@ class TestCausalIntentReachesEveryBackend:
         padded = [m for m in seen if m is not None]
         assert padded, "probe never exercised the PADDED branch"
         assert not padded[0].all(), "probe's 'padded' mask has no padded positions"
+
+
+class TestPositionGuard:
+    """specs/ablation-run T2.4 / AC-18: a model never sees more positions than it has."""
+
+    def test_wider_input_raises_naming_both_widths(self, base_config):
+        model = TransformerModel(base_config)
+        S = base_config.max_seq_length
+        seq = torch.ones(2, S + 1, dtype=torch.long, device=get_device(base_config))
+        with pytest.raises(ValueError) as exc:
+            model(seq)
+        assert str(S + 1) in str(exc.value)
+        assert f"max_seq_length={S}" in str(exc.value)
+
+    def test_model_width_input_still_runs(self, base_config):
+        model = TransformerModel(base_config)
+        S = base_config.max_seq_length
+        seq = torch.ones(2, S, dtype=torch.long, device=get_device(base_config))
+        assert model(seq).shape == (2, base_config.hidden_dim)

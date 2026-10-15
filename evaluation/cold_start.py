@@ -13,7 +13,7 @@ from evaluation.metrics import (
     compute_metrics, compute_metrics_batch, aggregate_metrics,
 )
 from data.sequence_generator import (
-    align_metadata_matrix, load_or_build_eval_candidates,
+    align_metadata_matrix, load_or_build_eval_candidates, load_examples,
 )
 from utils import get_device
 
@@ -61,8 +61,10 @@ def run_cold_start_evaluation(
 
     neg_pool = np.load(os.path.join(processed, "global_negative_pool.npy"))
 
-    with open(os.path.join(processed, "test_examples.pkl"), "rb") as f:
-        test_examples = pickle.load(f)
+    # specs/ablation-run FR-7: splits are stored wider than the model; narrow on read.
+    test_examples = load_examples(
+        os.path.join(processed, "test_examples.pkl"), config.max_seq_length,
+    )
 
     # REV-001: the metadata ON/OFF arms were the same call -- neither passed `metadata=`
     # and nothing toggled it -- so the two score tensors were identical by construction

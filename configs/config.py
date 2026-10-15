@@ -23,6 +23,12 @@ class Config:
     # --- Preprocessing ---
     implicit_threshold: float = 4.0
     min_interactions: int = 5
+    # specs/ablation-run FR-6 (owner decision 5): keep a seeded random fraction of the
+    # USERS that survive the rating/min-interactions filters (full histories). 1.0 = no
+    # sampling. `user_sample_seed` is independent of the training `seed`, so re-seeding
+    # training never changes which users are in the dataset.
+    user_sample_fraction: float = 1.0
+    user_sample_seed: int = 42
     train_ratio: float = 0.80
     val_ratio: float = 0.10
     # NOTE: `cold_start_ratio` applies ONLY to "first_appearance_rank" and
@@ -112,6 +118,12 @@ class Config:
     weight_decay: float = 0.01
     warmup_ratio: float = 0.1
     max_grad_norm: float = 1.0
+    # specs/ablation-run FR-5 (owner decision 4): after warmup the cosine decays to this
+    # fraction of the peak LR instead of 0. 0.0 reproduces the previous schedule exactly.
+    min_lr_ratio: float = 0.1
+    # specs/ablation-run FR-8: `run_pretrain` resumes from `last.pt` when it exists.
+    # `--no_resume` turns it off (also disables reuse of persisted ablation arms, FR-11).
+    resume_training: bool = True
 
     # --- LoRA / personalization ---
     # REV-070: `use_lora` and `use_federated` were added for REV-018 but REV-018 was
@@ -327,11 +339,22 @@ class Config:
         # T1.3 / AC-09: `flex_attention` is NOT a sanctioned value. It has no backward
         # pass on MPS in the pinned PyTorch build, so it can never satisfy the training
         # gates on the dev host; a selectable backend that provably cannot train is a
-        # trap (FR-4 rationale, design D2b). The message names only supported choices.
-        if self.attention_backend not in ("auto", "flash_attention_4", "sdpa"):
+        # trap (FR-4 rationale, design D2b). specs/ablation-run FR-2: FlashAttention-3
+        # replaces the misnamed FA4 backend (which called the FA2 API). The message names
+        # only the supported choices.
+        if self.attention_backend not in ("auto", "flash_attention_3", "sdpa"):
             raise ValueError(
                 f"Unknown attention_backend '{self.attention_backend}'. "
-                "Choose from 'auto', 'flash_attention_4', 'sdpa'"
+                "Choose from 'auto', 'flash_attention_3', 'sdpa'"
+            )
+        # specs/ablation-run FR-5 / FR-6.
+        if not 0.0 <= self.min_lr_ratio <= 1.0:
+            raise ValueError(
+                f"min_lr_ratio must be in [0, 1], got {self.min_lr_ratio}"
+            )
+        if not 0.0 < self.user_sample_fraction <= 1.0:
+            raise ValueError(
+                f"user_sample_fraction must be in (0, 1], got {self.user_sample_fraction}"
             )
         if not 0.0 < self.cold_start_ratio < 1.0:
             raise ValueError(

@@ -80,7 +80,7 @@ The canonical implementation sequence. Each step maps to specific spec tasks and
 
 | # | Step | Spec Tasks | Produces |
 |---|---|---|---|
-| 4.1 | Attention backend wrapper + self-test | `transformer-backbone T1.1, T1.3, T1.4` | `AttentionBackend` with SDPA/FA4 |
+| 4.1 | Attention backend wrapper + self-test | `transformer-backbone T1.1, T1.3, T1.4` | `AttentionBackend` with SDPA/FA3 (FA4 renamed to FA3 by `ablation-run T4.2`) |
 | 4.2 | Test attention backends | `transformer-backbone T1.2` | Causal + padding mask verified |
 | 4.3 | Embedding layer (item + position + tied output) | `transformer-backbone T2.1` | Embedding modules |
 | 4.4 | Metadata projection | `transformer-backbone T2.2` | Optional linear projection |
@@ -223,15 +223,19 @@ The canonical implementation sequence. Each step maps to specific spec tasks and
 
 ---
 
-## Phase 13 — H100 Validation (if on CUDA)
+## Phase 13 — Target-GPU Validation (if on CUDA)
+
+> **Owner decision (2026-10-15):** FlashAttention-4 is replaced by FlashAttention-3 on Hopper; other
+> CUDA GPUs run SDPA. See `specs/ablation-run` FR-2/FR-3 and `steering/code-quality.md`.
 
 | # | Step | Spec Tasks | Produces |
 |---|---|---|---|
-| 13.1 | H100 environment + FlashAttention-4 self-test | `transformer-backbone T1.1` (CUDA path) | FA4 startup validation |
+| 13.1 | Hopper: install FA3 + self-test + parity vs SDPA | `ablation-run T4.4, T4.5` (run on the H100) | `logs/verify_fa3.json` with `passed: true` |
+| 13.2 | Non-Hopper CUDA: SDPA self-test + parity | `ablation-run T4.4` (`--backend sdpa`) | verification report |
 
 ```
-🧪 GATE: H100 FlashAttention-4 self-test passes
-⛔ BLOCKED: No H100 training until this gate passes
+🧪 GATE: scripts/verify_attention_backend.py passes for the backend the machine will train with
+⛔ BLOCKED: No training on that machine until this gate passes
 ```
 
 ---
@@ -339,6 +343,35 @@ The canonical implementation sequence. Each step maps to specific spec tasks and
 
 ---
 
+## Phase 23 — Ablation Run Readiness (10% users, t-base, one seed, mixed bf16)
+
+Spec: `specs/ablation-run/`. Prerequisites: Phases 0–20 implemented (they are). This phase makes
+the code, tooling and launch artifacts for the two-machine ablation run; the run itself (Phase 14
+training + Phase 19 studies on the target machines) is started by the owner from the generated
+`LAUNCH.md` once every gate below has passed. **BUILD runs targeted test files only (never the full
+suite) and only capped runs on the Mac** — see `specs/ablation-run/tasks.md` "Rules for BUILD".
+
+| # | Step | Spec Tasks | Produces |
+|---|---|---|---|
+| 23.1 | Tiny synthetic dataset fixture | `ablation-run T0.1` | `tests/conftest.py` |
+| 23.2 | Config fields, CLI flags, fingerprint hygiene | `ablation-run T1.1–T1.3` | `min_lr_ratio`, `user_sample_*`, `resume_training`; derived processed dir |
+| 23.3 | User sampling, wide storage, narrowing everywhere, width/position/manifest guards | `ablation-run T2.1–T2.5` | `data/processed_users{pct}pct`, `stored_seq_length` |
+| 23.4 | Cosine LR floor, then golden characterisation test | `ablation-run T3.1–T3.2` | floor at 10% of peak; golden constants |
+| 23.5 | FlashAttention-3 backend, runtime record, verify + install scripts | `ablation-run T4.1–T4.5` | `flash_attention_3`; `scripts/verify_attention_backend.py`, `install_fa3.sh` |
+| 23.6 | Bit-identical utilisation levers | `ablation-run T5.1–T5.2` | workers + pinned memory, CPU-side negatives, fewer syncs |
+| 23.7 | Exact epoch-granular resume | `ablation-run T6.1–T6.2` | `last.pt`, atomic checkpoints |
+| 23.8 | OOM exit 75 + retry launcher, store lock, arm persistence | `ablation-run T7.1–T7.4` | `scripts/run_with_retry.py`, `ablations/seed_{seed}/` |
+| 23.9 | Packaging + README runbook | `ablation-run T8.1–T8.2` | `scripts/package_ablation_run.py`, `dist/` |
+| 23.10 | Mac verification | `ablation-run T9.1–T9.2` | targeted test sweep; capped real-data smoke incl. kill/resume |
+
+```
+🧪 GATE: test_determinism.py golden test green from T3.2 through T6.2 (training unchanged by FR-4/FR-8)
+🧪 GATE: T9.1 targeted sweep green; T9.2 capped smoke shows resume after kill -9 and arm reuse
+⛔ BLOCKED: no launch on the H100 until Phase 13.1 (FA3 verification) passes there — run_h100.sh enforces it
+```
+
+---
+
 ## Summary
 
 | Phase | Description | Test Gate |
@@ -356,7 +389,7 @@ The canonical implementation sequence. Each step maps to specific spec tasks and
 | 10 | Evaluation metrics | Metric toy tests |
 | 11 | **End-to-end smoke tests** | **One-batch + few-step T-Small on real data** |
 | 12 | Training pipeline | Checkpoint roundtrip |
-| 13 | H100 validation (if CUDA) | FA4 self-test |
+| 13 | Target-GPU validation (if CUDA) | FA3 (Hopper) / SDPA self-test + parity |
 | 14 | Full central pretraining | Val NDCG improving |
 | 15 | Local personalization | 1000-user evaluation complete |
 | 16 | Federated simulation | Convergence + checksum verified |
@@ -366,6 +399,7 @@ The canonical implementation sequence. Each step maps to specific spec tasks and
 | 20 | CLI integration | All stages dispatchable |
 | 21 | Multi-seed final runs | 3 independent seeds aggregated |
 | 22 | Final plots + deliverables | All outputs present |
+| 23 | Ablation run readiness (`ablation-run`) | Golden test green throughout; targeted sweep; capped smoke with resume |
 
 **Critical blocking gate:** Phase 11 (end-to-end smoke tests). Full MovieLens-20M training is **forbidden** until both the one-batch and few-step T-Small smoke tests pass.
 

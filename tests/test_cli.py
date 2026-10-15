@@ -1142,3 +1142,121 @@ class TestBackboneStore:
             str(tmp_path / "out"), "seed_123", "checkpoints", "t_base", "best.pt",
         )
         assert results[0]["shared_backbone_with"] == "multi_seed_123"
+
+
+class TestAblationRunConfig:
+    """specs/ablation-run T1.1: new config fields, their defaults and validation."""
+
+    def test_new_field_defaults(self):
+        cfg = Config()
+        assert cfg.min_lr_ratio == 0.1
+        assert cfg.user_sample_fraction == 1.0
+        assert cfg.user_sample_seed == 42
+        assert cfg.resume_training is True
+
+    def test_project_default_precision_is_unchanged(self):
+        # AC-01 (default half): the ablation commands pass mixed bf16; the default stays.
+        cfg = Config()
+        assert cfg.dtype == "bf16"
+        assert cfg.mixed_precision is False
+
+    @pytest.mark.parametrize("field,value", [
+        ("min_lr_ratio", -0.1),
+        ("min_lr_ratio", 1.1),
+        ("user_sample_fraction", 0.0),
+        ("user_sample_fraction", 1.5),
+    ])
+    def test_out_of_range_values_are_rejected(self, field, value):
+        cfg = Config()
+        setattr(cfg, field, value)
+        with pytest.raises(ValueError, match=field):
+            cfg.validate()
+
+    @pytest.mark.parametrize("field,value", [
+        ("min_lr_ratio", 0.0), ("min_lr_ratio", 1.0), ("user_sample_fraction", 1.0),
+        ("user_sample_fraction", 0.1),
+    ])
+    def test_boundary_values_are_accepted(self, field, value):
+        cfg = Config()
+        setattr(cfg, field, value)
+        cfg.validate()
+
+
+class TestAblationRunCLI:
+    """specs/ablation-run T1.2: CLI flags, override logging, derived processed dir."""
+
+    FLAGS = [
+        "--user_sample_fraction", "0.5", "--user_sample_seed", "7",
+        "--sequence_length_grid", "25", "50", "--attention_backend", "sdpa",
+        "--num_workers", "3", "--min_lr_ratio", "0.2", "--no_resume",
+    ]
+    EXPECTED = {
+        "user_sample_fraction": 0.5,
+        "user_sample_seed": 7,
+        "sequence_length_grid": [25, 50],
+        "attention_backend": "sdpa",
+        "num_workers": 3,
+        "min_lr_ratio": 0.2,
+        "resume_training": False,
+        "processed_data_dir": "data/processed_users50pct_seed7",
+    }
+
+    def test_each_flag_is_applied_and_logged(self, caplog):
+        import logging
+
+        cfg = Config()
+        with caplog.at_level(logging.INFO, logger="main"):
+            apply_cli_overrides(cfg, parse_args(["--stage", "pretrain"] + self.FLAGS))
+        default = Config()
+        for field, value in self.EXPECTED.items():
+            assert getattr(cfg, field) == value, field
+            assert (
+                f"CLI override: {field} {getattr(default, field)} -> {value}" in caplog.text
+            ), field
+
+    def test_absent_flags_leave_the_config_untouched(self):
+        from dataclasses import asdict
+
+        cfg = Config()
+        apply_cli_overrides(cfg, parse_args(["--stage", "pretrain"]))
+        assert asdict(cfg) == asdict(Config())
+
+    def test_fraction_and_seed_name_the_directory(self):
+        cfg = Config()
+        apply_cli_overrides(cfg, parse_args([
+            "--stage", "preprocess", "--user_sample_fraction", "0.25",
+            "--user_sample_seed", "7",
+        ]))
+        assert cfg.processed_data_dir == "data/processed_users25pct_seed7"
+
+    def test_default_seed_has_no_suffix(self):
+        from main import derive_processed_dir
+
+        cfg = Config()
+        cfg.user_sample_fraction = 0.1
+        assert derive_processed_dir(cfg) == "data/processed_users10pct"
+        cfg.user_sample_fraction = 1.0
+        assert derive_processed_dir(cfg) is None
+
+    def test_explicit_processed_dir_is_never_rewritten(self):
+        cfg = Config()
+        cfg.processed_data_dir = "/somewhere/else"
+        apply_cli_overrides(cfg, parse_args([
+            "--stage", "preprocess", "--user_sample_fraction", "0.1",
+        ]))
+        assert cfg.processed_data_dir == "/somewhere/else"
+
+    def test_no_resume_turns_resume_off(self):
+        cfg = Config()
+        apply_cli_overrides(cfg, parse_args(["--stage", "pretrain", "--no_resume"]))
+        assert cfg.resume_training is False
+
+    def test_backend_choices_come_from_the_model_module(self):
+        from models.transformer import VALID_BACKENDS
+
+        with pytest.raises(SystemExit):
+            parse_args(["--stage", "pretrain", "--attention_backend", "flex_attention"])
+        for backend in VALID_BACKENDS:
+            assert parse_args(
+                ["--stage", "pretrain", "--attention_backend", backend]
+            ).attention_backend == backend

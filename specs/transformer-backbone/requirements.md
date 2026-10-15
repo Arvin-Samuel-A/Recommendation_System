@@ -46,6 +46,12 @@ The backbone must produce both pooled representations (for next-item prediction 
 - Validate `hidden_dim % heads == 0`
 
 ### FR-4: Attention Backends
+
+> **Superseded in part by `specs/ablation-run` FR-2 (owner decision 2026-10-15).** `flash_attention_4`
+> (which called the FA2 `flash_attn` API) is replaced by `flash_attention_3` (`flash_attn_interface`) on
+> Hopper (capability 9.x); non-Hopper CUDA resolves to `sdpa`. Read "FlashAttention-4" below as
+> "FlashAttention-3 on Hopper". Everything else in this FR stands.
+
 - Sanctioned backends are exactly two: `sdpa` and `flash_attention_4`. `flex_attention` must not be accepted as a configuration value.
 - MPS/CPU → SDPA (`torch.nn.functional.scaled_dot_product_attention`) — this is the sanctioned local/dev training kernel, not a degraded fallback
 - CUDA/H100 → FlashAttention-4 (compatible package)
@@ -111,7 +117,7 @@ trains on MPS. The H100 path is unchanged.
 
 - **AC-01:** T-Small/T-Base/T-Large produce correct output shapes for both `return_all_hidden` modes
 - **AC-02:** SDPA self-test (forward + backward) passes on MPS before MPS training, and `attention_backend="auto"` on MPS resolves to `sdpa` with no fallback reason recorded
-- **AC-03:** FlashAttention-4 self-test passes on H100 before CUDA training
+- **AC-03:** FlashAttention-4 self-test passes on H100 before CUDA training *(superseded by `ablation-run` AC-07/AC-08: FlashAttention-3 self-test and parity pass on Hopper before training there)*
 - **AC-04:** Causal mask prevents future attention; padding positions contribute nothing
 - **AC-05:** Item embedding weight is the same object used as output projection (tied weights verified by identity)
 - **AC-06:** With `use_metadata=True`, metadata projection adds to input; with `False`, output is identical regardless of metadata tensor

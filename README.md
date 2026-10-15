@@ -60,7 +60,7 @@ User interaction sequence
 ┌─────────────────────────────────────┐
 │  Transformer Backbone (Pre-LN)      │
 │  Causal Self-Attention (BF16)       │
-│  SDPA (MPS) or FA4 (H100)           │
+│  SDPA (MPS/CPU/L4) or FA3 (Hopper)  │
 │  3–5 layers depending on variant    │
 └──────────────┬──────────────────────┘
                │
@@ -152,7 +152,7 @@ project_root/
 ### Prerequisites
 
 - Python 3.10+
-- Apple Silicon Mac (for development/smoke testing) or NVIDIA H100 (for final experiments)
+- Apple Silicon Mac (for development/smoke testing); NVIDIA Hopper (H100) or other CUDA GPUs for experiments
 - Kaggle account with API credentials configured (`~/.kaggle/kaggle.json`)
 
 ### Installation
@@ -180,9 +180,11 @@ chmod 600 ~/.kaggle/kaggle.json
 
 The dataset is downloaded automatically on first run. Subsequent runs reuse the cached copy.
 
-### FlashAttention-4 (H100 only)
+### FlashAttention-3 (Hopper GPUs only)
 
-For final H100 experiments, install the FlashAttention-4 package compatible with your PyTorch and CUDA versions. This is not required for Mac development.
+**Owner decision 2026-10-15:** Hopper GPUs (H100, compute capability 9.x) use FlashAttention-3 (`flash_attn_interface`, built from the `hopper/` directory of the flash-attention repository). Every other device — Apple Silicon (MPS), CPU and non-Hopper CUDA GPUs such as the AWS L4 — uses PyTorch SDPA. The former `flash_attention_4` backend has been removed: despite its name it called the FlashAttention-2 `flash_attn` API.
+
+FA3 is optional and machine-local: it is never in `requirements.txt` and nothing on the Mac imports it. Building it on the H100 (torch 2.14.1+cu130, CUDA 13, Python 3.12, no git) is scripted by the `ablation-run` spec (`specs/ablation-run/`): the flash-attention source travels as a tarball made on the Mac (`scripts/fetch_fa3_source.sh`), is built on the H100 by `scripts/install_fa3.sh`, and is verified with `scripts/verify_attention_backend.py --backend flash_attention_3` (self-test plus output/gradient parity against SDPA; exit 0 pass, 1 parity failure, 2 unavailable). `install_fa3.sh` exits 0 when FA3 is built (or already installed) and verified, 1 on a parity failure, 2 when a preflight check fails or FA3 is still unavailable, and 3 when extraction or the `hopper/` build fails (log: `logs/fa3_build.log`). See [Ablation run (10% users)](#ablation-run-10-users) for the commands.
 
 ---
 
@@ -262,8 +264,59 @@ Each ablation is config-driven — no source code edits required.
 | `--use_gradnorm` | flag | Force GradNorm on |
 | `--no_gradnorm` | flag | Force GradNorm off |
 | `--study` | `A`–`H`, `all` | Ablation study to run (with `--stage ablation`) |
+| `--no_train` | flag | Ablations only: evaluate existing backbones, skip arms without one |
+| `--seed` | integer | Training seed |
+| `--dtype` | `bf16`, `fp16` | Compute dtype (`fp16` requires `--mixed_precision`) |
+| `--mixed_precision` | flag | fp32 master weights + autocast in `--dtype`; experiment runs use `--dtype bf16 --mixed_precision` |
+| `--max_steps` | integer | Cap optimizer steps per epoch (0 = uncapped) |
+| `--eval_users`, `--clients_per_round`, `--local_epochs` | integer | Personalization / federated overrides |
+| `--user_sample_fraction` | float in (0, 1] | Keep a seeded random fraction of users; below 1 the processed dir becomes `data/processed_users{pct}pct` |
+| `--user_sample_seed` | integer | Seed of the user sample (independent of `--seed`; non-default adds `_seed{S}` to the dir) |
+| `--sequence_length_grid` | integers | Ablation H2 lengths; preprocessing stores every split at `max(grid + [max_seq_length])` |
+| `--attention_backend` | `auto`, `flash_attention_3`, `sdpa` | Attention kernel; an explicit backend that cannot run fails fast |
+| `--num_workers` | integer | DataLoader workers (same batches as 0 workers) |
+| `--min_lr_ratio` | float in [0, 1] | Cosine LR floor as a fraction of the peak LR (default 0.1) |
+| `--no_resume` | flag | Ignore `last.pt` and persisted ablation arms; start from scratch |
 
-All CLI overrides are logged with original and new values.
+All CLI overrides are logged with original and new values. A stage that runs out of GPU
+memory exits with status **75** so `scripts/run_with_retry.py` can re-run it.
+
+### Ablation run (10% users)
+
+The `specs/ablation-run` runbook: studies A–H at t-base, seed 42, on a seeded 10% user sample,
+mixed bf16, batch size 256 — studies A, D, E, H on the shared H100 (FlashAttention-3) and
+B, C, F, G on the AWS VM (SDPA). The exact per-machine copy/extract/launch commands are
+generated, not written by hand: see `launch/LAUNCH.md` produced by
+`scripts/package_ablation_run.py`.
+
+```bash
+# 1. Mac: build the sample (stored width 200 covers every H2 arm)
+uv run python main.py --stage preprocess --user_sample_fraction 0.1      # -> data/processed_users10pct
+# 2. Mac: FlashAttention-3 source for the H100 (needs network), then package everything
+bash scripts/fetch_fa3_source.sh <tag> dist
+# (commit first: the packager refuses while launch-time files or covered sources are untracked
+#  or have uncommitted changes; --allow-dirty overrides)
+uv run python scripts/package_ablation_run.py   # dist/code.tar.gz, dist/processed_users10pct.tar.gz, launch/
+# 3. H100: build + verify FA3, detached (skips the build if it already imports)
+setsid nohup bash scripts/install_fa3.sh flash-attention-src.tar.gz > logs/fa3_install.log 2>&1 < /dev/null &
+#    exit status: 0 ok, 1 parity failure, 2 preflight/unavailable, 3 build failed
+python3 scripts/verify_attention_backend.py --backend flash_attention_3 --model t-base   # exit 0 = parity OK
+# 4. each machine: launch detached (from the extracted directory)
+mkdir -p logs && setsid nohup bash launch/run_h100.sh > logs/run_h100.log 2>&1 < /dev/null &
+# 5. monitor
+tail -f logs/run_h100.log logs/ablation_A_t_base_seed42.log
+```
+
+- **Resume / retry.** Each study runs through `scripts/run_with_retry.py`: an out-of-memory
+  exit (75) waits and re-runs the same command. `run_pretrain` resumes from `last.pt` (the
+  last finished epoch), completed arms are reused from `outputs/ablations/seed_42/arms/`, and
+  finished backbones from the shared store (`outputs/checkpoints/ablations/by_fingerprint/`,
+  one locked trainer per fingerprint). A host-RAM kill (SIGKILL) is not retried; re-launching
+  the script resumes the same way. `--no_resume` starts over.
+- **Collect.** Copy back `outputs/ablations/seed_42/` (study JSONs, `arms/`, summary),
+  `outputs/plots/`, `logs/` and each backbone's training logs
+  (`outputs/checkpoints/ablations/by_fingerprint/<fp>/logs/`) from both machines; every arm records the backend and device it
+  ran on under `runtime`.
 
 ---
 
@@ -432,8 +485,9 @@ Results are saved to `outputs/ablations/{study}_{model}.json` with full resolved
 
 | File | Content |
 |---|---|
-| `outputs/ablations/{study}_{model}.json` | Per-study configurations, metrics, plot pointers |
-| `outputs/ablations/summary_{model}.json` | Aggregated headline numbers across all studies |
+| `outputs/ablations/seed_{seed}/{study}_{model}.json` | Per-study configurations, metrics, runtime (backend/device) |
+| `outputs/ablations/seed_{seed}/arms/{study}_{model}/{label}.json` | Each completed arm, persisted as it finishes (reused on re-run) |
+| `outputs/ablations/seed_{seed}/summary_{model}.json` | Aggregated headline numbers across all studies |
 
 ### Data Artifacts
 
@@ -490,11 +544,14 @@ The complete resolved configuration (including any CLI overrides) is saved to `o
 |---|---|---|---|
 | Smoke testing | Apple Silicon Mac (MPS) | SDPA | One-batch and few-step T-Small tests on real data |
 | Development | Apple Silicon Mac (MPS) | SDPA | Full T-Small training feasible |
-| Final experiments | NVIDIA H100 (CUDA) | FlashAttention-4 | All model sizes, all seeds, all ablations |
+| Experiments | NVIDIA H100 (Hopper, CUDA) | FlashAttention-3 | Ablations A, D, E, H of the 10% run; final runs |
+| Experiments | Other CUDA GPUs (e.g. AWS L4) | SDPA | Ablations B, C, F, G of the 10% run |
 
-**Dtype:** BF16 by default (`dtype="bf16"`, pure bf16 weights). `--mixed_precision` switches to fp32 master weights with autocast in `--dtype` (bf16 or fp16); fp16 is only allowed with mixed precision and adds a GradScaler. Use `--dtype fp16 --mixed_precision` on GPUs without native bf16 (e.g. T4).
+Arms that are compared with each other (one ablation study) always run on one machine, so they share hardware, precision and attention backend.
 
-**Fail-fast policy:** The MPS smoke test fails immediately if SDPA cannot execute. The H100 final run fails immediately if FlashAttention-4 cannot initialize. Silent fallback to vanilla attention is forbidden.
+**Dtype:** BF16 by default (`dtype="bf16"`, pure bf16 weights). `--mixed_precision` switches to fp32 master weights with autocast in `--dtype` (bf16 or fp16); fp16 is only allowed with mixed precision and adds a GradScaler. Use `--dtype fp16 --mixed_precision` on GPUs without native bf16 (e.g. T4). **Experiment runs use `--dtype bf16 --mixed_precision`** (owner decision 2026-10-15): with pure bf16 weights small updates are rounded away and training plateaus.
+
+**Fail-fast policy:** The MPS smoke test fails immediately if SDPA cannot execute. A run that requests `--attention_backend flash_attention_3` fails immediately if FlashAttention-3 cannot initialize; experiment commands always name their backend explicitly. Silent fallback to another kernel is forbidden.
 
 ---
 
@@ -508,7 +565,7 @@ The full 22-phase implementation sequence with test gates is in [`specs/BUILD_OR
 | 3 | Sequence/pool/candidate tests pass | All model training |
 | 5 | One-batch forward+backward smoke test | Multi-epoch training |
 | 11 | **One-batch + few-step T-Small smoke tests (real data)** | **Full MovieLens-20M training** |
-| 13 | H100 FlashAttention-4 self-test (if CUDA) | H100 training |
+| 13 | Hopper FlashAttention-3 self-test + parity (if CUDA) | H100 training |
 
 **Dependency chain:** data-pipeline → transformer-backbone → moe-routing → loss-functions → training-pipeline → personalization-federated → evaluation-diagnostics → ablations-cli
 
@@ -539,6 +596,7 @@ This project uses a spec-driven development workflow. Implementation contracts l
 | [`personalization-federated`](specs/personalization-federated/) | LoRA, personalization, federated simulation | Fresh LoRA per user, checksum enforcement, weighted FedAvg | 21 tasks |
 | [`evaluation-diagnostics`](specs/evaluation-diagnostics/) | Metrics, cold-start, long-tail, latency, diagnostics | Fixed candidates, device sync, diagnostic batches | 25 tasks |
 | [`ablations-cli`](specs/ablations-cli/) | CLI, ablation runner A–H, plots | Config-driven studies, multi-seed aggregation | 21 tasks |
+| [`ablation-run`](specs/ablation-run/) | 10%-user ablation run: mixed bf16, FA3 on Hopper, LR floor, user sampling, wide storage, resume, OOM retry, packaging | FA3 unpad/repad, bit-identical throughput levers, epoch-granular resume, store lock | 28 tasks |
 
 **Total: 157 implementation tasks** across 7 feature specs, ordered by dependency chain.
 

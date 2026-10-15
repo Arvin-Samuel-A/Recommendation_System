@@ -211,12 +211,19 @@ def generate_sequences(
     val_seqs: Dict[int, List[int]],
     test_seqs: Dict[int, List[int]],
     config: Config,
+    width: Optional[int] = None,
 ) -> Tuple[dict, dict, dict, Dict[int, List[int]], Dict[int, List[int]]]:
-    """Build the three splits' examples as preallocated int32 arrays (REV-086)."""
+    """Build the three splits' examples as preallocated int32 arrays (REV-086).
+
+    `width` is the stored sequence width (specs/ablation-run D7); it defaults to
+    `config.max_seq_length`. Preprocessing passes `stored_seq_length(config)` so every
+    Ablation H2 arm can narrow to its own `max_seq_length`.
+    """
     n_train, n_val, n_test = _count_examples(
         user_sequences, train_seqs, val_seqs, test_seqs,
     )
-    S, K = config.max_seq_length, config.multi_step_k
+    S = config.max_seq_length if width is None else int(width)
+    K = config.multi_step_k
 
     train_examples = _alloc_split(n_train, S, K)
     val_examples = _alloc_split(n_val, S, K)
@@ -329,6 +336,66 @@ def save_tensorised(dataset: RecDataset, path: str) -> None:
     torch.save(data, path)
 
 
+def stored_seq_length(config: Config) -> int:
+    """The width preprocessing stores every split at (specs/ablation-run FR-7, D7).
+
+    `max(sequence_length_grid + [max_seq_length])`, so every H2 arm can narrow to its own
+    width and none silently trains on fewer positions than it asks for.
+    """
+    return max([int(config.max_seq_length)] + [int(w) for w in config.sequence_length_grid])
+
+
+def _width_error(source: str, stored: int, requested: int) -> ValueError:
+    return ValueError(
+        f"{source} is stored at sequence width {stored} but {requested} positions were "
+        f"requested: re-run `python main.py --stage preprocess` with "
+        f"--sequence_length_grid covering {requested} (stored width = "
+        f"max(sequence_length_grid + [max_seq_length]))."
+    )
+
+
+def narrow_examples(examples: dict, max_seq_length: int, source: str = "examples") -> dict:
+    """A shallow copy of an `*_examples.pkl` dict narrowed to `max_seq_length` (D7).
+
+    Keeps the LAST `max_seq_length` positions (the most recent history under left
+    padding) and clamps `lengths`, which is exactly what generating the split at that
+    width yields. Raises when more positions are requested than are stored.
+    """
+    sequences = examples["sequences"]
+    if isinstance(sequences, np.ndarray):
+        stored = sequences.shape[1] if sequences.ndim == 2 else 0
+    else:
+        stored = len(sequences[0]) if len(sequences) else 0
+    N = int(max_seq_length)
+    if len(sequences) and N > stored:
+        raise _width_error(source, stored, N)
+    if N >= stored:
+        return dict(examples)
+    out = dict(examples)
+    if isinstance(sequences, np.ndarray):
+        out["sequences"] = sequences[:, -N:]
+    else:
+        out["sequences"] = [list(row)[-N:] for row in sequences]
+    lengths = examples.get("lengths")
+    if lengths is not None:
+        if isinstance(lengths, np.ndarray):
+            out["lengths"] = np.minimum(lengths, N)
+        else:
+            out["lengths"] = [min(int(x), N) for x in lengths]
+    return out
+
+
+def load_examples(path: str, max_seq_length: int) -> dict:
+    """Unpickle an `*_examples.pkl` split and narrow it to `max_seq_length` (D7).
+
+    The ONLY sanctioned reader of these artifacts outside `data/preprocessing.py`
+    (enforced by `tests/test_sequence_generator.py::TestEveryReaderNarrows`).
+    """
+    with open(path, "rb") as f:
+        examples = pickle.load(f)
+    return narrow_examples(examples, max_seq_length, source=path)
+
+
 def load_tensorised(
     path: str,
     metadata_matrix: Optional[np.ndarray] = None,
@@ -345,6 +412,12 @@ def load_tensorised(
     window means.
     """
     data = torch.load(path, weights_only=True)
+
+    # specs/ablation-run FR-7: asking for MORE positions than are stored used to return
+    # the narrower data silently, so a seq200 arm trained on 50 items.
+    stored = data["sequences"].shape[1]
+    if max_seq_length is not None and data["sequences"].shape[0] and max_seq_length > stored:
+        raise _width_error(path, stored, max_seq_length)
 
     if max_seq_length is not None and data["sequences"].shape[1] > max_seq_length:
         data = dict(data)

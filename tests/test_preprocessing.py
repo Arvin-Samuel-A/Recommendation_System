@@ -697,9 +697,10 @@ class TestSingleRatingPass:
         calls = {"n": 0}
         real = prep._read_ratings
 
-        def counting(cfg):
+        def counting(cfg, *args, **kwargs):
+            # specs/ablation-run D6: the reader also takes an optional `sampling_info`.
             calls["n"] += 1
-            return real(cfg)
+            return real(cfg, *args, **kwargs)
 
         monkeypatch.setattr(prep, "_read_ratings", counting)
         prep.process_ratings(config, return_timestamps=True)
@@ -707,3 +708,143 @@ class TestSingleRatingPass:
             f"rating.csv was read {calls['n']} times; sequences and timestamps must "
             f"come from a single pass"
         )
+
+
+class TestUserSampling:
+    """`user_sample_fraction` keeps a seeded random subset of USERS, histories intact."""
+
+    @staticmethod
+    def _write_ratings(config, n_users=40, per_user=10):
+        rows = [
+            (u, 1000 + (u * per_user + i) % 300, 5.0, 10_000 + u * 100 + i)
+            for u in range(1, n_users + 1) for i in range(per_user)
+        ]
+        pd.DataFrame(rows, columns=["userId", "movieId", "rating", "timestamp"]).to_csv(
+            os.path.join(config.raw_data_dir, "rating.csv"), index=False,
+        )
+
+    def test_keeps_fraction_of_users_with_full_histories(self, config):
+        from data.preprocessing import _read_ratings
+
+        self._write_ratings(config)
+        config.user_sample_fraction = 0.25
+        df = _read_ratings(config)
+
+        assert df["userId"].nunique() == 10
+        assert (df.groupby("userId").size() == 10).all(), "a sampled history was cut"
+
+    def test_sample_depends_only_on_its_own_seed(self, config):
+        from data.preprocessing import _read_ratings
+
+        self._write_ratings(config)
+        config.user_sample_fraction = 0.25
+        first = set(_read_ratings(config)["userId"])
+        config.seed = 999  # the TRAINING seed must not change the data subset
+        assert set(_read_ratings(config)["userId"]) == first
+        config.user_sample_seed = 7
+        assert set(_read_ratings(config)["userId"]) != first
+
+    def test_full_fraction_is_unchanged(self, config):
+        from data.preprocessing import _read_ratings
+
+        self._write_ratings(config)
+        assert _read_ratings(config)["userId"].nunique() == 40
+
+    def test_invalid_fraction_rejected(self):
+        cfg = Config()
+        cfg.user_sample_fraction = 0.0
+        with pytest.raises(ValueError, match="user_sample_fraction"):
+            cfg.validate()
+
+    def test_cli_moves_a_subset_to_its_own_processed_dir(self):
+        from main import apply_cli_overrides, parse_args
+
+        cfg = Config()
+        apply_cli_overrides(cfg, parse_args([
+            "--stage", "preprocess", "--user_sample_fraction", "0.1",
+            "--sequence_length_grid", "50",
+        ]))
+        assert cfg.user_sample_fraction == 0.1
+        assert cfg.processed_data_dir == "data/processed_users10pct"
+        assert cfg.sequence_length_grid == [50]
+
+
+class TestUserSamplingOnTheTinyFixture:
+    """specs/ablation-run T2.1 / AC-15, through the real `run_preprocessing`."""
+
+    FRACTION = 0.5
+
+    @staticmethod
+    def _load(processed, name):
+        with open(os.path.join(processed, name), "rb") as f:
+            return pickle.load(f)
+
+    def test_both_json_files_record_the_sample(self, tiny_processed_dir):
+        from data.preprocessing import SAMPLING_FIELDS
+        from tests.conftest import TINY_NUM_USERS
+
+        processed = tiny_processed_dir(user_sample_fraction=self.FRACTION)
+        expected_after = int(round(self.FRACTION * TINY_NUM_USERS))
+        for name in ("dataset_stats.json", "preprocessing_manifest.json"):
+            with open(os.path.join(processed, name)) as f:
+                record = json.load(f)
+            for field in SAMPLING_FIELDS:
+                assert field in record, f"{name} lacks {field}"
+            assert record["user_sample_fraction"] == self.FRACTION
+            assert record["user_sample_seed"] == 42
+            assert record["num_users_before_sampling"] == TINY_NUM_USERS
+            assert record["num_users_after_sampling"] == expected_after
+            assert isinstance(record["user_sample_fingerprint"], str)
+        with open(os.path.join(processed, "dataset_stats.json")) as f:
+            assert json.load(f)["num_users"] == expected_after
+
+    def _sampled_original_ids(self, processed):
+        import hashlib
+
+        user_map = self._load(processed, "user_mapping.pkl")  # original -> remapped
+        kept = np.sort(np.asarray(list(user_map.keys()), dtype=np.int64))
+        with open(os.path.join(processed, "dataset_stats.json")) as f:
+            stats = json.load(f)
+        # The mapping's originals ARE the sample: their fingerprint is the recorded one.
+        assert hashlib.sha256(kept.tobytes()).hexdigest()[:16] == stats["user_sample_fingerprint"]
+        return user_map
+
+    def test_every_user_in_every_artifact_is_a_sampled_user(self, tiny_processed_dir):
+        processed = tiny_processed_dir(user_sample_fraction=self.FRACTION)
+        user_map = self._sampled_original_ids(processed)
+        sampled_remapped = set(user_map.values())
+        assert len(sampled_remapped) == int(round(self.FRACTION * 60))
+
+        splits = self._load(processed, "splits.pkl")
+        for split in ("train", "val", "test"):
+            assert set(splits[split]) <= sampled_remapped, split
+        assert set(self._load(processed, "train_user_history.pkl")) <= sampled_remapped
+        test_examples = self._load(processed, "test_examples.pkl")
+        assert set(int(u) for u in test_examples["user_ids"]) <= sampled_remapped
+
+    def test_num_items_counts_only_the_sampled_users_items(self, tiny_processed_dir):
+        processed = tiny_processed_dir(user_sample_fraction=self.FRACTION)
+        user_map = self._sampled_original_ids(processed)
+        raw = os.path.join(os.path.dirname(processed), "raw", "rating.csv")
+        ratings = pd.read_csv(raw)
+        ratings = ratings[ratings["rating"] >= Config().implicit_threshold]
+        rated = ratings[ratings["userId"].isin(set(user_map))]["movieId"].nunique()
+        with open(os.path.join(processed, "dataset_stats.json")) as f:
+            assert json.load(f)["num_items"] == rated
+        assert rated < 150, "the sample must drop some of the catalogue to be a real check"
+
+    def test_full_fraction_never_draws_a_sample(self, config, monkeypatch):
+        from data import preprocessing as prep
+
+        TestUserSampling._write_ratings(config)
+
+        class _Boom:
+            def __init__(self, *args, **kwargs):
+                raise AssertionError("RandomState constructed with user_sample_fraction=1.0")
+
+        monkeypatch.setattr(prep.np.random, "RandomState", _Boom)
+        info = {}
+        df = prep._read_ratings(config, info)
+        assert df["userId"].nunique() == 40
+        assert info["num_users_before_sampling"] == info["num_users_after_sampling"] == 40
+        assert info["user_sample_fingerprint"] is None

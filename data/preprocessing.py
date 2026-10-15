@@ -156,8 +156,17 @@ def acquire_dataset(config: Config) -> str:
 
 RATING_COLUMNS = ["userId", "movieId", "rating", "timestamp"]
 
+#: specs/ablation-run FR-6: recorded in dataset_stats.json and the preprocessing manifest.
+SAMPLING_FIELDS = (
+    "user_sample_fraction",
+    "user_sample_seed",
+    "num_users_before_sampling",
+    "num_users_after_sampling",
+    "user_sample_fingerprint",
+)
 
-def _read_ratings(config: Config) -> "pd.DataFrame":
+
+def _read_ratings(config: Config, sampling_info: Optional[dict] = None) -> "pd.DataFrame":
     """Read, filter and chronologically sort `rating.csv` -- ONCE.
 
     REV-085: the file (20,000,263 rows, 690 MB) was read in full twice with no
@@ -203,6 +212,45 @@ def _read_ratings(config: Config) -> "pd.DataFrame":
         config.min_interactions, len(valid_users), len(df),
     )
 
+    # specs/ablation-run FR-6 / D6: a seeded sample of USERS, drawn AFTER both filters so
+    # each kept user's full filtered history survives. Everything downstream (ID maps,
+    # splits, cold/warm items, pool, candidates, histories) derives from this frame, so
+    # it is rebuilt from the subset by construction. `fraction == 1.0` skips the block
+    # entirely, so the full-data output is unchanged.
+    fraction = getattr(config, "user_sample_fraction", 1.0)
+    if fraction < 1.0:
+        users = np.sort(df["userId"].unique())
+        n_before = len(users)
+        n_keep = max(1, int(round(fraction * n_before)))
+        keep = np.random.RandomState(config.user_sample_seed).choice(
+            users, size=n_keep, replace=False,
+        )
+        df = df[df["userId"].isin(keep)]
+        kept_sorted = np.sort(keep).astype(np.int64)
+        logger.info(
+            "User sample (fraction=%g, seed=%d): %d -> %d users, %d rows",
+            fraction, config.user_sample_seed, n_before, n_keep, len(df),
+        )
+        if sampling_info is not None:
+            sampling_info.update({
+                "user_sample_fraction": float(fraction),
+                "user_sample_seed": int(config.user_sample_seed),
+                "num_users_before_sampling": int(n_before),
+                "num_users_after_sampling": int(n_keep),
+                "user_sample_fingerprint": hashlib.sha256(
+                    kept_sorted.tobytes()
+                ).hexdigest()[:16],
+            })
+    elif sampling_info is not None:
+        n_users = int(df["userId"].nunique())
+        sampling_info.update({
+            "user_sample_fraction": 1.0,
+            "user_sample_seed": int(getattr(config, "user_sample_seed", 42)),
+            "num_users_before_sampling": n_users,
+            "num_users_after_sampling": n_users,
+            "user_sample_fingerprint": None,
+        })
+
     return df.sort_values(["userId", "timestamp"], kind="stable")
 
 
@@ -215,7 +263,8 @@ def process_ratings(
     recover the timestamp column this function had already loaded and discarded.
     `return_timestamps=True` returns both from one pass.
     """
-    df = _read_ratings(config)
+    sampling_info: dict = {}
+    df = _read_ratings(config, sampling_info)
 
     user_ids_orig = sorted(df["userId"].unique())
     user_map = {orig: idx for idx, orig in enumerate(user_ids_orig)}
@@ -250,6 +299,8 @@ def process_ratings(
         "VOCAB_SIZE": num_items + 2,
         "total_interactions": sum(len(v) for v in user_sequences.values()),
         "skipped_users": skipped_users,
+        # specs/ablation-run FR-6: the sample this dataset was built from.
+        **sampling_info,
     }
 
     os.makedirs(config.processed_data_dir, exist_ok=True)
@@ -566,7 +617,11 @@ def run_preprocessing(config: Config) -> None:
     from data.sequence_generator import (
         generate_sequences, tensorise_examples, save_tensorised,
         GlobalNegativePool, generate_eval_candidates, save_eval_candidates,
+        stored_seq_length,
     )
+
+    # specs/ablation-run D6: an out-of-range sample fraction must fail before any work.
+    config.validate()
 
     logger.info("=== Step 1/7: Acquire dataset ===")
     fingerprint = acquire_dataset(config)
@@ -608,8 +663,18 @@ def run_preprocessing(config: Config) -> None:
     config.feature_dim = metadata_matrix.shape[-1]
 
     logger.info("=== Step 7/7: Generate sequences & tensorise ===")
+    # specs/ablation-run FR-7 / D7: store at the widest width any configured arm reads;
+    # every reader narrows to its own `max_seq_length`.
+    stored_width = stored_seq_length(config)
+    logger.info(
+        "Storing sequences at width %d (max_seq_length=%d, sequence_length_grid=%s)",
+        stored_width, config.max_seq_length, list(config.sequence_length_grid),
+    )
     train_examples, val_examples, test_examples, train_user_history, eval_user_history = (
-        generate_sequences(user_sequences, filtered_train, val_seqs, test_seqs, config)
+        generate_sequences(
+            user_sequences, filtered_train, val_seqs, test_seqs, config,
+            width=stored_width,
+        )
     )
 
     train_dataset = tensorise_examples(train_examples, metadata_matrix)
@@ -706,7 +771,11 @@ def run_preprocessing(config: Config) -> None:
         "val_candidates_fingerprint": val_fp,
         "test_candidates_fingerprint": test_fp,
         "seed": config.seed,
+        "stored_seq_length": int(stored_width),
     }
+    # specs/ablation-run FR-6: the same five sampling fields as dataset_stats.json.
+    for key in SAMPLING_FIELDS:
+        manifest[key] = stats.get(key)
     with open(os.path.join(processed, "preprocessing_manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
 
@@ -716,6 +785,46 @@ def run_preprocessing(config: Config) -> None:
         stats["num_users"], stats["num_items"], stats["VOCAB_SIZE"],
         len(cold_item_set), pool_size, fingerprint,
     )
+
+
+def check_processed_dir(config: Config) -> None:
+    """Refuse a processed directory built from a different user sample (FR-7, D6).
+
+    Reads `preprocessing_manifest.json`; a field the manifest lacks is read as the
+    pre-feature default (fraction 1.0). The seed is compared only for a real sample.
+    A directory with no manifest is warned about, not refused.
+    """
+    path = os.path.join(config.processed_data_dir, "preprocessing_manifest.json")
+    if not os.path.exists(path):
+        logger.warning(
+            "%s not found -- cannot verify that %s was built with "
+            "user_sample_fraction=%g / user_sample_seed=%d",
+            path, config.processed_data_dir, config.user_sample_fraction,
+            config.user_sample_seed,
+        )
+        return
+    with open(path) as f:
+        manifest = json.load(f)
+    stored_fraction = float(manifest.get("user_sample_fraction", 1.0))
+    stored_seed = manifest.get("user_sample_seed")
+    remedy = (
+        f"Re-run `python main.py --stage preprocess --user_sample_fraction "
+        f"{config.user_sample_fraction:g} --user_sample_seed {config.user_sample_seed}` "
+        f"or point processed_data_dir at the matching directory."
+    )
+    if abs(stored_fraction - float(config.user_sample_fraction)) > 1e-12:
+        raise ValueError(
+            f"{config.processed_data_dir} was preprocessed with user_sample_fraction="
+            f"{stored_fraction:g} but this run asks for {config.user_sample_fraction:g}. "
+            + remedy
+        )
+    if stored_fraction < 1.0 and stored_seed is not None and (
+        int(stored_seed) != int(config.user_sample_seed)
+    ):
+        raise ValueError(
+            f"{config.processed_data_dir} was preprocessed with user_sample_seed="
+            f"{stored_seed} but this run asks for {config.user_sample_seed}. " + remedy
+        )
 
 
 def get_timestamps_per_user(config: Config) -> Dict[int, List[float]]:

@@ -1,5 +1,6 @@
 import logging
-from typing import Optional, Tuple
+from dataclasses import dataclass
+from typing import Callable, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -10,10 +11,14 @@ from utils import get_device, resolve_dtype, resolve_param_dtype
 
 logger = logging.getLogger(__name__)
 
-# T1.3 / AC-09: exactly two sanctioned kernels plus "auto". `flex_attention` is
-# deliberately absent -- it has no backward pass on MPS in the pinned PyTorch build, so
-# it cannot train on the declared dev host (FR-4 rationale, design D2b).
-VALID_BACKENDS = ("auto", "flash_attention_4", "sdpa")
+# Exactly two sanctioned kernels plus "auto" (specs/ablation-run FR-2, owner decision
+# 2026-10-15). The former FlashAttention backend is gone: it was misnamed "4" and called
+# the FA2 `flash_attn` API. `flex_attention` stays absent -- it has no backward pass on MPS in the pinned
+# PyTorch build, so it cannot train on the declared dev host (transformer-backbone D2b).
+VALID_BACKENDS = ("auto", "flash_attention_3", "sdpa")
+
+#: FlashAttention-3 kernels take half precision only.
+FA3_DTYPES = (torch.bfloat16, torch.float16)
 
 
 class AttentionBackendError(RuntimeError):
@@ -25,6 +30,115 @@ def l2_normalize(t: torch.Tensor) -> torch.Tensor:
     return F.normalize(t.float(), p=2, dim=-1).to(t.dtype)
 
 
+def preferred_backend(device_type: str, capability: Optional[Tuple[int, int]]) -> str:
+    """The hardware-preferred kernel (specs/ablation-run FR-2, design D2).
+
+    Hopper CUDA (compute capability 9.x) -> FlashAttention-3. Any other CUDA GPU, MPS and
+    CPU -> SDPA, which is a sanctioned kernel there, not a fallback.
+    """
+    if device_type == "cuda" and capability is not None and capability[0] == 9:
+        return "flash_attention_3"
+    return "sdpa"
+
+
+# ---------------- variable-length (unpad -> kernel -> repad) core ----------------
+#
+# FlashAttention-3 ships no `bert_padding`, and every training batch is left-padded, so the
+# varlen path is the hot path (design D2). These functions are pure torch, differentiable,
+# and make no assumption about WHERE the pads are; under left padding each row's real
+# tokens are contiguous and in order, which is what makes causal attention over the ragged
+# buffer equal to causal attention with a key-padding mask.
+
+
+@dataclass
+class VarlenMeta:
+    """Ragged-batch metadata, computed once per `padding_mask` object."""
+
+    indices: Optional[torch.Tensor]  # (N_real,) int64 flat positions b*S+s; None if all_real
+    cu_seqlens: torch.Tensor         # (B+1,) int32 cumulative real lengths, on the mask's device
+    max_seqlen: int                  # host int, exact
+    all_real: bool                   # True -> no pad anywhere; callers take the dense path
+
+
+def varlen_meta(padding_mask: torch.Tensor) -> VarlenMeta:
+    """Metadata for a `(B, S)` mask that is True at REAL positions.
+
+    One host sync for the lengths (gives `max_seqlen` and `all_real`) and, only when a pad
+    exists, a second for the real-token indices.
+    """
+    B, S = padding_mask.shape
+    seqlens = padding_mask.sum(dim=1, dtype=torch.int32)
+    seqlens_host = seqlens.cpu()
+    max_seqlen = int(seqlens_host.max()) if B else 0
+    all_real = bool((seqlens_host == S).all())
+    cu_seqlens = torch.zeros(B + 1, dtype=torch.int32, device=padding_mask.device)
+    cu_seqlens[1:] = seqlens.cumsum(0, dtype=torch.int32)
+    indices = None
+    if not all_real:
+        indices = torch.nonzero(padding_mask.flatten(), as_tuple=False).flatten()
+    return VarlenMeta(indices, cu_seqlens, max_seqlen, all_real)
+
+
+def unpad(x_bshd: torch.Tensor, meta: VarlenMeta) -> torch.Tensor:
+    """`(B, S, H, D)` -> `(N_real, H, D)`, keeping real tokens in row-major order."""
+    B, S = x_bshd.shape[:2]
+    return x_bshd.reshape(B * S, *x_bshd.shape[2:]).index_select(0, meta.indices)
+
+
+def repad(x_un: torch.Tensor, meta: VarlenMeta, B: int, S: int) -> torch.Tensor:
+    """`(N_real, H, D)` -> `(B, S, H, D)` with exact zeros at pad positions."""
+    out = torch.zeros(B * S, *x_un.shape[1:], dtype=x_un.dtype, device=x_un.device)
+    return out.index_copy(0, meta.indices, x_un).reshape(B, S, *x_un.shape[1:])
+
+
+def _fa3_output(result):
+    """FA3 versions return either `out` or `(out, softmax_lse)`."""
+    if isinstance(result, (tuple, list)):
+        return result[0]
+    return result
+
+
+def varlen_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    padding_mask: torch.Tensor,
+    is_causal: bool,
+    varlen_fn: Callable,
+    meta: Optional[VarlenMeta] = None,
+) -> torch.Tensor:
+    """Attention over a padded `(B, H, S, D)` batch through a variable-length kernel.
+
+    `varlen_fn` is FA3's `flash_attn_varlen_func` in production and a pure-torch reference
+    in tests. Causality reaches it as the `causal` flag (REV-122).
+    """
+    B, H, S, D = q.shape
+    if meta is None:
+        meta = varlen_meta(padding_mask)
+    # (B, H, S, D) -> (B, S, H, D): a view back to the projections' contiguous layout.
+    q_un, k_un, v_un = (unpad(t.transpose(1, 2), meta) for t in (q, k, v))
+    out_un = _fa3_output(varlen_fn(
+        q_un, k_un, v_un,
+        cu_seqlens_q=meta.cu_seqlens, cu_seqlens_k=meta.cu_seqlens,
+        max_seqlen_q=meta.max_seqlen, max_seqlen_k=meta.max_seqlen,
+        causal=is_causal,
+    ))
+    return repad(out_un, meta, B, S).transpose(1, 2)
+
+
+def _import_fa3() -> Tuple[Callable, Callable]:
+    """Lazily import FlashAttention-3. Reached only from the FA3 probe/dispatch."""
+    try:
+        import flash_attn_interface
+    except ImportError as e:
+        raise AttentionBackendError(
+            "FlashAttention-3 (flash_attn_interface) is not installed on this machine. "
+            "It is built from the flash-attention repo's hopper/ directory for Hopper "
+            "GPUs; see scripts/install_fa3.sh. Select --attention_backend sdpa elsewhere."
+        ) from e
+    return flash_attn_interface.flash_attn_func, flash_attn_interface.flash_attn_varlen_func
+
+
 class AttentionBackend:
     """Dispatches attention to a real kernel and reports the kernel that actually ran.
 
@@ -34,17 +148,24 @@ class AttentionBackend:
     implementation (forward *and* backward, since training needs both), and an explicitly
     requested backend that cannot execute raises instead of falling back.
 
-    REV-062 / T1.3: the resolvable backends are `sdpa` (MPS/CPU) and `flash_attention_4`
-    (CUDA). SDPA is the sanctioned local/dev training kernel, not a degraded fallback.
-    FlexAttention is not resolvable and not selectable -- see `VALID_BACKENDS`.
+    specs/ablation-run FR-2: the resolvable backends are `sdpa` (MPS, CPU, non-Hopper CUDA)
+    and `flash_attention_3` (Hopper CUDA). FlexAttention is not resolvable and not
+    selectable -- see `VALID_BACKENDS`.
     """
 
     def __init__(self, config: Config):
         self.device = get_device(config)
         self.dtype = resolve_dtype(config)
+        # D2 "Probe": the startup gate exercises the kernel instance training uses.
+        self.head_dim = max(1, config.hidden_dim // max(1, config.num_heads))
         self.requested_backend = config.attention_backend
         self.require_backend = getattr(config, "require_attention_backend", False)
         self.fallback_reason: Optional[str] = None
+        # D2 "One metadata computation per forward": every block receives the SAME
+        # padding_mask object, so its varlen metadata is computed once per forward. The
+        # cache holds a strong reference, so the identity cannot be reused by another
+        # mask while cached.
+        self._varlen_cache: Optional[Tuple[torch.Tensor, VarlenMeta]] = None
         self.backend_name = self._resolve_backend(config.attention_backend)
         logger.info(
             "Resolved attention backend: %s on %s%s",
@@ -56,11 +177,10 @@ class AttentionBackend:
     # ---------------- backend resolution ----------------
 
     def _preferred_backend(self) -> str:
+        capability = None
         if self.device.type == "cuda":
-            return "flash_attention_4"
-        # T1.3: MPS and CPU both resolve to SDPA. MPS used to prefer FlexAttention, which
-        # could not run a backward pass here, so the armed gate failed on the dev host.
-        return "sdpa"
+            capability = torch.cuda.get_device_capability(self.device)
+        return preferred_backend(self.device.type, capability)
 
     def _resolve_backend(self, backend: str) -> str:
         if backend not in VALID_BACKENDS:
@@ -70,7 +190,7 @@ class AttentionBackend:
 
         if backend != "auto":
             # Explicit request: must execute or fail fast. This is the path the H100
-            # final run and the MPS gate run use, so there is no fallback here.
+            # run and the MPS gate run use, so there is no fallback here.
             ok, reason = self._probe(backend)
             if not ok:
                 raise AttentionBackendError(
@@ -112,17 +232,25 @@ class AttentionBackend:
     def _probe(self, backend: str) -> Tuple[bool, str]:
         """Run the backend's real kernel forward+backward on tiny inputs.
 
-        REV-122: the probe covers BOTH branches -- unpadded and left-padded. It used to
-        attend an unpadded input only, which is not the branch training takes: every
-        training batch is left-padded, so a defect confined to the padded path (as the
-        FA4 causality bug was) passed the startup gate untouched.
+        REV-122: the probe covers BOTH branches -- unpadded and left-padded -- because
+        every training batch is left-padded. specs/ablation-run D2: at the model's real
+        head dimension (80 at t-base), not a hardcoded 16, so the gate exercises the kernel
+        instance training uses.
         """
-        B, H, S, D = 2, 2, 8, 16
+        B, H, S, D = 2, 2, 8, self.head_dim
+        # The probe draws from its OWN generator: it must not consume the global RNG,
+        # which model construction (weight init) and dropout read next. Otherwise the
+        # initial weights would depend on the probe's shapes and on how many backends
+        # `auto` probed before settling (specs/ablation-run T5.1 BUILD note).
+        gen = torch.Generator(device="cpu").manual_seed(0)
+
+        def _rand():
+            t = torch.randn(B, H, S, D, generator=gen)
+            return t.to(device=self.device, dtype=self.dtype).requires_grad_(True)
+
         try:
             for case, padding_mask in (("unpadded", None), ("left-padded", self._probe_padding_mask(B, S))):
-                q = torch.randn(B, H, S, D, device=self.device, dtype=self.dtype, requires_grad=True)
-                k = torch.randn(B, H, S, D, device=self.device, dtype=self.dtype, requires_grad=True)
-                v = torch.randn(B, H, S, D, device=self.device, dtype=self.dtype, requires_grad=True)
+                q, k, v = _rand(), _rand(), _rand()
                 out = self._dispatch(
                     backend, q, k, v, padding_mask=padding_mask, is_causal=True,
                 )
@@ -136,6 +264,8 @@ class AttentionBackend:
                     return False, f"[{case}] backward produced no/!finite gradients"
         except Exception as e:  # noqa: BLE001 - probe must classify any failure
             return False, f"{type(e).__name__}: {e}"
+        finally:
+            self._varlen_cache = None
         return True, ""
 
     def _probe_padding_mask(self, B: int, S: int) -> torch.Tensor:
@@ -156,14 +286,10 @@ class AttentionBackend:
         is_causal: bool,
     ) -> torch.Tensor:
         # REV-122: the caller passes causal INTENT (`is_causal`) and the padding mask, and
-        # each backend formats its own mask from that pair -- design D2 point 3. The
-        # previous contract had `CausalSelfAttention` build one additive mask in SDPA's
-        # dialect (carrying causality) and pass `is_causal=False` alongside it; the FA4
-        # branch ignores additive masks and reads causality only from the flag, so every
-        # left-padded batch -- i.e. every training batch -- ran BIDIRECTIONAL on CUDA.
-        # Causality must never travel in a channel only one backend reads.
-        if backend == "flash_attention_4":
-            return self._flash_attention_4(q, k, v, padding_mask, is_causal)
+        # each backend formats its own mask from that pair -- design D2 point 3. Causality
+        # must never travel in a channel only one backend reads.
+        if backend == "flash_attention_3":
+            return self._flash_attention_3(q, k, v, padding_mask, is_causal)
         if backend == "sdpa":
             attn_mask = self._sdpa_additive_mask(q, padding_mask, is_causal)
             if attn_mask is not None:
@@ -199,82 +325,41 @@ class AttentionBackend:
         # memory-efficient kernel on CUDA.
         return ~blocked
 
-    @staticmethod
-    def _flash_attention_4(
+    def _varlen_meta_for(self, padding_mask: torch.Tensor) -> VarlenMeta:
+        cached = self._varlen_cache
+        if cached is not None and cached[0] is padding_mask:
+            return cached[1]
+        meta = varlen_meta(padding_mask)
+        self._varlen_cache = (padding_mask, meta)
+        return meta
+
+    def _flash_attention_3(
+        self,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
         padding_mask: Optional[torch.Tensor],
         is_causal: bool,
     ) -> torch.Tensor:
-        # FlashAttention expects (B, S, H, D); the project keeps (B, H, S, D).
-        try:
-            from flash_attn import flash_attn_func
-        except ImportError as e:
+        """FlashAttention-3 (`flash_attn_interface`), dense or variable-length (design D2)."""
+        if q.dtype not in FA3_DTYPES:
             raise AttentionBackendError(
-                "FlashAttention-4 is not installed. Install the flash-attn package "
-                "matching this CUDA/PyTorch build, or select another backend."
-            ) from e
-
-        # REV-081: this used to RAISE whenever `padding_mask` had any masked position.
-        # `CausalSelfAttention.forward` passes the mask whenever the batch contains a pad
-        # token, and every training batch is left-padded, so the first real batch on CUDA
-        # aborted the run -- the H100 path (FR-4, AC-03) could not train at all. Route
-        # padded batches through the variable-length API instead: unpad to a single
-        # ragged buffer with cumulative sequence lengths, attend, then repad.
-        #
-        # Left-padding makes this exact: every real token of a row is contiguous and in
-        # order, so removing the pads preserves the causal order within each sequence.
-        if padding_mask is not None and not bool(padding_mask.all()):
-            return AttentionBackend._flash_attention_4_varlen(
-                q, k, v, padding_mask, is_causal,
+                f"FlashAttention-3 takes bf16/fp16 inputs only, got {q.dtype}. Under "
+                f"mixed precision q/k/v come out of autocast in the compute dtype; with "
+                f"pure weights use --dtype bf16."
             )
-
-        out = flash_attn_func(
+        dense_fn, varlen_fn = _import_fa3()
+        if padding_mask is not None:
+            meta = self._varlen_meta_for(padding_mask)
+            if not meta.all_real:
+                return varlen_attention(
+                    q, k, v, padding_mask, is_causal, varlen_fn, meta=meta,
+                )
+        # FlashAttention takes (B, S, H, D); the project keeps (B, H, S, D).
+        out = _fa3_output(dense_fn(
             q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), causal=is_causal,
-        )
+        ))
         return out.transpose(1, 2)
-
-    @staticmethod
-    def _flash_attention_4_varlen(
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        padding_mask: torch.Tensor,
-        is_causal: bool,
-    ) -> torch.Tensor:
-        """FlashAttention over a padded batch, via the variable-length API (REV-081).
-
-        `padding_mask` is True at REAL positions, which is the convention
-        `flash_attn.bert_padding.unpad_input` expects.
-        """
-        try:
-            from flash_attn import flash_attn_varlen_func
-            from flash_attn.bert_padding import pad_input, unpad_input
-        except ImportError as e:
-            raise AttentionBackendError(
-                "FlashAttention's variable-length API is required for padded batches "
-                "but is unavailable. Install a flash-attn build providing "
-                "`flash_attn_varlen_func` and `flash_attn.bert_padding`."
-            ) from e
-
-        B, H, S, D = q.shape
-        # (B, H, S, D) -> (B, S, H, D), which is what the varlen helpers expect.
-        q_bshd, k_bshd, v_bshd = (t.transpose(1, 2) for t in (q, k, v))
-
-        q_un, indices, cu_seqlens, max_seqlen = unpad_input(q_bshd, padding_mask)[:4]
-        k_un = unpad_input(k_bshd, padding_mask)[0]
-        v_un = unpad_input(v_bshd, padding_mask)[0]
-
-        out_un = flash_attn_varlen_func(
-            q_un, k_un, v_un,
-            cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
-            max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen,
-            causal=is_causal,
-        )
-
-        out = pad_input(out_un, indices, B, S)  # (B, S, H, D)
-        return out.transpose(1, 2).contiguous()
 
     # ---------------- public API ----------------
 
@@ -308,7 +393,7 @@ class AttentionBackend:
         REV-122: callers pass `(padding_mask, is_causal)` and each backend formats the
         mask its kernel actually reads. There is deliberately no `attn_mask` parameter --
         an additive mask is SDPA dialect, and accepting one here is what let causality
-        silently vanish on the FlashAttention-4 path.
+        silently vanish on the (former) FlashAttention path.
         """
         return self._dispatch(
             self.backend_name, q, k, v,
@@ -343,8 +428,9 @@ class CausalSelfAttention(nn.Module):
 
         # REV-122: this attention is causal unconditionally -- `is_causal=True` on BOTH
         # branches. It previously passed `is_causal=False` on the padded branch and relied
-        # on a hand-built additive mask to carry causality, which only SDPA reads; the FA4
-        # branch therefore attended bidirectionally on every left-padded batch. Causal
+        # on a hand-built additive mask to carry causality, which only SDPA reads; the
+        # FlashAttention branch therefore attended bidirectionally on every left-padded
+        # batch. Causal
         # intent now travels as the flag, and each backend formats its own mask.
         out = self.backend.forward(q, k, v, padding_mask=padding_mask, is_causal=True)
 
@@ -440,6 +526,16 @@ class TransformerModel(nn.Module):
         return_all_hidden: bool = False,
     ) -> torch.Tensor:
         B, S = seq.shape
+        # specs/ablation-run FR-7 / AC-18: a shape check (no device sync). Without it a
+        # wider input indexes the position table out of range -- an opaque IndexError on
+        # CPU, a context-poisoning device assert on CUDA.
+        max_positions = self.position_embedding.num_embeddings
+        if S > max_positions:
+            raise ValueError(
+                f"input has {S} positions but the model was built with "
+                f"max_seq_length={max_positions}; narrow the data to the model width "
+                f"(load_tensorised(..., max_seq_length=...) / load_examples(...))."
+            )
         positions = torch.arange(S, device=seq.device)
         x = self.item_embedding(seq) + self.position_embedding(positions)
 

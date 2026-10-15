@@ -43,17 +43,53 @@ class TestLRScheduler:
         for i in range(1, len(lrs)):
             assert lrs[i] >= lrs[i - 1] - 1e-8
 
-    def test_cosine_reaches_near_zero(self, base_config):
+    def test_cosine_decays_to_floor(self, base_config):
+        """specs/ablation-run AC-14 (replaces `test_cosine_reaches_near_zero`)."""
+        base_config.min_lr_ratio = 0.1
         model = TransformerModel(base_config)
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
         scheduler = build_scheduler(optimizer, base_config, total_steps=100)
+        floor = base_config.min_lr_ratio * 1e-3
+        warmup_steps = int(100 * base_config.warmup_ratio)
 
-        for _ in range(100):
+        post_warmup = []
+        for step in range(1, 101):
             optimizer.step()
             scheduler.step()
+            if step >= warmup_steps:
+                post_warmup.append(optimizer.param_groups[0]["lr"])
 
         final_lr = optimizer.param_groups[0]["lr"]
-        assert final_lr < 1e-5
+        assert math.isclose(final_lr, floor, rel_tol=1e-6), final_lr
+        assert min(post_warmup) >= floor * (1 - 1e-9)
+
+    def test_zero_floor_matches_previous_schedule(self, base_config):
+        """`min_lr_ratio = 0` reproduces the pre-floor lambda exactly at every step."""
+        base_config.min_lr_ratio = 0.0
+        total_steps = 100
+        warmup_steps = int(total_steps * base_config.warmup_ratio)
+
+        def previous_lambda(step):  # verbatim from HEAD 0a91094
+            if step < warmup_steps:
+                return float(step) / max(1, warmup_steps)
+            progress = float(step - warmup_steps) / max(1, total_steps - warmup_steps)
+            return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+        model = TransformerModel(base_config)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        scheduler = build_scheduler(optimizer, base_config, total_steps=total_steps)
+        lr_lambda = scheduler.lr_lambdas[0]
+        for step in range(total_steps + 1):
+            assert lr_lambda(step) == previous_lambda(step), step
+
+    def test_floor_is_part_of_the_training_fingerprint(self, base_config):
+        import copy
+
+        from training.ablation_runner import _training_fingerprint
+
+        other = copy.deepcopy(base_config)
+        other.min_lr_ratio = 0.0
+        assert _training_fingerprint(other) != _training_fingerprint(base_config)
 
     def test_per_batch_stepping(self, base_config):
         model = TransformerModel(base_config)
@@ -166,9 +202,19 @@ def _build_subset_processed_dir(dest, n_train=512, n_val=128, seed=0, n_test=128
             continue
         with open(src_ex, "rb") as f:
             examples = pickle.load(f)
+        # specs/ablation-run T0.2 (owner-approved): since REV-086 the example splits are
+        # int32 NumPy arrays, not lists. Subsetting only lists copied the FULL ~2 GB
+        # arrays into every temp dir -- the bulk of the suite's ~16 GB temp footprint.
+        # `.copy()` so the pickle holds only the subset, not a view of the full array.
         subset_ex = {
-            k: (v[:count] if isinstance(v, list) else v) for k, v in examples.items()
+            k: (
+                v[:count].copy() if isinstance(v, np.ndarray)
+                else v[:count] if isinstance(v, list)
+                else v
+            )
+            for k, v in examples.items()
         }
+        del examples
         with open(os.path.join(dest, f"{split}_examples.pkl"), "wb") as f:
             pickle.dump(subset_ex, f)
 
@@ -679,7 +725,9 @@ class TestFewStepsSmoke:
                 model, moe, batch, cfg, loss_fns, gradnorm,
                 optimizer, scheduler, batch_idx, rng_obj,
             )
-            losses_over_steps.append(loss_values.get("next_item", 0.0))
+            # specs/ablation-run D4: the step returns 0-d device tensors; `np.isfinite`
+            # below cannot read an MPS tensor, so materialise the value here.
+            losses_over_steps.append(float(loss_values.get("next_item", 0.0)))
 
         assert len(losses_over_steps) == num_steps, f"Expected {num_steps} steps, got {len(losses_over_steps)}"
         assert all(l > 0 for l in losses_over_steps), "All losses should be positive"
@@ -965,3 +1013,110 @@ class TestMixedPrecision:
                 model, moe, TestMoECacheLifetime._batch(config), config, loss_fns,
                 None, optimizer, scheduler, 0, rng,
             )
+
+
+class TestBatchedFiniteChecks:
+    """specs/ablation-run T5.2 / AC-13: the batched checks still abort before stepping."""
+
+    @staticmethod
+    def _setup(use_gradnorm=True):
+        import random
+
+        from torch.optim.lr_scheduler import LambdaLR
+
+        from training.pretrain import _build_loss_fns, build_model
+
+        config = Config()
+        config.apply_model_config("t-small")
+        config.num_items = 200
+        config.vocab_size = 202
+        config.use_metadata = False
+        config.feature_dim = 0
+        config.device = "cpu"
+        config.batch_size = 4
+        torch.manual_seed(0)
+        model, moe = build_model(config)
+        loss_fns = _build_loss_fns(config, torch.device("cpu"))
+        params = list(model.parameters()) + list(moe.parameters())
+        for fn in loss_fns.values():
+            params += list(fn.parameters())
+        optimizer = torch.optim.AdamW(params, lr=1e-2)
+        scheduler = LambdaLR(optimizer, lr_lambda=lambda step: 1.0)
+        gradnorm = GradNormController(config.gradnorm_alpha, config.gradnorm_lr) if use_gradnorm else None
+        b, S = config.batch_size, config.max_seq_length
+        torch.manual_seed(1)
+        batch = {
+            "sequences": torch.randint(1, config.num_items + 1, (b, S)),
+            "targets": torch.randint(1, config.num_items + 1, (b,)),
+            "neg_ids": torch.randint(1, config.num_items + 1, (b, config.num_sampled_negatives)),
+            "targets_k": torch.randint(1, config.num_items + 1, (b, config.multi_step_k)),
+        }
+        return config, model, moe, loss_fns, gradnorm, optimizer, scheduler, batch, params, random.Random(0)
+
+    def _step(self, setup):
+        from training.pretrain import train_one_step
+
+        config, model, moe, loss_fns, gradnorm, optimizer, scheduler, batch, _, rng = setup
+        return train_one_step(
+            model, moe, batch, config, loss_fns, gradnorm, optimizer, scheduler, 0, rng,
+        )
+
+    @staticmethod
+    def _assert_unchanged(before, params):
+        for p_before, p_after in zip(before, params):
+            assert torch.equal(p_before, p_after), "a parameter moved on an aborted step"
+
+    def test_nan_loss_names_the_objective_and_moves_nothing(self):
+        setup = self._setup()
+        loss_fns, params = setup[3], setup[8]
+        real = loss_fns["multi_step"].forward
+
+        def nan_forward(*args, **kwargs):
+            return real(*args, **kwargs) * float("nan")
+
+        loss_fns["multi_step"].forward = nan_forward
+        before = [p.detach().clone() for p in params]
+        with pytest.raises(AssertionError, match="multi_step loss is not finite"):
+            self._step(setup)
+        self._assert_unchanged(before, params)
+
+    def test_non_finite_grad_norm_raises_on_the_non_scaler_path(self, monkeypatch):
+        setup = self._setup(use_gradnorm=False)
+        params = setup[8]
+        real_clip = torch.nn.utils.clip_grad_norm_
+
+        def inf_norm(*args, **kwargs):
+            real_clip(*args, **kwargs)
+            return torch.tensor(float("inf"))
+
+        monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", inf_norm)
+        before = [p.detach().clone() for p in params]
+        with pytest.raises(AssertionError, match="Non-finite gradient"):
+            self._step(setup)
+        self._assert_unchanged(before, params)
+
+    def test_non_finite_lambdas_raise_before_the_step(self, monkeypatch):
+        setup = self._setup(use_gradnorm=True)
+        gradnorm, params = setup[4], setup[8]
+        real_update = GradNormController.update
+
+        def poisoned(self, *args, **kwargs):
+            out = real_update(self, *args, **kwargs)
+            with torch.no_grad():
+                self.log_lambdas[0] = float("nan")
+            return out
+
+        monkeypatch.setattr(GradNormController, "update", poisoned)
+        before = [p.detach().clone() for p in params]
+        with pytest.raises(AssertionError, match="lambdas not finite"):
+            self._step(setup)
+        self._assert_unchanged(before, params)
+
+    def test_step_returns_device_scalars_not_python_floats(self):
+        loss_values, _ = self._step(self._setup())
+        for name, value in loss_values.items():
+            if name.startswith("_"):
+                continue
+            assert isinstance(value, torch.Tensor) and value.dim() == 0, name
+            assert math.isfinite(value)  # 0-d tensors still work with math/float/format
+            assert f"{value:.4f}"

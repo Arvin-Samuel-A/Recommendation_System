@@ -10,9 +10,13 @@ ARV-MMoE is a communication-efficient multi-objective federated sequential recom
 - **Python:** 3.10+
 - **Environment manager:** `uv venv` only (no conda, no `python -m venv`)
 - **Dtype:** BF16 by default (`torch.bfloat16`). Optional mixed precision (`mixed_precision=True`): fp32 master weights + autocast in bf16 or fp16; fp16 requires it and adds a GradScaler
-- **Dataset:** MovieLens-20M via Kaggle API
-- **Dev hardware:** Apple Silicon Mac (MPS, SDPA)
-- **Prod hardware:** NVIDIA H100 (CUDA, FlashAttention-4)
+  - **Experiment runs use mixed bf16** (`--dtype bf16 --mixed_precision`) — owner decision 2026-10-15. Pure bf16 weights round away updates below ~0.4% of the weight and plateau (measured: next-item loss 4.56 flat vs 4.436 still falling under mixed precision, T4, t-small, 360 steps). The `Config` default stays pure bf16; the run commands carry the flags.
+- **Dataset:** MovieLens-20M via Kaggle API; experiment runs may use a seeded user sample (`user_sample_fraction`, processed into its own `data/processed_users{pct}pct` directory)
+- **Dev hardware:** Apple Silicon Mac (MPS, SDPA). Never runs CUDA code; FlashAttention is never imported there.
+- **Target hardware** (owner decision 2026-10-15, supersedes "H100 → FlashAttention-4"):
+  - Shared H100 PCIe (Hopper, sm_90): FlashAttention-3 (`flash_attn_interface`, built from the flash-attention repo's `hopper/` directory; installed per machine, never in `requirements.txt`).
+  - Any non-Hopper CUDA GPU (e.g. the AWS VM's L4): SDPA.
+  - Arms that are compared with each other (one ablation study) run on one machine, so they share hardware, precision and attention backend. The backend is passed explicitly in run commands and is part of the training fingerprint.
 
 ## Component Map
 
@@ -35,6 +39,12 @@ Raw CSVs (Kaggle)
   → Sequence generation (chronological split, sliding window, left-padding, tensorisation)
   → Global negative pool (warm items only, deterministic, shared)
   → Fixed evaluation candidate sets (generated once, shared across all models)
+
+Stored vs. model sequence width:
+  Splits are stored at max(sequence_length_grid ∪ {max_seq_length}) (recorded as
+  `stored_seq_length` in the preprocessing manifest). Every reader narrows to the consuming
+  config's max_seq_length (most recent positions kept); asking for more than is stored, or
+  feeding a model more positions than it was built for, raises.
 
 Training:
   User sequence → Item embedding + Positional embedding [+ Metadata projection]
@@ -65,3 +75,12 @@ Serving:
 3. **e_rec ≡ e_next at inference.** No separate inference-only embedding; the next-item objective embedding serves double duty.
 4. **LoRA-only federated communication.** Router, experts, objective embeddings, and GradNorm state remain global/frozen during local training.
 5. **GradNorm on shared Transformer anchor.** The anchor is the last shared Transformer block (before optional MoE), ensuring it exists in every model variant.
+
+## Run Execution (long runs on shared GPUs)
+
+Approved pattern introduced by `specs/ablation-run` (owner decisions 2026-10-15); the backbone store exists today, the rest lands with that spec.
+
+- **Backbone store.** Ablation arms are trained into `checkpoints/ablations/by_fingerprint/<training fingerprint>/` and reused by every arm, study and process on that machine whose training-relevant config matches. Training a fingerprint holds an exclusive OS file lock on its store directory.
+- **Resume.** `run_pretrain` writes `last.pt` (full state incl. RNGs and loader generators) atomically at every epoch end and resumes from it by default; it refuses to resume across a different training fingerprint or `source_revision`. Resume is epoch-granular.
+- **OOM.** An out-of-memory error ends the process with exit status 75; `scripts/run_with_retry.py` waits and re-runs the same command, which resumes. Completed ablation arms are persisted and reused on re-run.
+- **Code transport.** Target machines without git receive code as a tarball of the tracked files; their `source_revision` is identified by `source_hash`.

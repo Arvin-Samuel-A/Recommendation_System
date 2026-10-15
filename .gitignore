@@ -8,6 +8,9 @@ dist/
 build/
 data/raw/
 data/processed/
+# specs/ablation-run: seeded user samples and run logs (data/artifacts, not code)
+data/processed_users*/
+/logs/
 outputs/
 *.pt
 *.npy

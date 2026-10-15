@@ -1,5 +1,6 @@
 import copy
 import hashlib
+from contextlib import contextmanager
 import json
 import logging
 import os
@@ -10,6 +11,7 @@ import numpy as np
 import torch
 
 from configs.config import Config
+from utils import is_oom_error
 
 # REV-032: `replace` and `Optional` were imported and unused; `asdict` is now used by the
 # per-result config snapshot (REV-019).
@@ -198,6 +200,14 @@ _PATH_FIELDS = frozenset({
 #: seed list differs, even though the trained model is identical.
 _RUN_SELECTION_FIELDS = frozenset({"final_seeds"})
 
+#: specs/ablation-run FR-13 (design D4/D13): how a run is EXECUTED, not what it trains.
+#: Worker processes and pinned memory yield the identical batch sequence (tested), and
+#: `resume_training` only decides whether `last.pt` is picked up. `persistent_workers`
+#: stays IN the fingerprint on purpose: a persistent iterator is reset between epochs
+#: without redrawing its base seed, which consumes the loader generator differently and
+#: so changes the data order from epoch 2 on.
+_RUNTIME_ONLY_FIELDS = frozenset({"num_workers", "pin_memory", "resume_training"})
+
 
 def _training_fingerprint(cfg: Config) -> str:
     """Hash of everything about `cfg` that actually changes the trained model.
@@ -212,7 +222,7 @@ def _training_fingerprint(cfg: Config) -> str:
     fields = {
         k: v for k, v in asdict(cfg).items()
         if k not in POST_TRAINING_ONLY_FIELDS and k not in _PATH_FIELDS
-        and k not in _RUN_SELECTION_FIELDS
+        and k not in _RUN_SELECTION_FIELDS and k not in _RUNTIME_ONLY_FIELDS
     }
     payload = json.dumps(fields, sort_keys=True, default=str)
     return hashlib.sha256(payload.encode()).hexdigest()[:12]
@@ -233,6 +243,11 @@ def backbone_store_dir(checkpoint_root: str, fingerprint: str) -> str:
     never collide.
     """
     return os.path.join(checkpoint_root, "ablations", "by_fingerprint", fingerprint)
+
+
+def training_log_dir(checkpoint_root: str, fingerprint: str) -> str:
+    """Where one fingerprint's training logs go: inside its store directory (REV-002)."""
+    return os.path.join(backbone_store_dir(checkpoint_root, fingerprint), "logs")
 
 
 def find_backbone(checkpoint_root: str, fingerprint: str) -> Optional[Dict]:
@@ -281,6 +296,97 @@ def register_backbone(
         json.dump(entry, f, indent=2)
     os.replace(tmp, os.path.join(store, BACKBONE_MARKER))  # atomic: never half-written
     return entry
+
+
+def _runtime_record(model, cfg: Config, device: torch.device) -> Dict:
+    """Backend, device and precision an arm was evaluated (and trained) under (D2)."""
+    import platform
+
+    if device.type == "cuda":
+        device_name = torch.cuda.get_device_name(device)
+    else:
+        device_name = platform.processor() or platform.machine() or device.type
+    return {
+        "attention_backend": model.backend.backend_name,
+        "attention_fallback_reason": model.backend.fallback_reason,
+        "device": str(device),
+        "device_name": device_name,
+        "dtype": cfg.dtype,
+        "mixed_precision": cfg.mixed_precision,
+    }
+
+
+#: The per-fingerprint lock file inside a store directory (FR-10).
+BACKBONE_LOCK = ".train.lock"
+#: How often a waiting process re-tries the lock.
+BACKBONE_LOCK_POLL_SECONDS = 5.0
+
+
+@contextmanager
+def backbone_lock(
+    checkpoint_root: str,
+    fingerprint: str,
+    timeout: Optional[float] = None,
+    poll: Optional[float] = None,
+):
+    """Exclusive OS lock on one fingerprint's store directory (specs/ablation-run D10).
+
+    `flock` locks are released by the kernel when their process dies, so an OOM-killed or
+    `kill -9`-ed trainer never leaves a stale lock (unlike an O_EXCL lock file). Waiting is
+    logged once, with the holder's "pid host time" line. `timeout=None` waits forever;
+    otherwise `TimeoutError` after `timeout` seconds.
+    """
+    import errno
+    import fcntl
+    import socket
+    import time
+    from datetime import datetime, timezone
+
+    if poll is None:
+        poll = BACKBONE_LOCK_POLL_SECONDS
+    store = backbone_store_dir(checkpoint_root, fingerprint)
+    os.makedirs(store, exist_ok=True)
+    path = os.path.join(store, BACKBONE_LOCK)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        start = time.monotonic()
+        logged = False
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as exc:
+                if exc.errno not in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+                    raise
+            elapsed = time.monotonic() - start
+            if not logged:
+                try:
+                    with open(path) as f:
+                        holder = f.read().strip() or "unknown"
+                except OSError:
+                    holder = "unknown"
+                logger.info(
+                    "Backbone %s is being trained by another process (pid host time: %s) "
+                    "-- waiting for its lock at %s", fingerprint, holder, path,
+                )
+                logged = True
+            if timeout is not None and elapsed >= timeout:
+                raise TimeoutError(
+                    f"Timed out after {timeout:g} s waiting for the backbone lock {path}"
+                )
+            wait = poll if timeout is None else min(poll, max(0.01, timeout - elapsed))
+            time.sleep(wait)
+        os.ftruncate(fd, 0)
+        os.lseek(fd, 0, os.SEEK_SET)
+        stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        os.write(fd, f"{os.getpid()} {socket.gethostname()} {stamp}\n".encode())
+        os.fsync(fd)
+        try:
+            yield path
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 def _run_single_config(
@@ -348,6 +454,32 @@ def _run_single_config(
     ckpt_path = os.path.join(cfg.model_checkpoint_dir(), "best.pt")
 
     shared = find_backbone(base_config.checkpoint_dir, fingerprint)
+    trained_here = False
+    if shared is None and train:
+        # specs/ablation-run FR-10 / D10: one trainer per fingerprint per machine. A
+        # process that waited re-checks the store after acquiring the lock, so it reuses
+        # the backbone the holder registered instead of training it again.
+        with backbone_lock(base_config.checkpoint_dir, fingerprint):
+            shared = find_backbone(base_config.checkpoint_dir, fingerprint)
+            if shared is None:
+                # Review REV-002: the training logs (per-epoch log, GradNorm JSONL, routing
+                # report) live in the fingerprint's store directory, next to its checkpoints,
+                # so a resume can only ever truncate/append ITS OWN records -- never splice
+                # in another arm's lines from a shared `pretrain_{model}.log`.
+                train_log_dir = training_log_dir(base_config.checkpoint_dir, fingerprint)
+                result["training_log_dir"] = train_log_dir
+                arm_log_dir = cfg.log_dir
+                cfg.log_dir = train_log_dir
+                try:
+                    train_result = run_pretrain(cfg, model_name)
+                finally:
+                    cfg.log_dir = arm_log_dir
+                result["best_val_ndcg"] = train_result["best_val_ndcg"]
+                result["best_epoch"] = train_result["best_epoch"]
+                register_backbone(
+                    base_config.checkpoint_dir, fingerprint, cfg, run_tag, train_result,
+                )
+                trained_here = True
     if shared is not None:
         cfg.checkpoint_dir = shared["checkpoint_dir"]
         ckpt_path = shared["checkpoint_path"]
@@ -359,13 +491,8 @@ def _run_single_config(
             "  %s: training-relevant config matches '%s' -- reusing its backbone "
             "instead of retraining an identical model", label, shared["trained_by"],
         )
-    elif train:
-        train_result = run_pretrain(cfg, model_name)
-        result["best_val_ndcg"] = train_result["best_val_ndcg"]
-        result["best_epoch"] = train_result["best_epoch"]
-        register_backbone(
-            base_config.checkpoint_dir, fingerprint, cfg, run_tag, train_result,
-        )
+    elif trained_here:
+        pass
     else:
         # `--no_train`: only a COMPLETED backbone is evaluated. A bare `best.pt` without
         # the marker is a run that did not finish.
@@ -381,6 +508,9 @@ def _run_single_config(
     model, moe = build_model(cfg)
     loss_fns = _build_loss_fns(cfg, device)
     arm_ckpt = load_checkpoint(ckpt_path, model, moe, loss_fns=loss_fns)
+    # specs/ablation-run FR-2 / AC-30: the kernel and device this arm ACTUALLY ran on, so a
+    # reviewer can check that every arm of a study shared one backend.
+    result["runtime"] = _runtime_record(model, cfg, device)
     # AC-09: an ablation JSON compares arms, so an unstamped one cannot prove its arms
     # were produced by the same code. Each arm echoes the source_revision of the
     # checkpoint IT was evaluated from, alongside `resolved_config` and `config_diff`.
@@ -543,12 +673,73 @@ def _run_single_config(
     return result
 
 
+# ---------------- per-arm persistence (specs/ablation-run FR-11, design D11) ----------------
+
+
+def _results_root(config: Config) -> str:
+    """Seed-namespaced results directory, so runs with different seeds never collide."""
+    return os.path.join(config.ablation_dir, f"seed_{config.seed}")
+
+
+def _arm_path(config: Config, study: str, model_name: str, label: str) -> str:
+    mn = model_name.replace("-", "_")
+    return os.path.join(_results_root(config), "arms", f"{study}_{mn}", f"{label}.json")
+
+
+def _arm_key(cfg: Config, study: str, label: str, model_name: str) -> str:
+    """Identity of one arm's RESULT: its resolved config (minus paths and runtime-only
+    fields), the study, label, model, and the code that would produce it."""
+    from utils import get_source_revision
+
+    revision = get_source_revision()
+    payload = {
+        "config": {
+            k: v for k, v in asdict(cfg).items()
+            if k not in _PATH_FIELDS and k not in _RUNTIME_ONLY_FIELDS
+        },
+        "study": study,
+        "label": label,
+        "model": model_name,
+        "source": {k: revision.get(k) for k in ("commit", "source_hash", "dirty")},
+    }
+    blob = json.dumps(payload, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode()).hexdigest()[:16]
+
+
+def _load_persisted_arm(path: str, arm_key: str) -> Optional[Dict]:
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            stored = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Ignoring unreadable persisted arm %s: %s", path, exc)
+        return None
+    if stored.get("status") != "ok" or stored.get("arm_key") != arm_key:
+        return None
+    return stored
+
+
+def _write_json_atomic(path: str, payload) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.tmp-{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump(payload, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
 def run_ablation(
     config: Config,
     model_name: str,
     study: str = "all",
     train: bool = True,
 ) -> Dict:
+    # specs/ablation-run FR-7 / AC-20: refuse a mismatched user sample before any arm.
+    from data.preprocessing import check_processed_dir
+    check_processed_dir(config)
+
     studies = list(STUDY_CONFIGS.keys()) if study == "all" else [study]
     all_results = {}
 
@@ -560,11 +751,32 @@ def run_ablation(
         for cfg in configs:
             label = getattr(cfg, "_study_label", "unknown")
             logger.info(f"  Config: {label}")
+            # FR-11: computed BEFORE `_run_single_config`, which resolves dataset fields
+            # and the checkpoint namespace into `cfg`.
+            arm_key = _arm_key(cfg, s, label, model_name)
+            arm_path = _arm_path(config, s, model_name, label)
+            if config.resume_training:
+                persisted = _load_persisted_arm(arm_path, arm_key)
+                if persisted is not None:
+                    persisted["reused_from_previous_run"] = True
+                    logger.info(
+                        "  %s: reusing the persisted result %s (arm_key %s)",
+                        label, arm_path, arm_key,
+                    )
+                    study_results.append(persisted)
+                    continue
             try:
                 result = _run_single_config(
                     cfg, model_name, s, config, train,
                 )
+                result["arm_key"] = arm_key
+                if result.get("status") == "ok":
+                    _write_json_atomic(arm_path, result)
             except Exception as exc:  # one arm failing must not lose the others
+                # specs/ablation-run FR-9: an OOM is not this arm's fault and recording it
+                # as a failure would lose the arm; let the process exit 75 and retry.
+                if is_oom_error(exc):
+                    raise
                 logger.exception("  Config %s failed: %s", label, exc)
                 result = {
                     "label": label,
@@ -852,15 +1064,14 @@ _STUDY_PLOTS = {
 
 
 def _save_study_results(config: Config, model_name: str, study: str, results: List[Dict]) -> None:
-    os.makedirs(config.ablation_dir, exist_ok=True)
+    # specs/ablation-run FR-11: under `{ablation_dir}/seed_{seed}/`.
     mn = model_name.replace("-", "_")
-    path = os.path.join(config.ablation_dir, f"{study}_{mn}.json")
-    with open(path, "w") as f:
-        json.dump(results, f, indent=2)
+    path = os.path.join(_results_root(config), f"{study}_{mn}.json")
+    _write_json_atomic(path, results)
 
 
 def _save_summary(config: Config, model_name: str, all_results: Dict) -> None:
-    os.makedirs(config.ablation_dir, exist_ok=True)
+    os.makedirs(_results_root(config), exist_ok=True)
     mn = model_name.replace("-", "_")
     summary = {}
     for study, results in all_results.items():
@@ -876,6 +1087,6 @@ def _save_summary(config: Config, model_name: str, all_results: Dict) -> None:
                 default=(None, None),
             )[1],
         }
-    path = os.path.join(config.ablation_dir, f"summary_{mn}.json")
+    path = os.path.join(_results_root(config), f"summary_{mn}.json")
     with open(path, "w") as f:
         json.dump(summary, f, indent=2)

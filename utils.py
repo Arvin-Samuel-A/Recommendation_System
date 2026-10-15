@@ -54,6 +54,48 @@ def make_grad_scaler(config) -> "torch.amp.GradScaler":
     return torch.amp.GradScaler(get_device(config).type, enabled=enabled)
 
 
+#: Process exit status meaning "out of memory, safe to retry" (specs/ablation-run FR-9).
+#: `scripts/run_with_retry.py` re-runs a command that exits with it.
+OOM_EXIT_CODE = 75
+
+
+def is_oom_error(exc: BaseException) -> bool:
+    """True for an accelerator out-of-memory error (CUDA or MPS), the one OOM a retry helps.
+
+    `torch.OutOfMemoryError`, or a `RuntimeError` whose message says "out of memory"
+    (older CUDA builds and the MPS allocator raise plain RuntimeErrors). Host `MemoryError`
+    is deliberately excluded: retrying the same command reproduces it.
+    """
+    oom_type = getattr(torch, "OutOfMemoryError", None)
+    if oom_type is not None and isinstance(exc, oom_type):
+        return True
+    return isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
+
+
+def atomic_torch_save(obj, path: str) -> None:
+    """`torch.save` that never leaves a truncated file under `path` (specs/ablation-run D8).
+
+    Writes `path.tmp-<pid>`, fsyncs it, then `os.replace`s it over `path` -- atomic on
+    POSIX. If the write fails, the temporary file is removed and the previous `path` (if
+    any) is untouched.
+    """
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    tmp = f"{path}.tmp-{os.getpid()}"
+    try:
+        with open(tmp, "wb") as f:
+            torch.save(obj, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)

@@ -13,7 +13,7 @@ from evaluation.metrics import (
     compute_metrics_batch, aggregate_metrics,
 )
 from data.sequence_generator import (
-    load_metadata_matrix, load_or_build_eval_candidates,
+    load_metadata_matrix, load_or_build_eval_candidates, load_examples,
 )
 from utils import get_device
 
@@ -116,8 +116,10 @@ def run_longtail_evaluation(
         eval_user_history = pickle.load(f)
     neg_pool = np.load(os.path.join(processed, "global_negative_pool.npy"))
 
-    with open(os.path.join(processed, "test_examples.pkl"), "rb") as f:
-        test_examples = pickle.load(f)
+    # specs/ablation-run FR-7: splits are stored wider than the model; narrow on read.
+    test_examples = load_examples(
+        os.path.join(processed, "test_examples.pkl"), config.max_seq_length,
+    )
 
     # REV-093: score against the FIXED stored candidate sets. This used to rebuild them
     # per call with `filter_negatives` and no `rng=`, so every example's negatives were
