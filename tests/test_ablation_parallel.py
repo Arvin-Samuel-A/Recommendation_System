@@ -305,7 +305,8 @@ class TestCollect:
             _edit_arm(cfg, "input_only", lambda r: r.update(status="failed", error="KeyError: x"))
         else:
             _edit_arm(cfg, "input_only", lambda r: r["code_revision"].update(source_hash="0" * 16))
-        assert _collect_via_main(monkeypatch, cfg) == 1
+        # A failed arm exits ARM_FAILED_EXIT_CODE (70), like `--stage ablation` does.
+        assert _collect_via_main(monkeypatch, cfg) == (70 if case == "failed" else 1)
         assert f"{case} ['input_only']" in caplog.text or f"{case} {['input_only']}" in caplog.text
         assert not os.path.exists(_study_json_path(cfg))
         assert not os.path.exists(_plot_path(cfg))
@@ -319,7 +320,10 @@ class TestCollect:
             os.remove(_arm_file(cfg, "objective_conditioned"))
         else:
             _edit_arm(cfg, "objective_conditioned", lambda r: r.update(status="failed", error="KeyError: x"))
-        assert _collect_via_main(monkeypatch, cfg, "--allow_incomplete") == 0
+        # Assembled either way; a failed arm still exits 70 (it is an error record, not an
+        # absence the caller chose to tolerate).
+        expected = 70 if case == "failed" else 0
+        assert _collect_via_main(monkeypatch, cfg, "--allow_incomplete") == expected
         study = json.load(open(_study_json_path(cfg)))
         assert [r["label"] for r in study] == ["objective_conditioned", "input_only"]
         assert study[0]["status"] == case

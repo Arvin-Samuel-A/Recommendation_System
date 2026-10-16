@@ -731,21 +731,43 @@ def run_gradient_diagnostics_stage(config, args):
     return report
 
 
+def _exit_if_arms_failed(stage: str, failed: dict) -> None:
+    """Exit `ARM_FAILED_EXIT_CODE` when any requested study holds a failed arm.
+
+    A failed arm used to leave the process at exit 0, so the launch scripts and
+    `scripts/run_with_retry.py` reported success while arms had crashed.
+    """
+    if not failed:
+        return
+    from utils import ARM_FAILED_EXIT_CODE
+
+    logger.error(
+        "%s: failed arms %s -- exiting with status %d", stage, failed, ARM_FAILED_EXIT_CODE,
+    )
+    raise SystemExit(ARM_FAILED_EXIT_CODE)
+
+
 def run_ablation_stage(config, args):
-    from training.ablation_runner import run_ablation
+    from training.ablation_runner import failed_arm_labels, run_ablation
     # REV-115: `--no_train` reaches the `train` parameter that already existed here.
     from training.ablation_runner import parse_arms
-    return run_ablation(
+    results = run_ablation(
         config, args.model, args.study, train=not getattr(args, "no_train", False),
         arms=parse_arms(getattr(args, "arms", None)),
     )
+    # Every arm has run and every record (and study output) is written by now; an OOM
+    # never gets here -- it propagates and exits 75 in `main`.
+    _exit_if_arms_failed("ablation", failed_arm_labels(results))
+    return results
 
 
 def run_ablation_collect_stage(config, args):
     """`--stage ablation_collect`: study JSON + plots from persisted arms (FR-15, D17).
 
-    Trains and evaluates nothing. Exits 1 if any requested study could not be assembled
-    (listing its missing / failed / stale / inconsistent arms).
+    Trains and evaluates nothing. Exits `ARM_FAILED_EXIT_CODE` if any requested study
+    holds a failed arm (assembled or not, as `--stage ablation` would), else 1 if any
+    requested study could not be assembled (listing its missing / stale / inconsistent
+    arms).
     """
     from training.ablation_runner import (
         STUDY_CONFIGS, _save_summary, collect_study,
@@ -755,9 +777,11 @@ def run_ablation_collect_stage(config, args):
     studies = list(STUDY_CONFIGS) if args.study == "all" else [args.study]
     if any(s not in STUDY_CONFIGS for s in studies):
         raise ValueError(f"Unknown study '{args.study}'. Choose from {list(STUDY_CONFIGS)} or all")
-    assembled, incomplete, failed_studies = {}, {}, []
+    assembled, incomplete, failed_studies, failed_arms = {}, {}, [], {}
     for study in studies:
         assessment = collect_study(config, args.model, study, allow_incomplete=allow)
+        if assessment.failed:
+            failed_arms[study] = sorted(assessment.failed)
         if assessment.written:
             from training.ablation_runner import _results_root
 
@@ -786,13 +810,17 @@ def run_ablation_collect_stage(config, args):
         )
     if failed_studies:
         logger.error("ablation_collect: studies not assembled: %s", failed_studies)
+    _exit_if_arms_failed("ablation_collect", failed_arms)
+    if failed_studies:
         raise SystemExit(1)
 
 
 def run_ablation_rescore_stage(config, args):
     """`--stage ablation_rescore` (specs/eval-integrity FR-8): rescore a finished run's
     saved epoch checkpoints with the current evaluation protocol. Trains nothing and
-    modifies no original. Exits 1 if any selected study could not be assembled."""
+    modifies no original. Exits `ARM_FAILED_EXIT_CODE` if any selected arm failed (its
+    original record is `failed`, or its rescore raised), else 1 if any selected study
+    could not be assembled."""
     from training.ablation_rescore import run_ablation_rescore
 
     report = run_ablation_rescore(
@@ -807,6 +835,8 @@ def run_ablation_rescore_stage(config, args):
         )
     if report["not_written"]:
         logger.error("ablation_rescore: studies not assembled: %s", report["not_written"])
+    _exit_if_arms_failed("ablation_rescore", report.get("failed_arms") or {})
+    if report["not_written"]:
         raise SystemExit(1)
     return report
 

@@ -593,8 +593,10 @@ def run_ablation_rescore(
 ) -> Dict:
     """Rescore the selected studies' arms and assemble them under the rescored root.
 
-    Returns `{"studies": {study: {...}}, "not_written": [...]}`; the CLI stage exits 1 when
-    `not_written` is non-empty.
+    Returns `{"studies": {study: {...}}, "not_written": [...], "failed_arms": {...}}`.
+    `failed_arms` maps a study to its arms whose original record is `failed` or whose
+    rescore raised; the CLI stage exits `ARM_FAILED_EXIT_CODE` when it is non-empty, else 1
+    when `not_written` is non-empty.
     """
     from data.preprocessing import check_processed_dir
 
@@ -607,9 +609,10 @@ def run_ablation_rescore(
     shared = EvalData(config)
 
     report: Dict[str, Dict] = {}
-    assembled, incomplete, not_written = {}, {}, []
+    assembled, incomplete, not_written, failed_arms = {}, {}, [], {}
     for s in studies:
         info = {"rescored": [], "current": [], "skipped": {}, "failed": {}}
+        failed_originals = []
         for cfg in resolve_study_configs(s, config):
             label = cfg._study_label
             path = _arm_path(config, s, model_name, label)
@@ -625,6 +628,8 @@ def run_ablation_rescore(
                 logger.warning("  %s/%s: unreadable original arm file -- skipped", s, label)
                 continue
             if orig.get("status") != "ok":
+                if orig.get("status") == "failed":
+                    failed_originals.append(label)
                 info["skipped"][label] = f"original status {orig.get('status')!r}"
                 logger.warning("  %s/%s: original status %r -- skipped", s, label, orig.get("status"))
                 continue
@@ -658,6 +663,8 @@ def run_ablation_rescore(
                 "inconsistent": assessment.inconsistent,
             }
         report[s] = info
+        if failed_originals or info["failed"]:
+            failed_arms[s] = sorted(set(failed_originals) | set(info["failed"]))
 
     if study == "all":
         _save_summary(
@@ -667,4 +674,4 @@ def run_ablation_rescore(
             extra={"rescore_caveat": RESCORE_CAVEAT},
         )
     logger.warning("ablation_rescore: %s", RESCORE_CAVEAT)
-    return {"studies": report, "not_written": not_written}
+    return {"studies": report, "not_written": not_written, "failed_arms": failed_arms}

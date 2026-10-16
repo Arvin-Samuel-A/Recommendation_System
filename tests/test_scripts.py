@@ -151,6 +151,13 @@ class TestRunWithRetry:
         assert out.returncode == 3
         assert counter.read_text() == "1"
 
+    def test_failed_arm_status_is_not_retried(self, tmp_path):
+        counter = tmp_path / "n"
+        out = self._wrap(self._counter_child(counter, [70, 0]))
+        assert out.returncode == 70
+        assert counter.read_text() == "1"
+        assert "ablation arm(s) failed" in out.stdout
+
     def test_sigterm_stops_the_child_and_the_loop(self, tmp_path):
         import signal
         import time

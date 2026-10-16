@@ -1340,6 +1340,33 @@ def _arm_cfg_from_record(record):
     return cfg
 
 
+@pytest.mark.parametrize("case", ["original_failed", "rescore_raised"])
+def test_rescore_failed_arm_exits_70(study_b, tmp_path, monkeypatch, case):
+    """A failed arm makes `ablation_rescore` exit ARM_FAILED_EXIT_CODE (70), as
+    `--stage ablation` and `ablation_collect` do; the other arm is still rescored."""
+    import json
+    from types import SimpleNamespace
+
+    import main as main_mod
+    from training.ablation_runner import _arm_path
+
+    cfg = _copy_run(study_b, tmp_path / "run")
+    if case == "original_failed":
+        path = _arm_path(cfg, "B", "t-small", "input_only")
+        record = json.load(open(path))
+        record.update(status="failed", error="KeyError: x")
+        json.dump(record, open(path, "w"))
+    else:
+        _spy_rescore_evals(monkeypatch, fail_on_call=1)  # the first arm's first eval
+    with pytest.raises(SystemExit) as exc:
+        main_mod.run_ablation_rescore_stage(
+            cfg, SimpleNamespace(model="t-small", study="B", allow_incomplete=False),
+        )
+    assert exc.value.code == 70
+    survivor = "objective_conditioned" if case == "original_failed" else "input_only"
+    assert _arm_record(cfg, survivor, rescored=True)["rescore"]["rescored"] is True
+
+
 def test_rescore_all_writes_summary_with_caveat(study_b, tmp_path, monkeypatch):
     """`--study all` assembles what it can, writes the rescored summary with the caveat,
     and exits 1 because the other studies were never run."""

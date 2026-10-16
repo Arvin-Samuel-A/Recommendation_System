@@ -1196,6 +1196,16 @@ def run_ablation(
     return all_results
 
 
+def failed_arm_labels(all_results: Dict[str, List[Dict]]) -> Dict[str, List[str]]:
+    """`{study: [label, ...]}` of the arms whose record has `status == "failed"`."""
+    failed = {}
+    for study, results in all_results.items():
+        labels = [r.get("label") for r in results if r.get("status") == "failed"]
+        if labels:
+            failed[study] = labels
+    return failed
+
+
 def _plot_study(config: Config, model_name: str, study: str, results: List[Dict]) -> None:
     """Render the per-study bar chart each FR names (REV-006)."""
     import matplotlib

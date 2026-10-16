@@ -74,6 +74,13 @@ def make_grad_scaler(config) -> "torch.amp.GradScaler":
 #: `scripts/run_with_retry.py` re-runs a command that exits with it.
 OOM_EXIT_CODE = 75
 
+#: Process exit status meaning "at least one ablation arm ended `failed`" (sysexits
+#: EX_SOFTWARE). `--stage ablation` returns it after every remaining arm has run and
+#: every record is written; `ablation_collect` / `ablation_rescore` return it when a
+#: requested study holds a failed arm. Not 75, so `scripts/run_with_retry.py` never
+#: retries it: a crashed arm is a code or data error, not a busy GPU.
+ARM_FAILED_EXIT_CODE = 70
+
 
 def is_oom_error(exc: BaseException) -> bool:
     """True for an accelerator out-of-memory error (CUDA or MPS), the one OOM a retry helps.

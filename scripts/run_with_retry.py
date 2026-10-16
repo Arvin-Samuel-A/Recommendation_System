@@ -8,6 +8,7 @@ re-running the SAME command continues the work. This wrapper is that loop:
   exit 0          -> stop, exit 0
   exit 75         -> wait --wait-seconds, re-run (at most --max-retries times), then exit 75
   any other exit  -> stop immediately with that status (no retry)
+                     (70 = ablation arm(s) failed: a code/data error, never retried)
   SIGTERM/SIGINT  -> terminate the child, exit 143/130 without retrying
 
 The child inherits stdout/stderr, so a `nohup ... > log` around the wrapper captures both.
@@ -23,6 +24,7 @@ import time
 from datetime import datetime, timezone
 
 OOM_EXIT_CODE = 75  # mirrors utils.OOM_EXIT_CODE; kept import-free so it runs anywhere
+ARM_FAILED_EXIT_CODE = 70  # mirrors utils.ARM_FAILED_EXIT_CODE; never retried
 
 
 def _log(message: str) -> None:
@@ -93,7 +95,10 @@ def main(argv=None) -> int:
         if status == 0:
             return 0
         if status != OOM_EXIT_CODE:
-            _log(f"status {status} is not {OOM_EXIT_CODE} (OOM); not retrying")
+            if status == ARM_FAILED_EXIT_CODE:
+                _log(f"status {status}: ablation arm(s) failed (see the command's log); not retrying")
+            else:
+                _log(f"status {status} is not {OOM_EXIT_CODE} (OOM); not retrying")
             return status
         if attempt == total:
             break

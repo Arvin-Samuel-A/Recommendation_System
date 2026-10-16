@@ -365,6 +365,13 @@ def render_launch_md(args, data_name: str, manifest: Dict) -> str:
         "start the next study), then the wrapper, which terminates its child: "
         "`pkill -TERM -f 'launch/run_'; pkill -TERM -f run_with_retry.py`.",
         "",
+        "Exit statuses in the `exit` lines: 0 ok; 75 out of memory after the last retry; "
+        "70 at least one arm ended `failed` (every other arm still ran and every record "
+        "was written; the arm's error is in its log and arm JSON, and a re-run retries "
+        "only the failed arms); 1 any other error, or for `ablation_collect` / "
+        "`ablation_rescore` a study that could not be assembled. A non-zero status never "
+        "stops the next command.",
+        "",
         "## Collect results",
         "",
         "```bash",

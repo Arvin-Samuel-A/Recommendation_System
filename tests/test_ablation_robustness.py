@@ -202,6 +202,95 @@ class TestOOMHandling:
         assert results["D"][2]["status"] == "ok"
 
 
+class TestFailedArmExitStatus:
+    """A failed ablation arm makes `--stage ablation` exit ARM_FAILED_EXIT_CODE (70), after
+    the remaining arms ran and every record was written. An OOM still exits 75."""
+
+    def test_constant_is_distinct_from_the_retry_status(self):
+        from utils import ARM_FAILED_EXIT_CODE, OOM_EXIT_CODE
+
+        assert ARM_FAILED_EXIT_CODE == 70
+        assert ARM_FAILED_EXIT_CODE not in (0, 1, OOM_EXIT_CODE)
+
+    def _main_study_d(self, tiny_processed_dir, tmp_path, monkeypatch, failure=None):
+        """`main.main --stage ablation --study D` over a tiny config, with arm 2 raising
+        `failure` (or no failure). Returns (exit code, calls, cfg)."""
+        from dataclasses import asdict
+
+        import main as cli
+        import training.ablation_runner as runner
+        from tests.conftest import tiny_config
+
+        cfg = tiny_config(tiny_processed_dir(), str(tmp_path))
+        values = asdict(cfg)
+
+        class _TinyConfig(Config):
+            def __init__(self):
+                super().__init__()
+                for key, value in values.items():
+                    setattr(self, key, copy.deepcopy(value))
+
+        calls = []
+
+        def fake(cfg, model_name, study, base, train):
+            calls.append(cfg._study_label)
+            if failure is not None and len(calls) == 2:
+                raise failure
+            return {"label": cfg._study_label, "study": study, "status": "ok"}
+
+        monkeypatch.setattr(cli, "Config", _TinyConfig)
+        monkeypatch.setattr(runner, "_run_single_config", fake)
+        try:
+            cli.main(["--stage", "ablation", "--study", "D", "--model", "t-small"])
+        except SystemExit as exc:
+            return exc.code, calls, cfg
+        return 0, calls, cfg
+
+    @staticmethod
+    def _arm_records(cfg, labels):
+        import json
+
+        from training.ablation_runner import _arm_path
+
+        out = {}
+        for label in labels:
+            path = _arm_path(cfg, "D", "t-small", label)
+            out[label] = json.load(open(path)) if os.path.exists(path) else None
+        return out
+
+    def test_failed_arm_exits_70_after_the_other_arms(
+        self, tiny_processed_dir, tmp_path, monkeypatch, caplog,
+    ):
+        code, calls, cfg = self._main_study_d(
+            tiny_processed_dir, tmp_path, monkeypatch, KeyError("missing"),
+        )
+        assert code == 70
+        assert len(calls) == 4, "the arms after the failed one must still run"
+        records = self._arm_records(cfg, calls)
+        assert records[calls[1]]["status"] == "failed"
+        assert "KeyError" in records[calls[1]]["error"]
+        assert all(records[label]["status"] == "ok" for label in calls if label != calls[1])
+        # The study output is written before the process exits.
+        assert os.path.exists(os.path.join(cfg.ablation_dir, "seed_42", "D_t_small.json"))
+        assert f"failed arms {{'D': ['{calls[1]}']}}" in caplog.text
+
+    def test_all_ok_exits_zero(self, tiny_processed_dir, tmp_path, monkeypatch):
+        code, calls, _ = self._main_study_d(tiny_processed_dir, tmp_path, monkeypatch)
+        assert code == 0 and len(calls) == 4
+
+    def test_oom_path_is_unchanged(self, tiny_processed_dir, tmp_path, monkeypatch):
+        import torch
+
+        code, calls, cfg = self._main_study_d(
+            tiny_processed_dir, tmp_path, monkeypatch, torch.OutOfMemoryError("CUDA out of memory"),
+        )
+        assert code == 75
+        assert len(calls) == 2, "an OOM stops the study so the retry re-runs it"
+        records = self._arm_records(cfg, calls)
+        assert records[calls[0]]["status"] == "ok"
+        assert records[calls[1]] is None, "an OOM arm is never recorded as failed"
+
+
 class TestBackboneLock:
     """specs/ablation-run T7.3 / AC-26."""
 
