@@ -28,6 +28,7 @@ from data.sequence_generator import (
 )
 from utils import (
     autocast_context, get_device, resolve_dtype, make_grad_scaler, artifact_source_revision,
+    atomic_write_json,
 )
 
 logger = logging.getLogger(__name__)
@@ -358,14 +359,17 @@ def run_local_personalization(
 
         assert compute_frozen_checksum(model, moe) == frozen_cksum, "Frozen params mutated during personalization"
 
-        ndcg_with = metrics_with.get("ndcg", {}).get("mean", 0.0)
-        ndcg_without = metrics_without.get("ndcg", {}).get("mean", 0.0)
+        ndcg_with = float(metrics_with.get("ndcg", {}).get("mean", 0.0))
+        ndcg_without = float(metrics_without.get("ndcg", {}).get("mean", 0.0))
         gain = ndcg_with - ndcg_without
 
-        is_cold = any(t in cold_items for t in test_targets)
+        is_cold = bool(any(t in cold_items for t in test_targets))
 
+        # Plain Python types: `user_id` comes from the numpy `test_examples["user_ids"]`
+        # (int32), which json cannot encode -- it discarded every LoRA ablation arm's
+        # record at write time, after the arm had fully trained.
         results.append({
-            "user_id": user_id,
+            "user_id": int(user_id),
             "ndcg_with_lora": ndcg_with,
             "ndcg_without_lora": ndcg_without,
             "gain": gain,
@@ -394,9 +398,14 @@ def _build_report(results: List[Dict], num_users_skipped: int) -> Dict:
     return {
         "num_users_evaluated": len(results),
         "num_users_skipped": num_users_skipped,
-        "with_lora": {"mean": np.mean(with_vals), "std": np.std(with_vals)},
-        "without_lora": {"mean": np.mean(without_vals), "std": np.std(without_vals)},
-        "gain": {"mean": np.mean(gains), "std": np.std(gains), "min": np.min(gains), "max": np.max(gains)},
+        "with_lora": {"mean": float(np.mean(with_vals)), "std": float(np.std(with_vals))},
+        "without_lora": {
+            "mean": float(np.mean(without_vals)), "std": float(np.std(without_vals)),
+        },
+        "gain": {
+            "mean": float(np.mean(gains)), "std": float(np.std(gains)),
+            "min": float(np.min(gains)), "max": float(np.max(gains)),
+        },
         "per_user_gains": [{"user_id": r["user_id"], "gain": r["gain"], "is_cold": r["is_cold"]} for r in results],
         # REV-065 / FR-10: the paired NDCG values, so Ablation E can overlay an arm's
         # users as a third scatter series. `per_user_gains` carries only the difference.
@@ -420,21 +429,14 @@ def _save_report(
     os.makedirs(config.log_dir, exist_ok=True)
     path = os.path.join(config.log_dir, f"personalization_gain_{model_name.replace('-', '_')}.json")
 
-    class NpEncoder(json.JSONEncoder):
-        def default(self, obj):
-            if isinstance(obj, (np.floating, np.integer)):
-                return float(obj)
-            if isinstance(obj, np.ndarray):
-                return obj.tolist()
-            return super().default(obj)
-
     payload = dict(report)
     # AC-09: echo the source_revision of the checkpoint these numbers came from.
     if source_revision is not None:
         payload["source_revision"] = source_revision
 
-    with open(path, "w") as f:
-        json.dump(payload, f, indent=2, cls=NpEncoder)
+    # The shared writer, not a local encoder: the one this replaced mapped every numpy
+    # integer to float, so `user_id` was written as e.g. 123.0.
+    atomic_write_json(path, payload)
 
 
 def _plot_personalization(config: Config, model_name: str, results: List[Dict]) -> None:

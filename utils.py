@@ -88,13 +88,66 @@ def is_oom_error(exc: BaseException) -> bool:
     return isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
 
 
+_PLAIN_JSON_SCALARS = (str, int, float, bool, type(None))
+
+
+def _to_plain_json(obj, path: str, leaks: List[str]):
+    """`obj` with numpy/torch values converted to Python ones; each converted path -> `leaks`.
+
+    `type(...) in` rather than `isinstance`: np.float64 subclasses float and serialises
+    without error, but it is still a numpy value the producer should not have emitted.
+    Anything that is neither plain nor numpy/torch is returned unchanged, so `json.dump`
+    still rejects it -- this converts array-library scalars, it does not hide arbitrary
+    objects.
+    """
+    if type(obj) in _PLAIN_JSON_SCALARS:
+        return obj
+    if isinstance(obj, dict):
+        out = {}
+        for key, value in obj.items():
+            if type(key) not in _PLAIN_JSON_SCALARS and isinstance(key, (np.generic, torch.Tensor)):
+                leaks.append(f"{path}<key {key!r}>")
+                key = key.item()
+            out[key] = _to_plain_json(value, f"{path}.{key}", leaks)
+        return out
+    if isinstance(obj, (list, tuple)):
+        return [_to_plain_json(v, f"{path}[{i}]", leaks) for i, v in enumerate(obj)]
+    if isinstance(obj, (np.generic, np.ndarray, torch.Tensor)):
+        leaks.append(f"{path} ({type(obj).__module__}.{type(obj).__name__})")
+        if isinstance(obj, torch.Tensor):
+            obj = obj.detach().cpu()
+        return obj.tolist() if getattr(obj, "ndim", 0) else obj.item()
+    return obj
+
+
+def to_plain_json(obj):
+    """(converted payload, paths that held numpy/torch values) -- see `_to_plain_json`."""
+    leaks: List[str] = []
+    return _to_plain_json(obj, "$", leaks), leaks
+
+
 def atomic_write_json(path: str, payload, indent: int = 2) -> None:
     """Write JSON so no reader ever sees a torn file (temp + fsync + `os.replace`).
 
     specs/ablation-run D16/D19: arm files, study JSONs and `run_config.json` can be written
     by several processes; `os.replace` makes each write all-or-nothing.
+
+    Numpy/torch scalars and arrays are converted to plain Python values first, with a
+    warning naming every converted field. An arm record is written once, after hours of
+    training, and a numpy int32 in one field used to discard the whole arm (`TypeError`,
+    recorded as failed, exit 0, so a retry re-trained and failed again). Producers are
+    still expected to emit plain types -- the warning, and the tests' `to_plain_json`
+    leak checks, keep a regression visible instead of silently absorbing it.
     """
     import json
+    import logging
+
+    payload, leaks = to_plain_json(payload)
+    if leaks:
+        logging.getLogger(__name__).warning(
+            "atomic_write_json(%s): converted %d numpy/torch value(s) to plain JSON: %s%s",
+            path, len(leaks), ", ".join(leaks[:5]), " ..." if len(leaks) > 5 else "",
+        )
 
     directory = os.path.dirname(os.path.abspath(path))
     os.makedirs(directory, exist_ok=True)
