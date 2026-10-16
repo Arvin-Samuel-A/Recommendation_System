@@ -1071,3 +1071,27 @@ kills its children in a `finally`; run `tests/test_ablation_parallel.py` alone a
     (`diff -rq` against the backup): `ablations/seed_42/`, `checkpoints/ablations/`, `logs/arms/`,
     `plots/arms/`, `plots/ablation_B_t_small.png` (new) and `logs/run_config.json` (overwritten);
     evidence copied to the scratchpad, then `outputs/` restored (`diff -rq` empty).
+
+## Phase 11 — Per-arm reseed; all-AWS run (owner decision 2026-10-16)
+
+Extension FR-19, AC-47–AC-48 (`requirements.md`, last section). The owner decided this run is
+entirely on AWS (4× L4, SDPA): FA3 and the H100 split are out of scope for it, and no packaging
+code changes (the packager already accepts `--h100-studies ""`). The "Rules for BUILD" apply.
+
+- [x] **T11.1: Reseed every arm** — `_run_single_config` calls `utils.set_seed(cfg.seed)` before
+  anything else, so before `build_model` and for stored-backbone arms too. New
+  `tests/test_ablation_reseed.py`: alone vs after another arm vs `--arms` with disturbed RNGs
+  (AC-47); RNG state at every `build_model` on a stored-backbone re-run (AC-48).
+  (FR-19; AC-47, AC-48)
+  - **Done when:** both new tests pass with the change and fail without it; the files below pass
+    with `-m "not slow" -q`.
+  - *BUILD note:* Without the change, AC-47 fails (`input_only` NDCG 0.41933 after
+    `objective_conditioned` vs 0.41508 alone) and AC-48 fails; with it both pass. Sweep, one file at a
+    time, free disk before -> after: `test_ablation_reseed` 2 passed | 54G;
+    `test_ablation_parallel` 33 passed | 53G; `test_ablation_robustness` 31 passed | 52G;
+    `test_resume` 15 passed | 51G; `test_determinism` 6 passed (golden unchanged) | 52G; no leftover
+    processes.
+
+- [ ] **T11.2 (owner, target machine): pre-launch checks** — Package with `--h100-studies ""
+  --aws-studies A,B,C,D,E,F,G,H --aws-gpus 4 --estimate-json estimate_gpu0.json`; smoke
+  `H:H2_seq200` and `G:K8` for a few steps on an L4 and record peak memory (expected ~14 of 23 GB).

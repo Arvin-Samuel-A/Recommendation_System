@@ -659,3 +659,56 @@ subprocesses.
   epochs.
 - **AC-46:** The packager exits non-zero for a study on both machines, duplicate or non-integer
   GPU ids, and `--gpus 0`.
+
+# Extension: per-arm reseed and the all-AWS run (owner decision 2026-10-16)
+
+Added after Phase 10. FR-1–FR-18 and AC-01–AC-46 are unchanged except where noted.
+
+## Owner decision: the whole run is on AWS with SDPA
+
+This run executes **all eight studies (A–H) on the AWS VM (4× L4) with the SDPA attention
+backend**. The H100 is not used. For this run, therefore:
+
+- FA3 (FR-2, FR-3, G3) and the H100/AWS split of studies (FR-12's two-machine packaging, the
+  H100 half of AC-44) are **out of scope**. The code and tests for them stay as they are; nothing
+  is removed.
+- The packager already supports this configuration without code changes:
+  `--h100-studies "" --aws-studies A,B,C,D,E,F,G,H --aws-gpus 4`, with `--estimate-json`
+  pointing at the L4 measurements (`estimate_gpu0.json`) for an accurate plan.
+- Before launch the owner smoke-tests the two largest arms, `H:H2_seq200` and `G:K8`, for a few
+  steps for memory (expected ~14 of 23 GB at batch 256; `seq200` has not yet run on an L4).
+- Optional, not blocking: the packager writes an empty `run_h100.sh` when the H100 has no studies;
+  it is harmless.
+
+## Problem
+
+`main.py` seeds once per process (`setup_seed`). Nothing reseeded between ablation arms, so each
+arm inherited whatever global RNG state the earlier arms in the same process left. A result then
+depended on execution order: measured on the 10% sample, `H2_seq4` scored NDCG 0.4154 after the
+earlier H arms and 0.4018 alone. With `--arms` splitting studies across GPUs, the same arm would
+score differently depending on which GPU script it landed in.
+
+## Functional Requirements
+
+### FR-19: Every arm starts from the configured seed
+
+- `_run_single_config` calls `utils.set_seed(cfg.seed)` first, before any model is built (weight
+  initialisation draws from the global generators).
+- This applies to **every** arm, including arms that reuse a stored backbone: their post-training
+  steps draw random numbers too (LoRA initialisation, federated client choice, evaluation
+  negatives).
+- Resume is unaffected: a resumed `run_pretrain` restores the checkpoint's saved RNG state, which
+  overrides the fresh seed, as it should (FR-8).
+- Side effect, intended: arms with the same architecture start from identical initial weights, so
+  differences between arms come from the arm, not from the random start.
+- Limit: GPU training is still not bit-for-bit reproducible, because some CUDA kernels are
+  non-deterministic. FR-19 removes the much larger execution-order effect, not that residue.
+
+## Acceptance Criteria
+
+- **AC-47:** On the tiny fixture, study B's `input_only` arm has identical metrics when run alone
+  (`--arms input_only`), after `objective_conditioned` in a full study run, and under `--arms`
+  after the global RNGs were disturbed. Without FR-19 the second comparison fails.
+- **AC-48:** On a re-run that loads stored backbones (shared store, fresh results dir, global RNGs
+  disturbed first), the global torch/numpy/python RNG state at every `build_model` call equals the
+  state right after `set_seed(cfg.seed)`.

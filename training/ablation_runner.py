@@ -513,7 +513,15 @@ def _run_single_config(
     from data.sequence_generator import (
         load_tensorised, load_eval_candidates, load_metadata_matrix,
     )
-    from utils import get_device, artifact_source_revision
+    from utils import get_device, artifact_source_revision, set_seed
+
+    # Every arm starts from the configured seed, so its result does not depend on which
+    # arms ran earlier in this process (H2_seq4 scored 0.4154 after the earlier H arms and
+    # 0.4018 alone). It runs before any model is built -- weight init draws from the global
+    # generators -- and also for arms that reuse a stored backbone, whose post-training
+    # steps (LoRA init, federated client choice, eval negatives) draw random numbers too.
+    # A resumed `run_pretrain` restores its checkpoint's RNG state over this, as it should.
+    set_seed(cfg.seed)
 
     label = getattr(cfg, "_study_label", "unknown")
     result = {
