@@ -442,3 +442,259 @@ class TestPackagerRefusesUncommittedCode:
         assert allowed.returncode == 0, allowed.stdout + allowed.stderr
         assert "WARNING (--allow-dirty)" in allowed.stdout
         assert "scripts/install_fa3.sh" in self._members(tmp_path / "dist2")
+
+
+# ---------------------------------------------------------------- Phase 10 packager (T10.8/T10.9)
+
+
+def _packager():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "package_ablation_run_under_test", os.path.join(ROOT, "scripts", "package_ablation_run.py"),
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _tiny_factory(cfg):
+    import copy
+    from dataclasses import asdict
+
+    from configs.config import Config
+
+    values = asdict(cfg)
+
+    class _TinyConfig(Config):
+        def __init__(self):
+            super().__init__()
+            for key, value in values.items():
+                setattr(self, key, copy.deepcopy(value))
+
+    return _TinyConfig
+
+
+class TestPlannerCore:
+    """T10.8 / AC-45, AC-46."""
+
+    def test_planner_fingerprints_equal_the_run(self, tiny_processed_dir, tmp_path, monkeypatch):
+        import json
+
+        import main as cli
+        from tests.conftest import tiny_config
+
+        pk = _packager()
+        cfg = tiny_config(tiny_processed_dir(), str(tmp_path), pretrain_epochs=1,
+                          max_steps_per_epoch=1, ablation_eval_examples=16)
+        factory = _tiny_factory(cfg)
+        planned = {}
+        for study in ("B", "H"):
+            base = pk.base_config_from_argv(
+                ["--stage", "ablation", "--study", study, "--model", "t-small"], factory,
+            )
+            for arm in pk.resolve_machine_arms(base, [study], tiny_processed_dir()):
+                planned[arm["key"]] = arm["fingerprint"]
+
+        # Run one arm per distinct fingerprint through main, exactly as a launch would.
+        monkeypatch.setattr(cli, "Config", factory)
+        firsts = {}
+        for key, fp in planned.items():
+            firsts.setdefault(fp, key)
+        for key in firsts.values():
+            study, label = key.split(":")
+            cli.main(["--stage", "ablation", "--study", study, "--arms", label, "--model", "t-small"])
+        recorded = {}
+        arms_root = os.path.join(cfg.ablation_dir, "seed_42", "arms")
+        for sub in os.listdir(arms_root):
+            for name in os.listdir(os.path.join(arms_root, sub)):
+                record = json.load(open(os.path.join(arms_root, sub, name)))
+                recorded[f"{record['study']}:{record['label']}"] = record["training_fingerprint"]
+        assert set(recorded) == set(firsts.values())
+        assert all(planned[k] == v for k, v in recorded.items()), (planned, recorded)
+        # H2_seq8 is the base width on the tiny config, so it shares B's base fingerprint.
+        assert planned["H:H2_seq8"] == planned["B:objective_conditioned"]
+        assert len(set(planned.values())) == len(firsts) == 5
+
+    def test_lpt_matches_a_hand_computed_assignment(self):
+        pk = _packager()
+        groups = [
+            {"name": n, "hours": h, "sort_key": (0, i), "arms": [{"key": n}]}
+            for i, (n, h) in enumerate([("a", 5), ("b", 3), ("c", 4), ("d", 3), ("e", 2)])
+        ]
+        bins = pk.lpt_assign(groups, 2)
+        # 5->g0, 4->g1, 3(b, earlier)->g1 (4<5), 3(d)->g0 (5<7), 2->g1 (7<8)
+        assert [[g["name"] for g in b] for b in bins] == [["a", "d"], ["c", "b", "e"]]
+        assert pk.lpt_assign(groups, 2) == bins  # deterministic
+
+    def test_fallback_hours(self):
+        from configs.config import Config
+
+        pk = _packager()
+
+        def hours(S, fraction=0.1, epochs=20):
+            cfg = Config()
+            cfg.max_seq_length, cfg.user_sample_fraction, cfg.pretrain_epochs = S, fraction, epochs
+            return pk.fallback_training_hours(cfg)
+
+        assert hours(200) > hours(100) > hours(50) == hours(25) == pytest.approx(1.81)
+        assert hours(200) == pytest.approx(9.0) and hours(100) == pytest.approx(4.5)
+        assert hours(50, fraction=0.2) == pytest.approx(2 * hours(50))
+        assert hours(100, epochs=10) == pytest.approx(hours(100) / 2)
+
+    def test_estimate_json_overrides_matched_groups(self, tiny_processed_dir, tmp_path):
+        import json
+
+        from tests.conftest import tiny_config
+
+        pk = _packager()
+        cfg = tiny_config(tiny_processed_dir(), str(tmp_path))
+        base = pk.base_config_from_argv(
+            ["--stage", "ablation", "--study", "H", "--model", "t-small"], _tiny_factory(cfg),
+        )
+        arms = pk.resolve_machine_arms(base, ["H"], tiny_processed_dir())
+        estimate = tmp_path / "estimate.json"
+        estimate.write_text(json.dumps({"models": {"t-small": {"configs": [
+            {"arms": ["H:H2_seq16"], "run_hours": 7.5},
+            {"arms": ["H:H1_no_metadata"], "oom": True},
+        ]}}}))
+        groups = pk.build_groups(arms, pk.load_estimate_hours(str(estimate), "t-small"))
+        by_arm = {a["key"]: g for g in groups for a in g["arms"]}
+        assert by_arm["H:H2_seq16"]["training_hours"] == 7.5
+        assert by_arm["H:H2_seq16"]["hours_source"] == "estimate-json"
+        assert by_arm["H:H1_no_metadata"]["hours_source"] == "fallback"
+
+    @pytest.mark.parametrize("extra,message", [
+        (["--h100-studies", "A,B", "--aws-studies", "B,C"], "listed for both machines"),
+        (["--aws-gpu-ids", "0,0,1"], "duplicates"),
+        (["--aws-gpu-ids", "0,x"], "integers"),
+        (["--gpus", "0"], "--gpus must be >= 1"),
+    ])
+    def test_refusals(self, tiny_processed_dir, tmp_path, extra, message):
+        processed = tiny_processed_dir(user_sample_fraction=0.5, sequence_length_grid=[25, 50, 100, 200])
+        out = run_script([
+            "scripts/package_ablation_run.py", "--user-sample-fraction", "0.5",
+            "--processed-dir", processed, "--out", str(tmp_path / "dist"), "--skip-data",
+            "--allow-dirty", *extra,
+        ])
+        assert out.returncode not in (0, None)
+        assert message in out.stdout + out.stderr
+
+
+class TestMultiGpuLaunch:
+    """T10.9 / AC-43, AC-44."""
+
+    FLAGS = (
+        "--model t-base --seed 42 --user_sample_fraction 0.5 --user_sample_seed 42 "
+        "--dtype bf16 --mixed_precision --batch_size 256"
+    )
+
+    @pytest.fixture
+    def processed(self, tiny_processed_dir):
+        return tiny_processed_dir(user_sample_fraction=0.5, sequence_length_grid=[25, 50, 100, 200])
+
+    def _package(self, processed, out, *extra):
+        result = run_script([
+            "scripts/package_ablation_run.py", "--user-sample-fraction", "0.5",
+            "--processed-dir", processed, "--out", str(out), "--skip-data", "--allow-dirty", *extra,
+        ])
+        assert result.returncode == 0, result.stdout + result.stderr
+        return out / "launch"
+
+    @staticmethod
+    def _files(launch):
+        return {p.name: p.read_bytes() for p in sorted(launch.iterdir())}
+
+    def test_one_gpu_is_byte_identical_to_no_flag(self, processed, tmp_path):
+        plain = self._files(self._package(processed, tmp_path / "plain"))
+        one = self._files(self._package(processed, tmp_path / "one", "--gpus", "1"))
+        assert plain == one
+        assert set(plain) == {"LAUNCH.md", "run_aws.sh", "run_h100.sh"}
+
+    def test_four_aws_gpus(self, processed, tmp_path):
+        import json
+        import re
+        import subprocess as sp
+
+        extra = ("--aws-gpus", "4", "--h100-studies", "A,D,E", "--aws-studies", "B,C,F,G,H")
+        launch = self._package(processed, tmp_path / "a", *extra)
+        again = self._package(processed, tmp_path / "b", *extra)
+        assert self._files(launch) == self._files(again), "the plan must be deterministic"
+
+        plan = json.loads((launch / "plan_aws.json").read_text())
+        assert plan["gpu_ids"] == ["0", "1", "2", "3"]
+        assert (launch / "run_h100.sh").read_text().startswith("#!/usr/bin/env bash")
+        assert not list(launch.glob("run_h100_gpu*.sh"))
+
+        # Every AWS arm in exactly one GPU script; groups never split.
+        from training.ablation_runner import resolve_study_configs
+        from configs.config import Config
+
+        expected = {
+            f"{s}:{c._study_label}" for s in "BCFGH" for c in resolve_study_configs(s, Config())
+        }
+        seen = {}
+        for gpu in plan["gpu_ids"]:
+            script = launch / f"run_aws_gpu{gpu}.sh"
+            if not plan["gpus"][gpu]["commands"]:
+                assert not script.exists()
+                continue
+            text = script.read_text()
+            assert f"export CUDA_VISIBLE_DEVICES={gpu}\n" in text
+            assert "verify_attention_backend" not in text  # sdpa machine: no FA3 gate
+            joined = text.replace("\\\n", " ")
+            commands = [l for l in joined.splitlines() if "--stage ablation --study" in l]
+            assert commands
+            for command in commands:
+                assert "scripts/run_with_retry.py" in command
+                assert self.FLAGS in command and "--attention_backend sdpa --num_workers 8 --arms " in command
+                study = re.search(r"--study (\w+)", command).group(1)
+                for label in re.search(r"--arms (\S+)", command).group(1).split(","):
+                    key = f"{study}:{label}"
+                    assert key not in seen, f"{key} is scheduled twice"
+                    seen[key] = gpu
+            assert sp.run(["bash", "-n", str(script)]).returncode == 0
+        assert set(seen) == expected
+        for group in plan["groups"]:
+            assert len({seen[a] for a in group["arms"]}) == 1, f"group split: {group['arms']}"
+            assert {seen[a] for a in group["arms"]} == {group["gpu"]}
+
+        # Independent LPT over the plan's own groups reproduces the assignment.
+        loads = {g: 0.0 for g in plan["gpu_ids"]}
+        order = sorted(range(len(plan["groups"])), key=lambda i: -plan["groups"][i]["hours"])
+        mine = {}
+        for i in order:  # groups are listed in first-arm order, so the index breaks ties
+            gpu = min(plan["gpu_ids"], key=lambda g: (loads[g], int(g)))
+            loads[gpu] += plan["groups"][i]["hours"]
+            mine[i] = gpu
+        assert all(plan["groups"][i]["gpu"] == g for i, g in mine.items())
+        for gpu, info in plan["gpus"].items():
+            assert info["hours"] == pytest.approx(loads[gpu], abs=1e-3)
+            assert all(seen[k] == gpu for k in info["arms"])
+
+        driver = (launch / "run_aws.sh").read_text()
+        busy = [g for g in plan["gpu_ids"] if plan["gpus"][g]["commands"]]
+        assert f"for G in {' '.join(busy)}; do" in driver
+        assert 'bash "launch/run_aws_gpu${G}.sh" > "logs/run_aws_gpu${G}.log" 2>&1 &' in driver
+        assert driver.index("\nwait\n") < driver.index("main.py --stage ablation_collect")
+        assert "for STUDY in B C F G H; do" in driver
+        assert sp.run(["bash", "-n", str(launch / "run_aws.sh")]).returncode == 0
+
+        md = (launch / "LAUNCH.md").read_text()
+        for gpu in busy:
+            assert (f"setsid nohup bash launch/run_aws_gpu{gpu}.sh > logs/run_aws_gpu{gpu}.log "
+                    "2>&1 < /dev/null &") in md
+        for study in "BCFGH":
+            assert f"--stage ablation_collect --study {study} " in md
+        assert "setsid nohup bash launch/run_aws.sh > logs/run_aws.log 2>&1 < /dev/null &" in md
+
+    def test_fa3_machine_gets_a_gate_per_gpu(self, processed, tmp_path):
+        launch = self._package(processed, tmp_path / "h", "--h100-gpu-ids", "2,5")
+        plan_ids = __import__("json").loads((launch / "plan_h100.json").read_text())["gpu_ids"]
+        assert plan_ids == ["2", "5"]
+        for gpu in plan_ids:
+            text = (launch / f"run_h100_gpu{gpu}.sh").read_text()
+            assert f"export CUDA_VISIBLE_DEVICES={gpu}\n" in text
+            assert text.index(f"export CUDA_VISIBLE_DEVICES={gpu}") < text.index(
+                f"verify_attention_backend.py --backend flash_attention_3") < text.index("--stage ablation --study")
+            assert f"logs/verify_fa3_gpu{gpu}.json" in text

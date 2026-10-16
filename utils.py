@@ -72,6 +72,31 @@ def is_oom_error(exc: BaseException) -> bool:
     return isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
 
 
+def atomic_write_json(path: str, payload, indent: int = 2) -> None:
+    """Write JSON so no reader ever sees a torn file (temp + fsync + `os.replace`).
+
+    specs/ablation-run D16/D19: arm files, study JSONs and `run_config.json` can be written
+    by several processes; `os.replace` makes each write all-or-nothing.
+    """
+    import json
+
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    tmp = f"{path}.tmp-{os.getpid()}"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(payload, f, indent=indent)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def atomic_torch_save(obj, path: str) -> None:
     """`torch.save` that never leaves a truncated file under `path` (specs/ablation-run D8).
 

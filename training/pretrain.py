@@ -784,6 +784,9 @@ def _capture_rng_state(
         "torch_mask": mask_rng.get_state(),
         "torch_cpu": torch.get_rng_state(),
         "torch_cuda": torch.cuda.get_rng_state_all() if device.type == "cuda" else None,
+        # specs/ablation-run D18: which entry of `torch_cuda` is THIS process's device, so a
+        # resume that sees a different number of GPUs restores the right one.
+        "torch_cuda_index": torch.cuda.current_device() if device.type == "cuda" else None,
         "torch_mps": torch.mps.get_rng_state() if device.type == "mps" else None,
         # Not read by the training step today; saved so a future reader cannot drift.
         "python_global": random.getstate(),
@@ -802,8 +805,23 @@ def _restore_rng_state(
     neg_rng.set_state(state["numpy_neg"])
     mask_rng.set_state(state["torch_mask"])
     torch.set_rng_state(state["torch_cpu"])
-    if device.type == "cuda" and state.get("torch_cuda") is not None:
-        torch.cuda.set_rng_state_all(state["torch_cuda"])
+    saved_cuda = state.get("torch_cuda")
+    if device.type == "cuda" and saved_cuda is not None:
+        visible = torch.cuda.device_count()
+        if len(saved_cuda) == visible:
+            torch.cuda.set_rng_state_all(saved_cuda)
+        else:
+            # specs/ablation-run FR-16 / D18: each process normally sees one GPU through
+            # CUDA_VISIBLE_DEVICES, and a takeover may run where a different count is
+            # visible. Restore the saving process's own device state onto ours.
+            index = state.get("torch_cuda_index") or 0
+            index = min(max(int(index), 0), len(saved_cuda) - 1)
+            torch.cuda.set_rng_state(saved_cuda[index])
+            logger.warning(
+                "Resume: the checkpoint saved %d CUDA RNG states but %d device(s) are "
+                "visible; restored state %d onto the current device.",
+                len(saved_cuda), visible, index,
+            )
     if device.type == "mps" and state.get("torch_mps") is not None:
         torch.mps.set_rng_state(state["torch_mps"])
     if state.get("python_global") is not None:

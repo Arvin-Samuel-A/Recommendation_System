@@ -20,7 +20,7 @@ The research project requires 8 ablation studies (A–H), each comparing multipl
 
 - GUI or web interface
 - Experiment tracking platform integration (MLflow, W&B)
-- Parallel ablation execution
+- Parallel ablation execution *(superseded by `ablation-run` FR-14–FR-18, owner decision 2026-10-16: a study's arms may run in parallel processes on GPUs of one machine; the study JSON is assembled from per-arm results)*
 
 ## Functional Requirements
 

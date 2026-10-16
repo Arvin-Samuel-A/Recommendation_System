@@ -255,7 +255,7 @@ Each ablation is config-driven — no source code edits required.
 
 | Flag | Values | Description |
 |---|---|---|
-| `--stage` | `preprocess`, `pretrain`, `personalize`, `federated`, `evaluate`, `cold_start`, `longtail`, `latency`, `routing_diagnostics`, `gradient_diagnostics`, `ablation`, `plots`, `all` | Pipeline stage to run |
+| `--stage` | `preprocess`, `pretrain`, `personalize`, `federated`, `evaluate`, `cold_start`, `longtail`, `latency`, `routing_diagnostics`, `gradient_diagnostics`, `ablation`, `ablation_collect`, `plots`, `all` | Pipeline stage to run (`ablation_collect`: assemble study JSON + plots from persisted arms, train nothing; exit 1 if a study is incomplete) |
 | `--model` | `t-small`, `t-base`, `t-large` | Model size variant |
 | `--epochs` | integer | Override `pretrain_epochs` (pretrain) or `federated_rounds` (federated) |
 | `--batch_size` | integer | Override `batch_size` for all stages |
@@ -277,6 +277,8 @@ Each ablation is config-driven — no source code edits required.
 | `--num_workers` | integer | DataLoader workers (same batches as 0 workers) |
 | `--min_lr_ratio` | float in [0, 1] | Cosine LR floor as a fraction of the peak LR (default 0.1) |
 | `--no_resume` | flag | Ignore `last.pt` and persisted ablation arms; start from scratch |
+| `--arms` | comma-separated labels | `--stage ablation` only: run just these arms of ONE `--study` (e.g. `--study H --arms H2_seq200`); an unknown label fails before any work |
+| `--allow_incomplete` | flag | `ablation_collect` only: assemble a study with missing/failed/stale arms as placeholders (never an inconsistent one) |
 
 All CLI overrides are logged with original and new values. A stage that runs out of GPU
 memory exits with status **75** so `scripts/run_with_retry.py` can re-run it.
@@ -317,6 +319,44 @@ tail -f logs/run_h100.log logs/ablation_A_t_base_seed42.log
   `outputs/plots/`, `logs/` and each backbone's training logs
   (`outputs/checkpoints/ablations/by_fingerprint/<fp>/logs/`) from both machines; every arm records the backend and device it
   ran on under `runtime`.
+
+### Splitting studies across GPUs
+
+On a machine with several GPUs the packager plans that machine's arms over them
+(`specs/ablation-run` FR-14–FR-18). The generated `launch/LAUNCH.md` remains the per-run source
+of truth for the exact commands; this is the overview.
+
+```bash
+uv run python scripts/package_ablation_run.py --aws-gpus 4 \
+    --h100-studies A,D,E --aws-studies B,C,F,G,H \
+    --estimate-json estimate.json      # optional: scripts/estimate_training_time.py --out
+```
+
+| Packager option | Meaning |
+|---|---|
+| `--gpus N` | GPUs on every machine (default 1 = the single sequential loop, unchanged output). It also applies to the usually single-GPU H100 (the packager warns); prefer `--aws-gpus N` |
+| `--h100-gpus N` / `--aws-gpus N` | Per-machine GPU count |
+| `--h100-gpu-ids` / `--aws-gpu-ids` | Explicit `CUDA_VISIBLE_DEVICES` ids, e.g. `0,1,2,3` |
+| `--estimate-json PATH` | Training hours per arm from `estimate_training_time.py --out`; otherwise the L4 fallback (1.81 h for ≤ 50 positions, 4.5 h × S/100 above, scaled by user fraction and epochs) |
+| `--allow-dirty` | Package an uncommitted tree (otherwise refused) |
+
+- **Plan.** Arms that share a training fingerprint are one group and always land on the same
+  GPU; groups are assigned longest-first to the least-loaded GPU. `launch/plan_<machine>.json`
+  lists each group, its fingerprint and hours, and each GPU's arms and hours.
+- **Launch.** The machine's usual one-liner runs `launch/run_<machine>.sh`, which starts one
+  `launch/run_<machine>_gpu<id>.sh` per GPU in the background (each exports
+  `CUDA_VISIBLE_DEVICES` and runs `--study X --arms ...` commands through the retry wrapper),
+  waits for all of them, then runs `--stage ablation_collect` for every study. Per-GPU logs:
+  `logs/run_<machine>_gpu<id>.log` and `logs/ablation_<model>_seed<seed>_gpu<id>_NN_<study>.log`.
+- **Study outputs.** Each arm is persisted on its own; a study's JSON and plots are written,
+  under a per-study lock, by whichever process completes the study (others log `... arms
+  complete; missing [...] -- study JSON and plots deferred ...`), and again by the final
+  collect. Re-run `python main.py --stage ablation_collect --study X ...` (same flags as the
+  run) at any time; it exits 1 and lists missing, failed, stale or inconsistent arms.
+- **Waiting.** A process that needs a backbone another process is training logs
+  `Backbone <fp> is being trained by another process (pid host time: ...) -- waiting for its
+  lock` once and then reuses it; if the holder dies, the waiter resumes the holder's
+  `last.pt`. The planner avoids this by keeping groups on one GPU.
 
 ---
 

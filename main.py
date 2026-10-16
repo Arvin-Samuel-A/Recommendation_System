@@ -26,6 +26,8 @@ VALID_STAGES = [
     # feeds personalization_gain_vs_lora_rank.png had no entry points at all.
     "lora_rank_sweep", "multi_seed",
     "ablation", "plots", "all",
+    # specs/ablation-run FR-15: assemble study JSON + plots from persisted arm files.
+    "ablation_collect",
 ]
 
 VALID_MODELS = ["t-small", "t-base", "t-large"]
@@ -124,6 +126,17 @@ def parse_args(argv=None):
     parser.add_argument(
         "--no_resume", action="store_true", default=False,
         help="Ignore last.pt and persisted ablation arms; train/evaluate from scratch.",
+    )
+    # specs/ablation-run FR-14: run only some arms of one study (labels as resolved for
+    # this config, e.g. H2_seq200, K6). Selects runs, like --study; not a Config field.
+    parser.add_argument(
+        "--arms", default=None,
+        help="Ablations only: comma-separated arm labels of ONE --study to run.",
+    )
+    parser.add_argument(
+        "--allow_incomplete", action="store_true", default=False,
+        help="ablation_collect only: assemble a study even if arms are missing/failed/stale "
+             "(placeholders in the JSON; plots of the ok arms). Never for an inconsistent study.",
     )
     return parser.parse_args(argv)
 
@@ -248,7 +261,7 @@ def setup_seed(config: Config) -> None:
     set_seed(config.seed)
 
 
-def save_config_snapshot(config: Config) -> None:
+def save_config_snapshot(config: Config, selection: Optional[dict] = None) -> None:
     """Write the RESOLVED run manifest.
 
     REV-029: this ran before any stage called `apply_model_config`, so `run_config.json`
@@ -265,6 +278,11 @@ def save_config_snapshot(config: Config) -> None:
     path = os.path.join(config.log_dir, "run_config.json")
 
     manifest = {"config": asdict(config)}
+    # specs/ablation-run FR-17: which runs this process selected (several processes may
+    # share one log dir when a study's arms are split across GPUs).
+    manifest["selection"] = selection if selection is not None else getattr(
+        config, "_run_selection", None,
+    )
     try:
         device = get_device(config)
         manifest["runtime"] = {
@@ -293,8 +311,10 @@ def save_config_snapshot(config: Config) -> None:
     except Exception as exc:  # never let manifest-writing abort a run
         logger.warning("Could not resolve source_revision for the manifest: %s", exc)
 
-    with open(path, "w") as f:
-        json.dump(manifest, f, indent=2)
+    # FR-17 / D19: atomic, so concurrent processes never leave a torn file.
+    from utils import atomic_write_json
+
+    atomic_write_json(path, manifest)
 
 
 def run_preprocess(config, args):
@@ -700,9 +720,59 @@ def run_gradient_diagnostics_stage(config, args):
 def run_ablation_stage(config, args):
     from training.ablation_runner import run_ablation
     # REV-115: `--no_train` reaches the `train` parameter that already existed here.
+    from training.ablation_runner import parse_arms
     return run_ablation(
         config, args.model, args.study, train=not getattr(args, "no_train", False),
+        arms=parse_arms(getattr(args, "arms", None)),
     )
+
+
+def run_ablation_collect_stage(config, args):
+    """`--stage ablation_collect`: study JSON + plots from persisted arms (FR-15, D17).
+
+    Trains and evaluates nothing. Exits 1 if any requested study could not be assembled
+    (listing its missing / failed / stale / inconsistent arms).
+    """
+    from training.ablation_runner import (
+        STUDY_CONFIGS, _save_summary, collect_study,
+    )
+
+    allow = getattr(args, "allow_incomplete", False)
+    studies = list(STUDY_CONFIGS) if args.study == "all" else [args.study]
+    if any(s not in STUDY_CONFIGS for s in studies):
+        raise ValueError(f"Unknown study '{args.study}'. Choose from {list(STUDY_CONFIGS)} or all")
+    assembled, incomplete, failed_studies = {}, {}, []
+    for study in studies:
+        assessment = collect_study(config, args.model, study, allow_incomplete=allow)
+        if assessment.written:
+            from training.ablation_runner import _results_root
+
+            mn = args.model.replace("-", "_")
+            with open(os.path.join(_results_root(config), f"{study}_{mn}.json")) as f:
+                assembled[study] = json.load(f)
+            logger.info("Collected %s", assessment.describe())
+            if not assessment.complete:
+                incomplete[study] = {
+                    "missing": assessment.missing + assessment.stale,
+                    "failed": sorted(assessment.failed),
+                }
+        else:
+            failed_studies.append(study)
+            logger.error("NOT collected -- %s", assessment.describe())
+            incomplete[study] = {
+                "missing": assessment.missing + assessment.stale,
+                "failed": sorted(assessment.failed),
+                "inconsistent": assessment.inconsistent,
+            }
+    if args.study == "all":
+        _save_summary(
+            config, args.model,
+            {s: r for s, r in assembled.items() if s not in incomplete},
+            incomplete=incomplete,
+        )
+    if failed_studies:
+        logger.error("ablation_collect: studies not assembled: %s", failed_studies)
+        raise SystemExit(1)
 
 
 def run_plots_stage(config, args):
@@ -1030,6 +1100,7 @@ STAGE_MAP = {
     "lora_rank_sweep": run_lora_rank_sweep_stage,
     "multi_seed": run_multi_seed_stage,
     "ablation": run_ablation_stage,
+    "ablation_collect": run_ablation_collect_stage,
     "plots": run_plots_stage,
     "all": run_all_pipeline,
 }
@@ -1059,13 +1130,34 @@ def _resolve_before_snapshot(config: Config, args) -> None:
             logger.warning("Could not read %s for the manifest: %s", meta_path, exc)
 
 
+def _validate_arm_selection(config: Config, args) -> None:
+    """specs/ablation-run FR-14: reject a bad `--arms` before anything else happens."""
+    if getattr(args, "arms", None) is None:
+        return
+    if args.stage != "ablation":
+        raise ValueError(f"--arms is only valid with --stage ablation (got --stage {args.stage})")
+    from training.ablation_runner import parse_arms, select_study_configs
+
+    probe = copy.deepcopy(config)
+    probe.apply_model_config(args.model)
+    select_study_configs(args.study, probe, parse_arms(args.arms))
+
+
 def main(argv=None):
     args = parse_args(argv)
     config = Config()
     apply_cli_overrides(config, args)
+    _validate_arm_selection(config, args)
     # REV-029: resolve the model config and dataset-derived fields BEFORE snapshotting.
     _resolve_before_snapshot(config, args)
     setup_seed(config)
+    # FR-17: the selection travels on the config (not a dataclass field, so it is in
+    # neither the fingerprint nor asdict()) and is recorded by the snapshot.
+    config._run_selection = {
+        "stage": args.stage,
+        "study": getattr(args, "study", None),
+        "arms": getattr(args, "arms", None),
+    }
     save_config_snapshot(config)
     # Every stage's forward passes (training, evaluation, LoRA, federated, ablations) run
     # under one autocast region; it is a no-op unless mixed_precision is on.

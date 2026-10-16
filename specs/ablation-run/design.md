@@ -539,3 +539,245 @@ OOM anywhere → **exit 75** → run_with_retry waits → same command → reuse
 - Experiment runs use mixed bf16; default unchanged (`architecture.md`, `code-quality.md`).
 - New durable rules: stored width vs model width (`conventions.md`), dev-host test hygiene and tiny
   data (`testing.md`), batched per-step finite checks and atomic checkpoints (`code-quality.md`).
+
+---
+
+# Extension design: splitting a study's arms across GPUs (FR-14–FR-18, owner 2026-10-16)
+
+Built on the code at `e0729ab` (re-read for this extension; see requirements "Re-verified at
+`e0729ab`"). Reused as-is: `resolve_study_configs` / `_study_entries`, `_training_fingerprint`,
+`backbone_lock` + `find_backbone` re-check, `run_pretrain` resume from `last.pt`, per-arm files
+(`_arm_path`, `_arm_key`, `_load_persisted_arm`, `_write_json_atomic`), `_save_study_results`,
+`_plot_study`, `_STUDY_PLOTS`, `_save_summary`, `main.is_oom_error` → exit 75,
+`scripts/run_with_retry.py`, and the packager's command builder, readiness check and tarballs.
+
+## Files (extension)
+
+| File | Action | Role |
+|---|---|---|
+| `training/ablation_runner.py` | modify | `parse_arms`/`select_study_configs`, `resolve_dataset_fields`, generic `file_lock` (backbone lock delegates), study lock + `write_study_outputs`, `assess_study`/`collect_study`, failed-arm persistence, arm-scoped side outputs, `run_ablation(..., arms=None)` |
+| `main.py` | modify | `--arms`, `--allow_incomplete`, stage `ablation_collect`, atomic `run_config.json` with the selection |
+| `utils.py` | modify | `atomic_write_json` (ablation runner's `_write_json_atomic` delegates to it) |
+| `training/pretrain.py` | modify | device-count-tolerant CUDA RNG restore; save the current CUDA device index |
+| `scripts/package_ablation_run.py` | modify | GPU options, planner (groups, cost model, LPT), per-GPU scripts, driver, plan JSON, LAUNCH.md |
+| `tests/test_ablation_parallel.py` | new | FR-14–FR-17 in-process tests and real-subprocess concurrency tests |
+| `tests/test_scripts.py` | modify | FR-18 packager tests |
+| `tests/test_resume.py` | modify | AC-41 |
+| `README.md` | modify | `--arms`, `ablation_collect`, multi-GPU packaging |
+
+## D15 — Arm selection (FR-14)
+
+```python
+def parse_arms(text: Optional[str]) -> Optional[List[str]]   # None -> None; "a, b,a" -> ["a","b"]; "" / " , " -> ValueError
+def select_study_configs(study, base_config, arms) -> List[Config]
+    # arms None -> resolve_study_configs(study, base_config) unchanged
+    # study == "all" -> ValueError("--arms needs exactly one --study ...")
+    # unknown -> ValueError(f"Study {study} has no arm(s) {bad}; valid labels: {labels}")
+    # else the resolved configs for `arms`, in the given order
+```
+`run_ablation(config, model_name, study="all", train=True, arms=None)` calls
+`select_study_configs` **first** (before `check_processed_dir`), so a typo costs nothing.
+Labels come from `_study_entries`, so grid labels follow the run's `sequence_length_grid` /
+`expert_count_grid`. `main.py`: `--arms` (str, default `None`); `main()` raises `ValueError` if
+`--arms` is given with a stage other than `ablation`; `run_ablation_stage` passes
+`arms=parse_arms(args.arms)`. A `ValueError` exits 1 through Python's default handler, which
+`run_with_retry.py` does not retry. `--arms` is not a `Config` field: like `--study`, it selects
+runs and must not enter the fingerprint or `arm_key`.
+
+## D16 — Study outputs written once, under a lock (FR-15)
+
+- `file_lock(path, timeout=None, poll=..., on_wait=None)`: the `flock` loop extracted from
+  `backbone_lock`, which keeps its signature, log message and behaviour (its tests stay green).
+- `_study_lock(config, study, model_name)` = `file_lock({root}/arms/{study}_{mn}/.study.lock)`.
+- `write_study_outputs(config, model_name, study, results)`: under the study lock,
+  `_save_study_results` (already atomic) → `_plot_study` → `_STUDY_PLOTS[study]` (exceptions in
+  named figures still only logged). The full-run path (no `--arms`) calls it in place of the
+  three calls it makes today: same files, same content plus `code_revision`.
+- Arm persistence: before writing, every result gets `arm_key` and
+  `code_revision = get_source_revision()`; the arm file is written for `ok` **and** `failed`
+  results (the `except` branch builds the failed record as today, then persists it). OOM still
+  re-raises before anything is written.
+- Why per-arm files + assembly rather than merging into the study JSON under a lock: the arm files
+  already exist and are written atomically by exactly one process each; a study JSON that grows
+  arm by arm would be a partial study that plots and readers could mistake for a complete one.
+
+## D17 — Assessment and collection (FR-15)
+
+```python
+@dataclass
+class StudyAssessment:
+    labels: List[str]                 # expected, study order
+    ok: Dict[str, dict]; failed: Dict[str, dict]
+    missing: List[str]; stale: List[str]
+    inconsistent: List[str]           # human-readable "field X differs: a=..., b=..."
+    @property
+    def complete(self): return not (self.missing or self.stale or self.failed or self.inconsistent)
+
+def assess_study(config, model_name, study) -> StudyAssessment
+def collect_study(config, model_name, study, allow_incomplete=False) -> StudyAssessment
+```
+- `assess_study` resolves the expected labels with `resolve_study_configs(study, config)`, reads
+  each arm file, and classifies: no file → missing; `code_revision.source_hash` ≠ this process's
+  `get_source_revision()["source_hash"]` → stale; `status == "failed"` → failed; else ok.
+  Comparing `source_hash` only (not `commit`/`dirty`) lets a clean checkout of the same commit
+  collect results produced from the git-less tarball (same tracked `.py` files, same hash).
+- Consistency over ok + failed records: `runtime.attention_backend` and `runtime.device_name`
+  equal across records that have `runtime`; and for every key of `resolved_config` not in
+  (union of the study's `_study_overrides` keys) ∪ `_PATH_FIELDS` ∪ `_RUNTIME_ONLY_FIELDS`, the
+  value is equal across records. Each violation is one `inconsistent` entry naming the field and
+  the labels/values.
+- `collect_study` takes the study lock, calls `assess_study` (inside the lock, so it sees every
+  file persisted before the lock was granted), then: inconsistent → log, write nothing; complete
+  or `allow_incomplete` → build the list in label order (ok record; failed record; or
+  `{"label", "study", "status": "missing"}`; stale records are treated as missing), drop
+  `reused_from_previous_run`, and write via the unlocked body of `write_study_outputs`.
+- **Auto-collect** (`run_ablation` with `arms`): after the arm loop, `collect_study(...)` inside
+  `try/except Exception` (logged, never raised — the arms themselves succeeded). If incomplete, log
+  `study X: N/M arms complete; missing [...] failed [...] stale [...] -- study JSON and plots
+  deferred to the process that completes the study or to --stage ablation_collect`. Safety
+  argument: each process persists its arm files before requesting the lock; the files of the last
+  arm to be persisted therefore exist when its process assesses, so that process sees a complete
+  study. Two processes that both see a complete study write identical outputs one after the other.
+- **Stage `ablation_collect`** (`main.run_ablation_collect_stage`): `--study X` or `all`;
+  `--allow_incomplete`; no `check_processed_dir`, no data, no model. For `all` it also writes
+  `summary_{model}.json` with `_save_summary` over assembled studies plus `"complete": false,
+  "missing": [...]` entries for the rest. Exit `SystemExit(1)` if any requested study was not
+  assembled. With `--allow_incomplete` a partially assembled study counts as assembled (exit 0,
+  warning logged), because the flag means "I accept a partial study"; an inconsistent study is
+  never assembled and always exits 1.
+
+## D18 — Waiting on and taking over a backbone (FR-16)
+
+Already implemented by T7.3 and FR-8; this extension pins it with tests and fixes one gap.
+- Waiter: `find_backbone` miss → `backbone_lock(timeout=None)` → polls every 5 s, logs the
+  holder once → after acquiring, `find_backbone` again → reuse (no `run_pretrain`).
+- Holder death: `flock` is released by the kernel (REV-010: after its forked DataLoader workers
+  exit, seconds). The waiter then trains; `run_pretrain` resumes the holder's `last.pt` because the
+  store directory, fingerprint, `total_steps` and `source_revision` are identical.
+- Gap fixed: `_capture_rng_state` also stores `torch_cuda_index = torch.cuda.current_device()`;
+  `_restore_rng_state` uses `set_rng_state_all` when the saved list length equals
+  `torch.cuda.device_count()` (unchanged path), otherwise sets the saved state at
+  `torch_cuda_index` (default 0 for older checkpoints, clamped to the list) on the current device
+  and logs a warning. Under `CUDA_VISIBLE_DEVICES=k` every process sees one device, so the normal
+  path is unchanged.
+- Process placement avoids the idle-waiter case entirely: the planner never splits a fingerprint
+  group across GPUs (D20). Waiting remains the correct fallback for hand-written commands.
+
+## D19 — Per-process output isolation (FR-17)
+
+- `_run_single_config(..., scoped_outputs=False)`: when true (`run_ablation` passes
+  `arms is not None`), immediately after `resolved_config` is captured, `cfg.log_dir` and
+  `cfg.plot_dir` become `{base}/arms/{study}_{label}` for the arm's extras. Training already uses
+  its fingerprint log directory (REV-002 swap). `_PATH_FIELDS` keep both out of the fingerprint and
+  `arm_key`, and the consistency check excludes them.
+- `utils.atomic_write_json(path, payload)` (temp + fsync + `os.replace`);
+  `save_config_snapshot` uses it and adds `"selection": {"stage", "study", "arms"}` to the
+  manifest (passed in from `main()`; `None` fields when absent).
+
+## D20 — Packager planner and multi-GPU launch (FR-18)
+
+**Machine GPUs.** `gpu_ids(args, machine) -> Optional[List[str]]`: explicit
+`--{machine}-gpu-ids` wins (validated: integers, unique, non-empty); else
+`--{machine}-gpus` or `--gpus` (≥ 1); a count of 1 without explicit ids returns `None` = the
+legacy single-GPU path, rendered by today's `render_script` untouched (AC-43). Count N > 1 →
+`["0", ..., str(N-1)]`. `--h100-studies` ∩ `--aws-studies` ≠ ∅ → refuse.
+
+**Resolving arms exactly as the run will.** New shared helper in `training/ablation_runner.py`:
+```python
+def resolve_dataset_fields(cfg: Config, stats_dir: Optional[str] = None) -> None
+    # num_items, num_users, vocab_size from {stats_dir or cfg.processed_data_dir}/dataset_stats.json;
+    # feature_dim from load_metadata_matrix(...) -- exactly what _run_single_config does today
+```
+`_run_single_config` calls it (no behaviour change). The packager builds the base config with
+`main.parse_args(<the study command's argv>)` → `apply_cli_overrides` → `apply_model_config`,
+so `processed_data_dir` holds the same relative path the remote will use, then for every arm of
+`resolve_study_configs(study, base)` calls `resolve_dataset_fields(cfg, stats_dir=<local
+processed dir>)` and `_training_fingerprint(cfg)`. AC-45 proves equality with
+`_run_single_config`.
+
+**Cost model.**
+- Training hours per fingerprint group: if `--estimate-json` is given, the max `run_hours` over
+  the group's arms found in `models[<model>].configs[*]` (rows matched by `"study:label"`;
+  the estimate must have been produced with the run's `--user-fraction`, epochs and batch);
+  otherwise `fallback_training_hours(cfg) = base(S) × (user_sample_fraction / 0.1) ×
+  (pretrain_epochs / 20)` with `base(S) = 1.81` for `S ≤ 50` and `4.5 × S / 100` above (handoff:
+  16 arms ≤ 50 ≈ 29 h, seq100 ≈ 4.5 h, seq200 ≈ 9 h on one L4 at 10%). The plan records which
+  source was used per group.
+- Post-training overhead per arm (constants, documented as rough): 0.05 h, +0.25 h when
+  `personalization_mode == "lora"` and the study has the `personalization` extra, +0.5 h when
+  `system_eval == "communication"`, +0.1 h for the `gradient` extra, +0.05 h for `efficiency` or
+  `system_eval == "latency"`. Not scaled by user fraction (fixed user/client counts).
+
+**Assignment.** `lpt_assign(groups, n_gpus) -> List[List[Group]]`: groups sorted by
+`(-hours, first_arm_sort_key)`; each to `argmin(load)` (lowest index on ties). Pure function,
+unit-tested. Example on the default AWS studies with `--aws-gpus 4` and fallback hours: 9 groups
+(one of 4 arms, eight singletons) → loads ≈ {4.0, 3.8, 5.6, 3.8} h, makespan ≈ 5.6 h. With H moved to AWS the
+seq200 group (~9 h) sits alone on one GPU and bounds the makespan.
+
+**Commands per GPU.** The GPU's arms sorted by (machine study order, study order); consecutive
+arms of one study → one command `study_command(args, backend, py, study=X, arms=[...])`.
+`study_command` gains optional `study`/`arms` parameters; with neither it renders today's string
+(legacy byte-identity).
+
+**Emitted files** (machine with N > 1):
+```bash
+# launch/run_aws_gpu2.sh
+#!/usr/bin/env bash
+set -uo pipefail
+cd "$(dirname "$0")/.."; mkdir -p logs
+<today's machine setup block: PY / venv activation + torch import check>
+export CUDA_VISIBLE_DEVICES=2
+<FA3 gate iff backend is FA3, report logs/verify_fa3_gpu2.json>
+"$PY" -u scripts/run_with_retry.py --max-retries 20 --wait-seconds 300 -- \
+  "$PY" -u main.py --stage ablation --study B --arms input_only <FR-12 flags> \
+  > logs/ablation_t_base_seed42_gpu2_01_B.log 2>&1
+echo "$(date -Is) gpu2 command 1 (B: input_only) exit $?"
+...
+# launch/run_aws.sh (driver)
+<setup>
+for G in 0 1 2 3; do bash "launch/run_aws_gpu${G}.sh" > "logs/run_aws_gpu${G}.log" 2>&1 & done
+wait
+for STUDY in B C F G H; do
+  "$PY" -u main.py --stage ablation_collect --study "${STUDY}" <FR-12 flags> \
+    > "logs/collect_${STUDY}_t_base_seed42.log" 2>&1
+  echo "$(date -Is) collect ${STUDY} exit $?"
+done
+```
+`launch/plan_{machine}.json`: `{"machine", "gpu_ids", "hours_source", "groups": [{"fingerprint",
+"arms": ["S:label", ...], "training_hours", "overhead_hours", "hours", "gpu"}], "gpus": {id:
+{"arms", "hours"}}, "makespan_hours"}`. `LAUNCH.md` gains, for a multi-GPU machine, the plan
+table, per-GPU one-liners `mkdir -p logs && setsid nohup bash launch/run_{m}_gpu{id}.sh >
+logs/run_{m}_gpu{id}.log 2>&1 < /dev/null &` (for manual use), and the collect commands. The
+driver one-liner is unchanged. Every generated script is checked with `bash -n` as today.
+
+*Alternatives considered:* (a) let reusing arms of a group run on other GPUs after the trainer —
+needs cross-process dependency scheduling and leaves GPUs idle on the lock; (b) a dynamic work
+queue — needs a coordinator process and makes the run harder to reason about and reproduce; a
+static, reviewable plan in `plan_*.json` was preferred; (c) ignoring groups — duplicated waiting
+on the shared base group (4–9 arms) would serialise most of the machine behind one lock.
+
+## D21 — Tests (extension)
+
+- `tests/test_ablation_parallel.py` (new):
+  - in-process: `parse_arms`/`select_study_configs` errors and order (AC-32/33), full-run vs
+    collect equality and `code_revision` (AC-34), `assess_study` classification incl. stale
+    (patched `source_hash`) and inconsistency (edit a persisted record's `batch_size` /
+    `runtime.device_name`) (AC-36), arm-scoped outputs + atomic `run_config.json` (AC-42), OOM
+    under `--arms` then re-run (AC-40, in-process like `TestArmPersistence`).
+  - real subprocesses: a small driver script written to `tmp_path` that puts the repo on
+    `sys.path`, builds `tiny_config(...)` from `tests.conftest`, applies optional monkeypatches
+    named by argv (e.g. "hold after epoch 0 until a sentinel file disappears"), and calls
+    `run_ablation(...)`/`collect_study(...)`; launched with `uv run python <driver>` and
+    `subprocess.Popen`; every wait is bounded (e.g. 120 s) and every child is killed in a
+    `finally`. Used for AC-35, AC-37, AC-38, AC-39.
+- `tests/test_resume.py`: AC-41 with `torch.cuda` functions monkeypatched (no CUDA needed).
+- `tests/test_scripts.py`: AC-43–AC-46 against `tiny_processed_dir(user_sample_fraction=...)`
+  with `--processed-dir`, `--skip-data`, `--allow-dirty` where the tree is dirty, `--out tmp_path`.
+- Rules unchanged: targeted files only, `-m "not slow"`, tiny data, `uv run`.
+
+## Steering (extension)
+
+`steering/architecture.md` "Run Execution" and `steering/conventions.md` "Output Organization"
+are updated by PLAN for: parallel arms on GPUs of one machine, study outputs assembled from
+persisted arms under a per-study lock, the `ablation_collect` stage, `.study.lock`. The
+ablations-cli Non-Goal "Parallel ablation execution" carries a supersession note.

@@ -69,10 +69,12 @@ outputs/
 ├── checkpoints/ablations/by_fingerprint/{fp}/   # shared backbone store (+ .train.lock, backbone.json)
 ├── logs/                          # JSON/JSONL/log files per experiment
 ├── plots/                         # All PNG plots (150 DPI)
-└── ablations/seed_{seed}/         # Per-study JSON results (A–H), summary, arms/{study}_{model}/{label}.json
+└── ablations/seed_{seed}/         # Per-study JSON results (A–H), summary, arms/{study}_{model}/{label}.json (+ .study.lock)
 ```
 
 Ablation results are seed-namespaced (`specs/ablation-run` FR-11) so runs with different seeds never overwrite each other.
+
+When arms run in separate processes (`--arms`, `specs/ablation-run` FR-17), each arm's post-training side outputs go to `logs/arms/{study}_{label}/` and `plots/arms/{study}_{label}/`, so no two processes write the same file. A file written by more than one process (run manifest, study JSON) is written atomically, and study-level outputs are written under the study lock.
 
 ## Naming Conventions
 

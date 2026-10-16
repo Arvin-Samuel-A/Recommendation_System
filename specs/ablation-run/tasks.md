@@ -758,3 +758,316 @@ passed, `test_determinism.py` 6 passed (golden unchanged), `test_cli.py` 63 pass
   rejects any real defect: a wrong mask or non-causal attention gives a relative error of
   order 1. It is not meaningfully weaker. Not changed, as instructed.
 - REV-008, REV-009, REV-010: left as they are (INFO).
+
+## Phase 10 — Splitting a study's arms across GPUs (owner request 2026-10-16)
+
+Extension FR-14–FR-18, AC-32–AC-46, design D15–D21. The "Rules for BUILD" at the top apply
+unchanged (targeted test files with `-m "not slow"`, tiny synthetic data only, `uv run`, no full
+suite, no commit/push). Additionally: every real-subprocess test bounds every wait (≤ 120 s) and
+kills its children in a `finally`; run `tests/test_ablation_parallel.py` alone and check
+`ps` shows no leftover `python` children afterwards. Existing tests must keep passing
+**unmodified** unless a task says otherwise.
+
+- [x] **T10.1: One helper for dataset-derived fields** — Add
+  `resolve_dataset_fields(cfg, stats_dir=None)` to `training/ablation_runner.py` (D20) and make
+  `_run_single_config` use it instead of its inline stats/metadata block. No behaviour change.
+  (FR-18; D20; AC-45 groundwork)
+  - **Done when:** `uv run pytest tests/test_ablation_robustness.py tests/test_determinism.py -m "not slow" -q`
+    passes unmodified, and a new test in `tests/test_ablation_parallel.py` shows
+    `resolve_dataset_fields(cfg, stats_dir=<tiny dir>)` on a config whose `processed_data_dir`
+    is a different string sets the same four fields as `_run_single_config` does for the real dir.
+  - *BUILD note:* `resolve_dataset_fields(cfg, stats_dir=None)` replaces `_run_single_config`'s inline
+    stats/metadata block (returns the aligned metadata matrix it still needs).
+    `uv run pytest tests/test_ablation_robustness.py tests/test_determinism.py -m "not slow" -q` →
+    31 + 6 passed, unmodified (this Mac was under heavy unrelated load, so runtimes were ~4× the
+    earlier ones). New `TestResolveDatasetFields`: the four fields `_run_single_config` resolves
+    for the real tiny dir (captured by stopping it at `run_pretrain`) equal those
+    `resolve_dataset_fields(remote_cfg, stats_dir=<tiny dir>)` sets on a config whose
+    `processed_data_dir` is the non-existent `data/processed_users50pct`, which is left untouched.
+
+- [x] **T10.2: `--arms` selection** — Implement D15: `parse_arms`, `select_study_configs`,
+  `run_ablation(..., arms=None)` validating before `check_processed_dir`; `main.py` `--arms`
+  (rejected with any stage but `ablation`) passed through `run_ablation_stage`. No other
+  behaviour change yet. (FR-14; D15; AC-32, AC-33)
+  - **Done when:** tests in `tests/test_ablation_parallel.py` pass: AC-32 (only the listed arm runs,
+    order as given, duplicates dropped) and AC-33 (unknown label, other study's label, empty list,
+    `--study all --arms x`, `--arms` with `--stage pretrain`: `ValueError` listing the valid labels
+    or naming the rule, with spies on `check_processed_dir` / `run_pretrain` at zero calls;
+    `main.main([...])` raises a non-`SystemExit(75)` error). `uv run pytest tests/test_cli.py tests/test_ablation_robustness.py -m "not slow" -q`
+    still passes unmodified.
+  - *BUILD note:* `parse_arms` (order kept, duplicates dropped, empty → `ValueError`), `select_study_configs`,
+    `run_ablation(..., arms=None)` validating before `check_processed_dir`; `main.py --arms` is
+    validated right after `apply_cli_overrides`, before the snapshot / backend probe / stats read,
+    via `_validate_arm_selection` (rejects any stage but `ablation`). `tests/test_ablation_parallel.py`
+    → 12 passed: only the listed arms run, in the given order, duplicates dropped (D), a B run
+    writes only `input_only.json`; grid labels follow the config (`H2_seq16` on the tiny grid);
+    unknown label, another study's label (`mmoe` in B), `--study all --arms x` and an empty list
+    raise `ValueError` (valid labels listed / one-study rule named) with `check_processed_dir`,
+    `load_tensorised` and `run_pretrain` spies at 0; via `main.main` the same, plus
+    `--stage pretrain --arms ...`, raise `ValueError` (Python exits 1, never 75) before
+    `save_config_snapshot`. `tests/test_cli.py` 63 passed and `tests/test_ablation_robustness.py`
+    31 passed, both unmodified.
+
+- [x] **T10.3: Locked, shared study-output writer; persist every attempted arm** — Implement D16:
+  generic `file_lock` (with `backbone_lock` delegating, same log text), `_study_lock`,
+  `write_study_outputs` used by the full-run path, `arm_key` + `code_revision` on every result,
+  failed results persisted too; add `utils.atomic_write_json` and make `_write_json_atomic`
+  delegate. (FR-14 "unchanged without --arms", FR-15; D16; AC-34 part, AC-37 groundwork)
+  - **Done when:** `uv run pytest tests/test_ablation_robustness.py tests/test_cli.py -m "not slow" -q`
+    passes unmodified (incl. `TestBackboneLock`, `TestArmPersistence`, `TestSingleArmRerun`); new
+    tests show a failed arm is persisted with `status: "failed"`, `arm_key`, `code_revision` and is
+    retried (not reused) on re-run; a spy shows the full-run path writes the study JSON and plots
+    while holding the study lock.
+  - *BUILD note:* `file_lock(path, timeout, poll, on_wait)` is the extracted `flock` loop; `backbone_lock`
+    delegates with the same "Backbone … is being trained by another process (pid host time: …)"
+    log line (only the `TimeoutError` text became generic). `write_study_outputs` (study JSON →
+    generic plot → named figure, under `_study_lock`) replaces the three inline calls of the full
+    run. Every result gets `arm_key` and `code_revision`; failed arms are persisted with both (plus
+    `study_overrides` and the pre-run `resolved_config`). `utils.atomic_write_json` added;
+    `_write_json_atomic` delegates. `uv run pytest tests/test_ablation_robustness.py tests/test_cli.py
+    -m "not slow" -q` → 31 + 63 passed, unmodified (incl. `TestBackboneLock`, `TestArmPersistence`,
+    `TestSingleArmRerun`). New tests (`tests/test_ablation_parallel.py` → 14 passed): a failed
+    arm's file has `status: "failed"`, the error, `arm_key`, `code_revision`; the re-run calls
+    only the failed arm and the ok arm is reused; a spy shows `_save_study_results` and
+    `_plot_study` both run while the study lock is held (a second `flock` on it times out).
+    DEVIATION: the study lock lives at `{ablation_dir}/seed_{seed}/.locks/{study}_{model}.study.lock`,
+    not `arms/{study}_{model}/.study.lock` as D16 says. A lock file inside `arms/` would break the
+    existing, must-stay-unmodified `TestArmPersistence` assertion that the arms dir lists only the
+    two arm files (AC-34); keeping `arms/` to arm results also keeps `ls` there meaningful.
+
+- [x] **T10.4: Assessment, auto-collect and `ablation_collect`** — Implement D17:
+  `StudyAssessment`, `assess_study`, `collect_study`, auto-collect at the end of an `--arms` run,
+  and the `ablation_collect` stage with `--allow_incomplete` (incl. the `--study all` summary).
+  Register the stage in `VALID_STAGES`/`STAGE_MAP` and extend the existing stage name-resolution
+  AST test if it enumerates stages. (FR-15; D17; AC-34, AC-35 sequential variant, AC-36)
+  - **Done when:** new in-process tests pass: full run of study B then `ablation_collect --study B`
+    reproduces its JSON except `reused_from_previous_run` (AC-34); sequential `--arms
+    objective_conditioned` then `--arms input_only`: after the first, no study JSON / study plot
+    and a log line naming `input_only`; after the second, both exist with both arms in study order
+    (AC-35 sequential); every AC-36 case (missing, failed, stale via patched `source_hash`,
+    `--allow_incomplete` placeholders and plots, inconsistent `batch_size` and
+    `runtime.device_name` refused even with `--allow_incomplete`), with exit codes checked via
+    `main.main`. Run: `uv run pytest tests/test_ablation_parallel.py -m "not slow" -q`.
+  - *BUILD note:* `StudyAssessment` / `assess_study` / `collect_study` (under the study lock), auto-collect
+    at the end of an `--arms` run (logged, never raised), `--stage ablation_collect` with
+    `--allow_incomplete`; `--study all` writes `summary_{model}.json` with `"complete": false`
+    entries for studies it could not assemble (via a new optional `incomplete=` argument of
+    `_save_summary`). `uv run pytest tests/test_ablation_parallel.py -m "not slow" -q` → 26 passed
+    (61 s). `TestCollect` works on copies of one real full study-B run:
+    - full run then `ablation_collect --study B` (through `main.main`, exit 0) reproduces the study
+      JSON exactly once `reused_from_previous_run` is dropped; arms in study order, every record has
+      `code_revision.source_hash`, plot written (AC-34);
+    - missing / failed / stale (`source_hash` patched) `input_only` → exit 1, the log names it,
+      neither JSON nor plot written; `--allow_incomplete` → exit 0, JSON with the `missing`
+      placeholder or the failed record in study order, plot from the ok arm (AC-36);
+    - `runtime.device_name` or `resolved_config.batch_size` changed in one arm → exit 1 naming
+      the field, with and without `--allow_incomplete` (AC-36); overridden fields
+      (`router_conditioning`) may differ;
+    - `--study all` exits 1 and the summary has B (`num_ok 2`) and A marked incomplete;
+    - sequential `--arms objective_conditioned` then `--arms input_only` (real training): after
+      the first no study JSON / plot and the log says `missing ['input_only']` … `deferred`; after
+      the second both exist with both arms in order (AC-35 sequential).
+    Stage registration: `ablation_collect` added to `VALID_STAGES` and `STAGE_MAP`. The existing
+    AST name-resolution test in `tests/test_cli.py` enumerates only the four evaluation stages;
+    rather than modify it (AC-34 keeps existing tests unmodified) the same check was added for
+    `run_ablation_collect_stage` in `tests/test_ablation_parallel.py`.
+    `tests/test_cli.py` 63 passed and `tests/test_ablation_robustness.py` 31 passed, unmodified.
+
+- [x] **T10.5: Isolation and takeover hardening** — Implement D19 (arm-scoped `log_dir`/`plot_dir`
+  under `--arms`; atomic `run_config.json` with `selection`) and the D18 RNG gap
+  (`torch_cuda_index` saved; device-count-tolerant restore). (FR-16, FR-17; D18, D19; AC-41,
+  AC-42)
+  - **Done when:** AC-42 test passes (two arms with personalization mocked to write
+    `personalization_gain_{model}.json` and its plots: under `--arms` each lands in its own
+    `{log_dir}/arms/{study}_{label}/`, none in `{log_dir}/` itself; without `--arms` the old
+    paths; `run_config.json` written through `atomic_write_json` (spy) with the `arms` selection);
+    AC-41 test in `tests/test_resume.py` passes with `torch.cuda.device_count`/`set_rng_state`/
+    `set_rng_state_all` monkeypatched; and
+    `uv run pytest tests/test_resume.py tests/test_determinism.py -m "not slow" -q` passes (golden
+    unchanged).
+  - *BUILD note:* D19: `_run_single_config(..., scoped_outputs=False)`; `run_ablation` passes
+    `scoped_outputs=True` only under `--arms` (as a keyword given only then, so existing test
+    doubles of `_run_single_config` with the old 5-argument signature keep working). The arm's
+    `log_dir`/`plot_dir` become `{base}/arms/{study}_{label}` right after `resolved_config` is
+    captured (so the recorded config, fingerprint and `arm_key` are unchanged). `run_config.json`
+    is written with `utils.atomic_write_json` and carries `"selection": {"stage","study","arms"}`;
+    DEVIATION from D19's "passed in from `main()`": the selection travels as a non-field attribute
+    `config._run_selection`, because the existing, must-stay-unmodified `TestOOMHandling` patches
+    `save_config_snapshot` with a one-argument lambda. D18: `torch_cuda_index` saved;
+    `_restore_rng_state` uses `set_rng_state_all` when counts match, else restores the saved
+    device's state onto the current device and warns.
+    Tests: AC-42 `TestOutputIsolation` (E:global_lora and A:arv_mmoe_gradnorm_lora under `--arms`,
+    personalization and federated mocked to write their usual files: each lands in its own
+    `{log_dir}/arms/{study}_{label}/`, plots likewise, nothing `personalization_gain_*`/
+    `federated_rounds_*` in `{log_dir}/`; the same E arm without `--arms` writes
+    `{log_dir}/personalization_gain_t_small.json` as before; `run_config.json` written through
+    `atomic_write_json` (spy) with the `arms` selection) → 2 passed. AC-41 `TestCudaRngDeviceCount`
+    in `tests/test_resume.py` (4 saved states, 1 visible device, index 2 → `set_rng_state` with
+    state 2 + warning; 4 visible → `set_rng_state_all` exactly as before) → 2 passed.
+    `uv run pytest tests/test_resume.py tests/test_determinism.py -m "not slow" -q` → 15 + 6
+    passed (golden unchanged); `test_ablation_parallel.py` 28, `test_ablation_robustness.py` 31,
+    `test_cli.py` 63 passed.
+
+- [x] **T10.6: Real-process concurrency: partial runs and collection** — Add the subprocess
+  driver helper (D21) and tests: two concurrent `--arms` runs of study B (AC-35), two concurrent
+  `collect_study` calls on a complete study (AC-37), and OOM under `--arms` then re-run (AC-40,
+  may be in-process). (FR-15, FR-16; D17, D21; AC-35, AC-37, AC-40)
+  - **Done when:** `uv run pytest tests/test_ablation_parallel.py -m "not slow" -q -k "concurrent or oom"`
+    passes on three consecutive invocations (flakiness check), no child process survives, and
+    each test finishes in < 120 s.
+  - *BUILD note:* Driver (D21): `tests/test_ablation_parallel.py::DRIVER`, written to `tmp_path`, builds
+    `tiny_config` from `tests.conftest`, applies patches named in its JSON spec (`hold_after_epoch0`,
+    `fast_lock_poll`, `trace_writes`) and calls `run_ablation` / `collect_study`. Every wait is
+    bounded (`_wait_for`, 120 s; `proc.wait(timeout=120)`), every child is killed and reaped in
+    the `procs` fixture's `finally`, and the fixture asserts `pgrep -f <driver>` finds nothing.
+    DEVIATION: children run the venv's `sys.executable` directly (the interpreter `uv run python`
+    resolves to) instead of `uv run python <driver>`: T9.2 showed a `uv run` wrapper survives
+    separately from its Python child, so signals and kills would not reach the right process.
+    Tests: AC-35 two concurrent `--arms` processes of study B → both exit 0, one valid study
+    JSON with both arms in study order, study plot exists; AC-37 two concurrent collectors on a
+    complete study → both exit 0, the trace shows start/end/start/end (no overlap; each write
+    held for 0.5 s), the result equals a single in-process assembly; AC-40 (in-process, via
+    `main.main`) OOM injected at the second arm's epoch-1 first step → `SystemExit(75)` with only
+    the first arm persisted; re-run → `run_pretrain` ×1, `evaluate_model` ×1, 2 training steps,
+    "at epoch 1 (global step 2)", study JSON with both arms ok.
+    Three consecutive invocations of
+    `uv run pytest tests/test_ablation_parallel.py -m "not slow" -q -k "concurrent or oom"`:
+    run 1 3 passed (26.0 s; per test 11.6 / 4.6 / 2.7 s), run 2 3 passed (26.4 s), run 3 3 passed
+    (26.3 s); after each, `pgrep -f driver.py` → 0 processes.
+
+- [x] **T10.7: Real-process concurrency: shared fingerprint wait and takeover** — Tests only,
+  unless they expose a defect: AC-38 (P2 needing P1's fingerprint waits, logs P1's pid, reuses,
+  never trains; exactly one training log in the store) and AC-39 (P1 held after its epoch-0
+  `last.pt`, P2 waiting, P1 SIGKILLed, P2 resumes at epoch 1 and registers). Use B
+  `objective_conditioned` and C `arv_mmoe` (same fingerprint on the tiny config — assert that
+  first). (FR-16; D18, D21; AC-38, AC-39)
+  - **Done when:** both tests pass three runs in a row with bounded waits and no leftover
+    processes; if either exposes a defect, fix it in the smallest way, record it in the BUILD note,
+    and re-run `tests/test_ablation_robustness.py` and `tests/test_resume.py`.
+  - *BUILD note:* Tests only; no defect found. Both first assert that B:objective_conditioned and C:arv_mmoe
+    share a training fingerprint on the tiny config. AC-38: P1 (`B --arms objective_conditioned`,
+    2 epochs) is held inside the store lock after its epoch-0 `last.pt`; the lock file's first
+    field is P1's pid; P2 (`C --arms arv_mmoe`) logs "(pid host time: <P1 pid> …" and stays
+    alive; after release both exit 0; P2's result is ok with `shared_backbone_with ==
+    "B_objective_conditioned"`, no `training_log_dir`, no "Resuming"/"Epoch 0:" in its log, and the
+    store holds exactly one `pretrain_t_small.log`. AC-39: same set-up, then P1 is SIGKILLed; P2
+    acquires the lock, logs "Resuming t-small from … at epoch 1 (global step 2)", exits 0, its arm
+    is ok with a `training_log_dir`, and `find_backbone` finds the registered backbone.
+    Three consecutive invocations of `-k "SharedFingerprint"`: run 1 2 passed (16.9 s; 8.5 / 7.8 s
+    per test), run 2 2 passed (17.1 s), run 3 2 passed (17.1 s); 0 leftover driver processes each
+    time. `tests/test_ablation_robustness.py` and `tests/test_resume.py` were not re-run for this
+    task because nothing was changed (they are in the T10.11 sweep).
+
+- [x] **T10.8: Planner core (pure functions)** — In `scripts/package_ablation_run.py`: GPU option
+  parsing/validation (`gpu_ids`), study-overlap refusal, machine arm resolution with
+  `resolve_dataset_fields`, fingerprint groups, `fallback_training_hours`, estimate-JSON loading,
+  per-arm overheads, `lpt_assign`. No rendering changes yet. (FR-18; D20; AC-45, AC-46)
+  - **Done when:** new tests in `tests/test_scripts.py` pass: fingerprints from the planner equal
+    those `_run_single_config` records for the same arms on the tiny fixture (run one arm per
+    distinct fingerprint, `max_steps_per_epoch=1`); `lpt_assign` matches a hand-computed
+    assignment on synthetic hours and never splits a group; fallback ranks `H2_seq200 >
+    H2_seq100 > H2_seq50` and scales linearly with fraction and epochs; `--estimate-json` hours
+    override the fallback for matched arms; AC-46 refusals exit non-zero.
+  - *BUILD note:* Planner in `scripts/package_ablation_run.py`: `gpu_ids` (explicit ids win; unique integers;
+    counts ≥ 1; N = 1 without ids → None = legacy path), `check_study_overlap`,
+    `base_config_from_argv` (main's `parse_args` → `apply_cli_overrides` → `apply_model_config` on
+    the study command's own argv, `study_argv`), `resolve_machine_arms` (resolves the base's
+    dataset fields first, as `main._resolve_before_snapshot` does, then `resolve_dataset_fields`
+    + `_training_fingerprint` per arm, stats from the LOCAL dir), `fallback_training_hours`,
+    `load_estimate_hours` (rows matched by `"study:label"`, OOM rows skipped), `arm_overhead_hours`,
+    `build_groups`, `lpt_assign`, `gpu_commands`, `plan_machine`. New `TestPlannerCore` (part of
+    `uv run pytest tests/test_scripts.py -m "not slow" -q` → 29 passed):
+    - planner fingerprints for every arm of B and H (tiny config) equal the
+      `training_fingerprint` recorded by real `main.main --arms` runs of one arm per distinct
+      fingerprint (5 runs, 1 step each); `H2_seq8` shares B's base fingerprint (AC-45);
+    - `lpt_assign` on hours [5, 3, 4, 3, 2] / 2 GPUs equals the hand-computed `[a, d] / [c, b, e]`,
+      deterministic;
+    - fallback: seq200 (9.0 h) > seq100 (4.5 h) > seq50 = seq25 (1.81 h), linear in fraction and
+      epochs; `--estimate-json` hours (7.5 h) override the fallback for the matched group, an OOM
+      row is ignored;
+    - AC-46: a study on both machines, ids `0,0,1`, ids `0,x` and `--gpus 0` each exit non-zero
+      with the reason.
+    Why the base config's dataset fields are resolved first: an arm without metadata (H1) keeps the
+    base's `feature_dim`, which `main` sets from the stats before the arms are built; skipping that
+    step would give H1 a fingerprint the run never computes.
+
+- [x] **T10.9: Multi-GPU launch files** — Render per D20: `study_command(..., study=, arms=)`
+  (legacy string unchanged when neither is given), `run_{m}_gpu{id}.sh`, the driver
+  `run_{m}.sh` for N > 1, `plan_{m}.json`, LAUNCH.md additions; legacy path untouched for N = 1
+  without ids. (FR-18; D20; AC-43, AC-44)
+  - **Done when:** `uv run pytest tests/test_scripts.py -m "not slow" -q` passes, including the
+    existing `TestPackageAblationRun` tests **unmodified**, a byte-identity test for no flag vs
+    `--gpus 1` (AC-43), and AC-44 on `--aws-gpus 4 --h100-studies A,D,E --aws-studies B,C,F,G,H`.
+  - *BUILD note:* `study_command(..., study=, arms=, stage=)` (legacy string unchanged when none is given);
+    `render_script` refactored onto shared `_machine_setup`/`_fa3_gate` helpers with byte-identical
+    output (compared against launch files captured before the change, for no flag and `--gpus 1`);
+    new `render_gpu_script`, `render_driver_script`, `render_multi_gpu_md`, `plan_{m}.json`.
+    `uv run pytest tests/test_scripts.py -m "not slow" -q` → 29 passed, with the existing
+    `TestPackageAblationRun` unmodified (no removed lines in the file's diff). `TestMultiGpuLaunch`:
+    - no flag vs `--gpus 1` → byte-identical `launch/` (AC-43);
+    - `--aws-gpus 4 --h100-studies A,D,E --aws-studies B,C,F,G,H` (AC-44): two runs identical;
+      every AWS arm in exactly one GPU script; no fingerprint group spans GPUs; an independent LPT
+      over the plan's groups reproduces the assignment and per-GPU hours; each GPU script exports
+      its `CUDA_VISIBLE_DEVICES`, routes every command through `run_with_retry.py` with the FR-12
+      flags plus `--arms`, has no FA3 gate (SDPA machine) and passes `bash -n`; the driver starts
+      every busy GPU script in the background, `wait`s, then `ablation_collect`s B C F G H;
+      `plan_aws.json` has per-GPU arms and hours; LAUNCH.md has the per-GPU one-liners, the collect
+      commands and the unchanged driver one-liner; the H100 keeps its single-GPU script;
+    - `--h100-gpu-ids 2,5`: each H100 GPU script exports its id, then runs the FA3 gate (report
+      `logs/verify_fa3_gpu{id}.json`) before its first command.
+    On the real 10% data, `--aws-gpus 4` with B C F G H planned (fallback hours) GPU loads of
+    9.10 / 8.37 / 8.79 / 9.45 h; `H2_seq200` sits alone on GPU 0.
+
+- [x] **T10.10: Documentation** — README: `--arms`, `--allow_incomplete`, `--stage
+  ablation_collect`, packager GPU options and `--estimate-json`, a short "Splitting studies across
+  GPUs" runbook (plan file, per-GPU logs, collect, what a waiting process logs). Keep LAUNCH.md the
+  per-run source of truth; link, do not duplicate. (FR-14–FR-18)
+  - **Done when:** every new flag/stage appears in the README CLI tables and every path the README
+    names exists.
+  - *BUILD note:* README: the main CLI table's `--stage` row lists `ablation_collect`; new rows `--arms` and
+    `--allow_incomplete`; a new "Splitting studies across GPUs" section with the packager options
+    (`--gpus`, `--h100-gpus`/`--aws-gpus`, `--h100-gpu-ids`/`--aws-gpu-ids`, `--estimate-json`,
+    `--allow-dirty`), the plan file, per-GPU scripts and logs, the driver's wait + collect, how
+    study outputs are written, and what a waiting process logs. It points at the generated
+    `launch/LAUNCH.md` for exact commands instead of duplicating them. Every script path the README
+    names exists (`ls` of all six `scripts/*` paths the README mentions: estimate_training_time.py,
+    fetch_fa3_source.sh, install_fa3.sh, package_ablation_run.py, run_with_retry.py,
+    verify_attention_backend.py).
+
+- [x] **T10.11: Targeted sweep for Phase 10** — Run one file at a time with `-m "not slow" -q`:
+  `test_ablation_parallel.py`, `test_ablation_robustness.py`, `test_cli.py`, `test_scripts.py`,
+  `test_resume.py`, `test_determinism.py`, `test_training.py`. Check free disk before and after.
+  Then a capped Mac smoke on the real 10% data **only if ≥ 15 GB free and the orchestrator
+  approves**: two concurrent processes, `--stage ablation --study B --model t-small
+  --user_sample_fraction 0.1 --epochs 1 --max_steps 5 --arms objective_conditioned` and
+  `... --arms input_only` (CPU/MPS is fine), then confirm one study JSON with both arms, and
+  `--stage ablation_collect --study B` exits 0; finally list and delete the smoke outputs.
+  - **Done when:** every file passes (counts recorded in the BUILD note); the smoke evidence (log
+    lines, JSON excerpt, exit codes) is quoted from files, or the smoke is recorded as skipped with
+    the reason.
+  - *BUILD note:* Sweep, one file at a time, `uv run pytest tests/<file>.py -m "not slow" -q -rs`, free disk before -> after:
+    `test_ablation_parallel` | 33 passed in 52.54s | free 57G -> 56G | leftover drivers: 0;
+    `test_ablation_robustness` | 31 passed in 35.63s | free 56G -> 56G | leftover drivers: 0;
+    `test_cli` | 63 passed in 1.63s | free 56G -> 56G | leftover drivers: 0;
+    `test_scripts` | 29 passed in 26.57s | free 56G -> 57G | leftover drivers: 0;
+    `test_resume` | 15 passed in 112.44s (0:01:52) | free 57G -> 56G | leftover drivers: 0;
+    `test_determinism` | 6 passed, 2 warnings in 114.05s (0:01:54) | free 56G -> 56G | leftover drivers: 0;
+    `test_training` | 26 passed, 2 deselected, 2 warnings in 29.49s | free 56G -> 56G | leftover drivers: 0;
+    Concurrency, three consecutive runs on the final tree of `-k "concurrent or oom or SharedFingerprint"` (AC-35/37/38/39/40): run 1 5 passed (43.5 s, slowest test 11.7 s), run 2 5 passed (43.9 s, 11.9 s), run 3 5 passed (44.1 s, 11.9 s); 0 leftover driver processes after each (also three runs each of the T10.6 and T10.7 subsets earlier, see those notes).
+    Capped Mac smoke (approved; 56 GB free; `outputs/` (115 MB) backed up first): two processes
+    started together, `uv run python -u main.py --stage ablation --study B --model t-small
+    --user_sample_fraction 0.1 --epochs 1 --max_steps 5 --arms objective_conditioned` and the same
+    with `--arms input_only` (MPS); both exit 0. Logs: the `input_only` process finished first and
+    logged "study B: 1/2 arms complete; missing ['objective_conditioned'] failed [] stale [] --
+    study JSON and plots deferred …"; the `objective_conditioned` process then logged "Study B
+    complete -- study JSON and plots written". `outputs/ablations/seed_42/B_t_small.json` (read
+    back): `objective_conditioned ok fp 3e3614363ea7 mps ndcg 0.0634 5000 examples`, `input_only ok
+    fp 453e6ebd5354 mps ndcg 0.0605 5000`, both `code_revision.source_hash acab815a9a38a9fc`;
+    `outputs/plots/ablation_B_t_small.png` written; side outputs under `outputs/logs/arms/
+    {B_input_only,B_objective_conditioned}/`; no `pretrain_t_small.log` in `outputs/logs/` (the
+    training logs sit in each fingerprint's store directory). Then `uv run python -u main.py --stage
+    ablation_collect --study B --model t-small --user_sample_fraction 0.1` → exit 0, "Collected
+    study B: 2/2 arms complete; missing [] failed [] stale []". Created/changed under `outputs/`
+    (`diff -rq` against the backup): `ablations/seed_42/`, `checkpoints/ablations/`, `logs/arms/`,
+    `plots/arms/`, `plots/ablation_B_t_small.png` (new) and `logs/run_config.json` (overwritten);
+    evidence copied to the scratchpad, then `outputs/` restored (`diff -rq` empty).

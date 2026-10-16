@@ -2,7 +2,14 @@
 
 ## Review Status
 
-**PASS_WITH_WARNINGS** — verdict for the orchestrator: **APPROVE** (round 2, 2026-10-16).
+**PASS_WITH_WARNINGS** — verdict for the orchestrator: **APPROVE** (round 3, 2026-10-16).
+
+**Round 3 (Phase 10: FR-14..FR-18, AC-32..AC-46):** 0 BLOCKER, 0 MAJOR, 0 MINOR, 3 NIT
+(REV-012..REV-014), plus INFO notes. Every Phase 10 requirement and acceptance criterion is met.
+I verified the concurrency design independently: I re-derived the ordering argument, mutated
+the code to confirm each concurrency test fails without the property it guards, and compared
+planner fingerprints against a replicated run on the real 10% data. REV-011 is RESOLVED: the
+`FA3_MIN_FREE_GB` override is in `e0729ab` and the test uses it. See "Round 3" at the end.
 
 **Round 2:** REV-001..REV-006 are all RESOLVED and verified (see "Round 2" at the end). No new
 BLOCKER, MAJOR or MINOR finding. One new NIT (REV-011). The INFO observations REV-007..REV-010
@@ -477,7 +484,7 @@ the T0.2 implementation in round 1.
 
 ```
 REV-011
-Severity: NIT (LOW, test robustness) | Status: OPEN | Requirement: FR-3
+Severity: NIT (LOW, test robustness) | Status: RESOLVED (in e0729ab: FA3_MIN_FREE_GB, test sets 0) | Requirement: FR-3
 File: tests/test_scripts.py — TestFA3InstallExitCodes (both tests)
 Problem: The stubbed run still goes through install_fa3.sh's real disk preflight, which needs
   20 GB or more free under the tmp build dir.
@@ -518,3 +525,308 @@ Next steps:
 1. The orchestrator commits the feature, including the five new scripts and the new tests. The
    packager then runs without `--allow-dirty`; this is shown by the throwaway-repo test.
 2. REV-011 is an optional NIT.
+
+---
+
+## Round 3 (Phase 10: splitting a study's arms across GPUs)
+
+**Date:** 2026-10-16.
+
+**Baseline.** `e0729ab` (the committed feature plus round-2 fixes). All Phase 10 work is
+uncommitted:
+- modified: `main.py`, `utils.py`, `training/{ablation_runner,pretrain}.py`,
+  `scripts/package_ablation_run.py`, `README.md`, and appends to
+  `tests/{test_scripts,test_resume}.py`;
+- new: `tests/test_ablation_parallel.py`;
+- PLAN's spec and steering edits.
+
+`git diff e0729ab` on `tests/test_ablation_robustness.py` and `tests/test_cli.py` is empty, and
+`tests/test_scripts.py` and `tests/test_resume.py` contain additions only (0 removed lines).
+That satisfies AC-34's "existing tests unmodified".
+
+**Scope.**
+- The extension spec: requirements FR-14..FR-18 and AC-32..AC-46, design D15..D21, tasks
+  T10.1–T10.11.
+- BUILD's notes, including the five deviations:
+  1. the study lock lives in `.locks/`;
+  2. the selection is passed via `config._run_selection`;
+  3. test children use `sys.executable`;
+  4. the planner resolves the base config's dataset fields first (the H1 case);
+  5. the legacy renderer was refactored with byte-identical output.
+
+  All five are acceptable. Nos. 1 and 2 were needed to keep existing tests unmodified, and
+  no. 4 is required for correctness.
+
+### Verification of the focus points
+
+| Focus | Verdict | Evidence |
+|---|---|---|
+| `--arms` fail-fast; exit 1 not 75; no-arms path unchanged | OK | See "`--arms` fail-fast and the no-arms path" below. |
+| Last finisher never misses an arm; never "nobody writes" | OK | See "Persist-before-lock ordering" below. |
+| Atomic writes, stale/inconsistent, `--allow_incomplete`, failed arms retried | OK | See "Atomic writes and assessment" below. |
+| Shared-fingerprint wait/reuse, SIGKILL takeover, OOM under `--arms` | OK | See "Shared fingerprints, takeover and OOM" below. |
+| CUDA RNG device-count fix | OK | See "CUDA RNG device-count fix" below. |
+| Side-output isolation; atomic `run_config.json` | OK | See "Side-output isolation" below. |
+| Planner fingerprints (deviation 4, H1) | OK | See "Planner fingerprints" below. |
+| Groups never split, LPT deterministic, every arm exactly once, driver | OK | See "Grouping, LPT and the driver" below. |
+| `--gpus 1` byte-identical | OK | See "Byte-identical single-GPU output" below. |
+| Refusals | OK | See "Refusals" below. |
+| Concurrency tests are not flaky or vacuous; bounded; no strays | OK | See "Concurrency tests" below. |
+
+#### `--arms` fail-fast and the no-arms path
+
+- **Where validation happens.** `main._validate_arm_selection` runs right after
+  `apply_cli_overrides`, before `_resolve_before_snapshot` (the first stats read), the snapshot
+  and the backend probe. `run_ablation(arms=...)` validates before `check_processed_dir`.
+- **What raises.** Each of these raises `ValueError` (Python exit 1, never retried):
+  - an unknown label;
+  - a label from another study;
+  - an empty list;
+  - `--study all`;
+  - a non-ablation stage.
+- **Tests.** `TestArmSelection::test_bad_selection_fails_before_any_work` and
+  `test_main_rejects_bad_selection_without_exit_75` show spies on `check_processed_dir`,
+  `load_tensorised` and `run_pretrain` at 0 calls, and no snapshot.
+- **No-arms path.** It still uses `resolve_study_configs` and the same per-arm loop. The only
+  differences are the documented additive ones:
+  - `code_revision` on each record;
+  - failed arms persisted;
+  - the study JSON and plots written through `write_study_outputs` under the study lock;
+  - `scoped_outputs` is not passed.
+
+#### Persist-before-lock ordering
+
+- **The argument.** Under `--arms`, each ok or failed arm file is written atomically right
+  after its arm. Only then, after the process's arm loop, does `collect_study` take the study
+  lock and assess the files inside it. Let P be the process whose persist of the study's last
+  missing arm happens last. Every other arm file already exists before P persists, and P
+  assesses only after acquiring the lock, which comes after its own persist. So P sees a
+  complete study. Two processes that both see complete write the same content one after the
+  other, so the write is idempotent. A process killed between its persist and its collect is
+  covered by the driver's final `ablation_collect`. An OOM re-raises before anything is
+  persisted, then retry, reuse and resume take over.
+- **Mutation check (lock).** I replaced the study lock in `collect_study` with a
+  `nullcontext`. `test_concurrent_collectors_serialise_and_agree` then failed 3 out of 3
+  times, with the trace showing overlapping `start, start, end, end`.
+- **Mutation check (ordering).** I deferred the ok-arm persistence until after auto-collect.
+  `test_concurrent_partial_runs_assemble_one_study` then failed: no study JSON was written,
+  and both processes logged that the study was incomplete. `test_sequential_partial_runs` also
+  failed. So the AC-35 and AC-37 tests guard exactly these two properties.
+
+#### Atomic writes and assessment
+
+- **Atomic writes.** Arm files, the study JSON and `run_config.json` all go through
+  `utils.atomic_write_json` (temp file, fsync, `os.replace`). Plots are drawn inside the study
+  lock.
+- **Stale.** A record whose `code_revision.source_hash` differs from the collecting process's
+  counts as stale, and a record without `code_revision` is stale too.
+- **Inconsistent.** Backend or device differences, or a non-overridden `resolved_config`
+  difference, block assembly even with `--allow_incomplete`.
+- **No false inconsistencies.** I checked that `_consistency_problems` reports nothing for any
+  real study: I built A–H records exactly as `_run_single_config` captures them (t-base, 0.1)
+  and every study came back `[]`. A legitimately split study is therefore never refused as
+  inconsistent.
+- **Config drift is caught.** If a re-run changes a shared post-training field (for example
+  `ablation_eval_examples`) for only some arms, the mix is reported as inconsistent rather than
+  silently mixed.
+- **Failed arms are retried.** A failed record has `status` `failed`, `arm_key` and
+  `code_revision`. Reuse requires `ok`, so the arm runs again
+  (`test_failed_arm_is_persisted_and_retried`).
+- **`--allow_incomplete`.** It writes placeholders or failed records in study order and exits 0.
+  Without it, an incomplete study exits 1 and nothing is written (`TestCollect`).
+
+#### Shared fingerprints, takeover and OOM
+
+- **Wait and reuse (AC-38).** The real-subprocess test checks that the lock file carries P1's
+  pid and that P2 logs `(pid host time: <P1 pid>`. P2 then reuses
+  (`shared_backbone_with == "B_objective_conditioned"`), and the store holds exactly one
+  training log.
+- **SIGKILL takeover (AC-39).** P1 is SIGKILLed while holding the lock. P2 logs
+  `Resuming … at epoch 1 (global step 2)` and registers the backbone.
+- **OOM under `--arms` (AC-40).** OOM gives exit 75 with only arm 1 persisted. The re-run makes
+  `run_pretrain` ×1, `evaluate_model` ×1 and 2 training steps.
+- **Memory while waiting.** Before taking the lock, `_run_single_config` only resolves dataset
+  fields on the CPU. No model is built and no data is put on the GPU. The CUDA context comes
+  only from the snapshot's backend probe, as FR-16 allows.
+
+#### CUDA RNG device-count fix
+
+- **Equal counts.** When the counts match, the code still uses `set_rng_state_all` exactly as
+  before.
+- **Different counts.** It restores state `torch_cuda_index` (clamped) on the current device
+  and logs a warning (`TestCudaRngDeviceCount`).
+- **Tests.** The golden test (`test_determinism.py`, 6 passed) and `test_resume.py` (15
+  passed) are unchanged and green.
+
+#### Side-output isolation
+
+- **Scoped directories.** `scoped_outputs` is set only under `--arms`. It is applied after
+  `resolved_config` is captured, so the fingerprint, `arm_key` and consistency check are
+  unchanged.
+- **Training logs.** These still go to the fingerprint's store directory, and `gradnorm` plots
+  follow the scoped `plot_dir`.
+- **No other shared writes.** The arm extras write nothing else outside `log_dir`/`plot_dir`.
+  Their reads of `checkpoint_dir` and `processed_dir` are read-only, and the candidate
+  fallback is in-memory.
+- **`run_config.json`.** It is atomic and records the selection. Last writer wins across GPU
+  processes, which FR-17 accepts.
+
+#### Planner fingerprints
+
+- **Repo test.** `TestPlannerCore::test_planner_fingerprints_equal_the_run` runs
+  `main.main --arms` for one arm per distinct fingerprint, including H1, and compares against
+  the planner.
+- **My replication on real data.** On `data/processed_users10pct`, I compared the planner with
+  `cli.parse_args`, `apply_cli_overrides`, `_resolve_before_snapshot`,
+  `resolve_study_configs`, `resolve_dataset_fields` and `_training_fingerprint` (the run's own
+  sequence). Over all 34 arms of A, D, E on H100 and B, C, F, G, H on AWS there were 0
+  mismatches.
+
+#### Grouping, LPT and the driver
+
+- **Real-data plan.** I ran `--gpus 4` on the real data with `--allow-dirty`:
+  - H100: 22 arms, each in exactly one GPU script; 10 groups (one 9-arm, one 3-arm, two 2-arm);
+    GPU loads 9.10 / 6.51 / 7.98 / 8.09 h.
+  - AWS: 12 arms; 9 groups (one 4-arm); GPU loads 3.97 / 3.82 / 5.63 / 3.77 h.
+  - Both match the requirements' fingerprint census.
+- **Plan invariants.** Every group's arms sit on the group's GPU. Each GPU script exports its
+  `CUDA_VISIBLE_DEVICES`. The FA3 gate (one per-GPU report) appears iff the backend is FA3.
+  Every script passes `bash -n`.
+- **Driver.** It backgrounds the busy GPU scripts, runs `wait`, then runs `ablation_collect`
+  per study.
+- **LPT test.** `lpt_assign` matches the hand-computed bins and is deterministic.
+
+#### Byte-identical single-GPU output
+
+I loaded `e0729ab`'s packager from `git show`. Its `render_script` (h100 and aws) and
+`render_launch_md` output is byte-identical to the current code for three variants: no flag,
+`--gpus 1`, and `--h100-gpus 1 --aws-gpus 1`.
+
+#### Refusals
+
+The packager refuses:
+- a study listed for both machines;
+- duplicate GPU ids;
+- non-integer GPU ids;
+- `--gpus 0`.
+
+Tested in `TestPlannerCore::test_refusals`.
+
+#### Concurrency tests
+
+- I ran the concurrency subset (`concurrent or oom or SharedFingerprint`) 3 times: once inside
+  the full file and twice on its own. 5/5 passed every time, in about 43 s.
+- `pgrep -f driver.py` found 0 processes afterwards. The fixture also asserts this.
+- Every wait is bounded to 120 s, and children are killed and reaped in a `finally`.
+
+### New findings (Round 3)
+
+```
+REV-012
+Severity: NIT (LOW) | Status: OPEN | Requirement: FR-15
+File: training/ablation_runner.py — _save_summary() (plain open(path, "w"))
+Problem: The summary file is still written non-atomically and outside any lock, unlike the
+  study JSONs and arm files.
+Impact: The only writers are single-process: a full `--study all` run and
+  `ablation_collect --study all`. The generated driver collects per study and never writes it.
+  Two concurrent `--study all` collects run by hand could leave a torn summary.
+Correction: Write it with utils.atomic_write_json.
+```
+
+```
+REV-013
+Severity: NIT (LOW) | Status: OPEN | Requirement: FR-15 / FR-9 (record-and-continue)
+File: training/ablation_runner.py — run_ablation(), except branch (_write_json_atomic of the
+  failed record)
+Problem: Persisting a failed arm is now inside the except handler. If that write itself raises
+  (for example the disk is full), the exception escapes run_ablation and the remaining arms
+  are not run. Before this change, a failed arm was only recorded in memory and the study
+  continued.
+Impact: This only happens on a secondary I/O failure, which would most likely break the next
+  arm anyway.
+Correction: Wrap the failed-record write in try/except OSError, log it, and continue.
+```
+
+```
+REV-014
+Severity: NIT (LOW, operational) | Status: OPEN | Requirement: FR-18
+File: scripts/package_ablation_run.py — gpu_ids() / README "Splitting studies across GPUs"
+Problem: `--gpus N` applies to BOTH machines, as FR-18 specifies, but the shared H100 has one
+  GPU. Copying `--gpus 4` from an AWS example emits run_h100_gpu{1,2,3}.sh. Their FA3 gate
+  fails (no such device), so those arms never run and the H100 collect exits 1.
+Impact: Loud, not silent, but it loses an H100 launch round trip.
+Correction: Print the per-machine GPU counts in the packager summary and suggest
+  `--aws-gpus` in the README example (or warn when --gpus > 1 is given without a
+  per-machine override).
+```
+
+INFO:
+- `run_config.json` is last-writer-wins across GPU processes (FR-17 accepts this).
+- `save_config_snapshot` probes the attention backend in every process, including
+  `ablation_collect` (pre-existing; a failure is only a warning).
+- On Linux, a SIGKILLed holder's forked DataLoader workers keep the lock for a few seconds
+  until their watchdog ends them (REV-010). This only delays a takeover.
+
+### Round 3 acceptance criteria
+
+| AC | Status | Evidence |
+|---|---|---|
+| AC-32 | PASS | `TestArmSelection::test_only_the_listed_arms_run_in_order` (order, duplicates dropped, only `input_only.json`). |
+| AC-33 | PASS | `test_bad_selection_fails_before_any_work`, `test_main_rejects_bad_selection_without_exit_75`. |
+| AC-34 | PASS | Existing tests unmodified and green. `TestCollect::test_collect_reproduces_the_full_run`. Records carry `code_revision`. |
+| AC-35 | PASS | `test_concurrent_partial_runs_assemble_one_study`, `test_sequential_partial_runs` (mutation-checked). |
+| AC-36 | PASS | `TestCollect` (missing / failed / stale / `--allow_incomplete` / inconsistent `batch_size` and `device_name` / overridden fields allowed / `--study all` summary). |
+| AC-37 | PASS | `test_concurrent_collectors_serialise_and_agree` (mutation-checked). |
+| AC-38 | PASS | `test_waiter_reuses_the_holders_backbone`. |
+| AC-39 | PASS | `test_waiter_takes_over_a_killed_holder_by_resuming`. |
+| AC-40 | PASS | `test_oom_under_arms_exits_75_then_reuses_and_resumes`. |
+| AC-41 | PASS | `TestCudaRngDeviceCount`; golden and resume unchanged. |
+| AC-42 | PASS | `TestOutputIsolation` (both tests). |
+| AC-43 | PASS | `TestMultiGpuLaunch` byte-identity test, plus my comparison against `e0729ab`'s renderer. |
+| AC-44 | PASS | `TestMultiGpuLaunch` AC-44 test, plus my real-data `--gpus 4` invariant check. |
+| AC-45 | PASS | `TestPlannerCore` (fingerprints vs real runs, estimate-json, fallback), plus my 34-arm real-data replication. |
+| AC-46 | PASS | `TestPlannerCore::test_refusals`. |
+
+All tasks T10.1–T10.11 are implemented as their BUILD notes describe. No task is falsely marked
+complete. I did not repeat T10.11's real-data smoke, because it overwrites `outputs/`; its
+mechanisms are covered by the subprocess tests.
+
+### Round 3 testing
+
+| Command | Result |
+|---|---|
+| `uv run pytest tests/test_ablation_parallel.py -m "not slow" -q -rs` | 33 passed; 0 leftover drivers |
+| `uv run pytest tests/test_ablation_robustness.py -m "not slow" -q -rs` | 31 passed (unmodified file) |
+| `uv run pytest tests/test_cli.py -m "not slow" -q -rs` | 63 passed (unmodified file) |
+| `uv run pytest tests/test_scripts.py -m "not slow" -q -rs` | 29 passed |
+| `uv run pytest tests/test_resume.py -m "not slow" -q -rs` | 15 passed |
+| `uv run pytest tests/test_determinism.py -m "not slow" -q -rs` | 6 passed (golden unchanged) |
+| `uv run pytest tests/test_ablation_parallel.py -m "not slow" -q -k "concurrent or oom or SharedFingerprint"` ×2 | 5 passed each (~43 s); 0 leftover |
+| Mutation (scratch copy): no study lock in `collect_study` → concurrent-collectors test ×3 | FAILED 3/3 (writes overlapped), as required |
+| Mutation (scratch copy): persist ok arms after auto-collect → concurrent/sequential partial-run tests | FAILED (no study JSON; both processes "incomplete"), as required |
+| Scratch script: `_consistency_problems` over A–H records built like `_run_single_config` | `[]` for every study |
+| Scratch script: planner vs replicated `main` → `_run_single_config` fingerprint path on real 10% data | 34 arms, 0 mismatches |
+| Scratch script: `e0729ab` packager renderers vs current (3 single-GPU flag variants) | byte-identical |
+| `package_ablation_run.py --skip-data --allow-dirty --gpus 4 --out <scratchpad>` on real data | exit 0; plan invariants hold; all scripts pass `bash -n` |
+
+Free disk stayed at 56–57 GiB. Only this `review.md` was edited in the repo.
+
+### Round 3 final assessment
+
+**APPROVE (PASS_WITH_WARNINGS).** Phase 10 is correct.
+
+- **Ordering.** The persist-before-lock order guarantees that some process assembles every
+  study that completes. The driver's final collect covers a process killed after persisting.
+- **Concurrency tests.** They are bounded, they do not flake, and they fail when the lock or
+  the ordering is broken.
+- **Planner.** It reproduces the run's fingerprints exactly, including H1.
+- **Single-GPU launch.** It is byte-identical to `e0729ab`.
+
+REV-012..REV-014 are optional NITs. Commit before packaging (the REV-001 refusal still
+applies).
+
+### Round 3 follow-up (orchestrator, 2026-10-16)
+- REV-013 — RESOLVED: persisting a failed arm is wrapped in `try/except OSError` (logged), so a failed write no longer skips the remaining arms (`training/ablation_runner.py`).
+- REV-014 — RESOLVED: the packager warns when `--gpus N>1` applies to the H100 without `--h100-gpus`/`--h100-gpu-ids`; README recommends `--aws-gpus N`.
+- REV-012 left as is (single-process writer only).
+- Re-run: `test_scripts` + `test_ablation_robustness` 60 passed, `test_ablation_parallel` 33 passed (`-m "not slow"`).

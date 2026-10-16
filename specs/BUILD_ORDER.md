@@ -363,10 +363,13 @@ suite) and only capped runs on the Mac** — see `specs/ablation-run/tasks.md` "
 | 23.8 | OOM exit 75 + retry launcher, store lock, arm persistence | `ablation-run T7.1–T7.4` | `scripts/run_with_retry.py`, `ablations/seed_{seed}/` |
 | 23.9 | Packaging + README runbook | `ablation-run T8.1–T8.2` | `scripts/package_ablation_run.py`, `dist/` |
 | 23.10 | Mac verification | `ablation-run T9.1–T9.2` | targeted test sweep; capped real-data smoke incl. kill/resume |
+| 23.11 | Split studies across GPUs: `--arms`, locked study assembly + `ablation_collect`, wait/takeover hardening, output isolation | `ablation-run T10.1–T10.7` | arm-filtered runs; concurrency proven with real subprocesses |
+| 23.12 | Packager GPU planning + multi-GPU launch files, docs, sweep | `ablation-run T10.8–T10.11` | `run_{m}_gpu{id}.sh`, driver with collect, `plan_{m}.json`; `--gpus 1` byte-identical |
 
 ```
 🧪 GATE: test_determinism.py golden test green from T3.2 through T6.2 (training unchanged by FR-4/FR-8)
 🧪 GATE: T9.1 targeted sweep green; T9.2 capped smoke shows resume after kill -9 and arm reuse
+🧪 GATE: T10.6/T10.7 concurrency tests pass three consecutive runs; existing ablation/packager tests pass unmodified
 ⛔ BLOCKED: no launch on the H100 until Phase 13.1 (FA3 verification) passes there — run_h100.sh enforces it
 ```
 
@@ -399,7 +402,7 @@ suite) and only capped runs on the Mac** — see `specs/ablation-run/tasks.md` "
 | 20 | CLI integration | All stages dispatchable |
 | 21 | Multi-seed final runs | 3 independent seeds aggregated |
 | 22 | Final plots + deliverables | All outputs present |
-| 23 | Ablation run readiness (`ablation-run`) | Golden test green throughout; targeted sweep; capped smoke with resume |
+| 23 | Ablation run readiness (`ablation-run`) | Golden test green throughout; targeted sweep; capped smoke with resume; Phase 10 concurrency tests (real subprocesses) and `--gpus 1` byte-identity |
 
 **Critical blocking gate:** Phase 11 (end-to-end smoke tests). Full MovieLens-20M training is **forbidden** until both the one-batch and few-step T-Small smoke tests pass.
 

@@ -358,3 +358,58 @@ class TestResumeLogCleanup:
         assert result is not None
         assert epochs() == ["0", "1", "2"], "the redone epoch duplicated its log line"
         assert steps() == [0, 2, 4, 6, 8, 10], "the redone epoch duplicated GradNorm records"
+
+
+class TestCudaRngDeviceCount:
+    """specs/ablation-run AC-41: resume tolerates a different number of visible GPUs."""
+
+    @staticmethod
+    def _state():
+        import random
+
+        import numpy as np
+
+        from training.pretrain import _capture_rng_state
+
+        state = _capture_rng_state(
+            random.Random(0), np.random.RandomState(0), torch.Generator().manual_seed(0),
+            torch.device("cpu"),
+        )
+        state["torch_cuda"] = [torch.full((8,), i, dtype=torch.uint8) for i in range(4)]
+        state["torch_cuda_index"] = 2
+        return state
+
+    def _restore(self, monkeypatch, visible):
+        import random
+
+        import numpy as np
+
+        from training.pretrain import _restore_rng_state
+
+        calls = {"all": [], "one": []}
+        monkeypatch.setattr(torch.cuda, "device_count", lambda: visible)
+        monkeypatch.setattr(torch.cuda, "set_rng_state_all", lambda states: calls["all"].append(states))
+        monkeypatch.setattr(torch.cuda, "set_rng_state", lambda st, *a, **k: calls["one"].append(st))
+        _restore_rng_state(
+            self._state(), random.Random(1), np.random.RandomState(1),
+            torch.Generator(), torch.device("cuda"),
+        )
+        return calls
+
+    def test_fewer_visible_devices_restores_the_saved_device_and_warns(self, monkeypatch, caplog):
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="training.pretrain"):
+            calls = self._restore(monkeypatch, visible=1)
+        assert calls["all"] == []
+        assert len(calls["one"]) == 1 and torch.equal(calls["one"][0], torch.full((8,), 2, dtype=torch.uint8))
+        assert "saved 4 CUDA RNG states but 1 device(s) are visible" in caplog.text
+
+    def test_equal_counts_restore_every_device_as_before(self, monkeypatch, caplog):
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="training.pretrain"):
+            calls = self._restore(monkeypatch, visible=4)
+        assert len(calls["all"]) == 1 and len(calls["all"][0]) == 4
+        assert calls["one"] == []
+        assert "CUDA RNG states" not in caplog.text

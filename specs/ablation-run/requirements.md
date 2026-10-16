@@ -58,6 +58,10 @@ At HEAD the ablation cannot be run as the owner requested:
 
 - Changing the batch size, LR scaling, data-parallel shards, multiple arms per GPU, or any other
   batch/run-level parallelism (owner decision 3). No batch-size probing.
+  *Amended by the owner 2026-10-16 (FR-14–FR-18):* the arms of a study may now run as separate
+  processes on **separate GPUs of one machine**, one process per GPU, batch 256 unchanged. Still
+  out of scope: more than one arm per GPU at a time, data-parallel training of one arm, and
+  splitting a study across machines.
 - GPU negative sampling (see design D4 for why it fails the owner's bit-identity bar).
 - Changing the project default precision (`dtype="bf16"`, `mixed_precision=False` stays).
 - Running the ablation itself, any multi-hour job, or anything on the H100/AWS machines.
@@ -417,3 +421,241 @@ are not BUILD gates.
   same command, it logs a resume at epoch 1 and completes; (c) a capped `--stage ablation --study B`
   run twice: the second run reuses both arms; (d) `package_ablation_run.py` builds `dist/` and the
   emitted commands match FR-12.
+
+---
+
+# Extension: splitting a study's arms across GPUs (owner request 2026-10-16)
+
+Added after the feature above was built, reviewed (`review.md`, APPROVE) and committed as
+`e0729ab`. FR-1–FR-13 and AC-01–AC-31 are unchanged; everything below is additive.
+
+## Problem
+
+Study H runs ~17 h serially on one GPU (its seq100/seq200 arms alone are ~4.5 h and ~9 h on an
+L4 at 10% users). The packaging from FR-12 runs every study of a machine as one sequential loop on
+one GPU, so a multi-GPU machine (e.g. 4× L4) sits mostly idle. Balanced over 4 L4s the whole
+ablation fits in ~12 h. Running arms of one study in several processes needs: a way to select
+arms, study outputs that several processes can produce without overwriting each other, a
+well-defined behaviour when two processes need the same backbone, and a packager that plans and
+emits the per-GPU launch.
+
+Re-verified at `e0729ab` (the facts these requirements build on):
+- Arm results are already persisted one file per arm, atomically, under
+  `{ablation_dir}/seed_{seed}/arms/{study}_{model}/{label}.json` — but only for `status == "ok"`
+  (`training/ablation_runner.py::run_ablation`).
+- `run_ablation` writes the study JSON (`_save_study_results`) and draws the study plots
+  (`_plot_study`, `_STUDY_PLOTS`) unconditionally from its in-memory list at the end of each
+  study, so two partial processes would each overwrite the study JSON with only their own arms.
+- `_run_single_config` takes the backbone-store lock with `timeout=None` (blocking, 5 s poll,
+  holder logged once), re-checks the store after acquiring, and reuses if found. If the holder
+  died without registering, the waiter trains — and `run_pretrain`, finding the holder's
+  `last.pt` in the same store directory with the same fingerprint and code, **resumes** it.
+- Arm extras write some files under fixed per-model names, so concurrent arms collide:
+  `run_local_personalization` → `{log_dir}/personalization_gain_{model}.json` and two plots;
+  `run_federated` → `{log_dir}/federated_rounds_{model}.json`,
+  `{log_dir}/personalization_gain_{model}.json`, `{plot_dir}/federated_convergence_{model}.png`.
+  (`cold_start`/`longtail`/MoE reports are already keyed by `{study}_{label}`.)
+- `main.save_config_snapshot` rewrites `{log_dir}/run_config.json` non-atomically in every
+  process.
+- `_restore_rng_state` calls `torch.cuda.set_rng_state_all` with the saved list, which fails if
+  the resuming process sees a different number of CUDA devices than the one that saved it.
+- On the launch config, the H100 studies (A, D, E, H) resolve to 10 training fingerprints
+  (one shared by 9 arms across A, D, E, H; one by `A:4obj_no_routing`/`D:none_no_gradnorm`; one by
+  `A:arv_mmoe`/`D:arv_no_gradnorm`; one by `D:none_gradnorm`/`E:global_only`/`E:global_lora`;
+  six single-arm) and the AWS studies (B, C, F, G) to 9 (one shared by `B:objective_conditioned`,
+  `C:arv_mmoe`, `F:full_reference`, `G:K4`; eight single-arm).
+
+## Goals
+
+- G10: Run any subset of one study's arms in one process (`--arms`).
+- G11: Correct study JSON and plots no matter how arms were distributed over processes, and an
+  explicit way to (re)assemble them.
+- G12: A process that needs a backbone another process is training waits and reuses it; OOM
+  retry and resume keep working per arm.
+- G13: The packager plans arms over N GPUs per machine and emits the per-GPU launch plus a final
+  collect step; `--gpus 1` is today's output.
+
+## Non-Goals (extension)
+
+- More than one process per GPU, data-parallel training of one arm, any batch-size change.
+- Splitting one study across machines (H100 and AWS); the packager refuses it.
+- Scheduling across machines, dynamic work stealing, or reading a remote backbone store to skip
+  already-trained fingerprints (the plan assumes a fresh store).
+- Merging results from the two machines into one summary automatically (possible by hand with
+  FR-15's collect stage over a merged results tree; not automated).
+
+## Functional Requirements (extension)
+
+### FR-14: `--arms` arm filter
+- `--stage ablation --study X --arms a,b,...` runs only those arms of study X, in the order given
+  (duplicates dropped, first occurrence kept). Labels are the resolved labels of X for the run's
+  config (grid arms included, e.g. `H2_seq200`, `K6`). `--arms` with any stage other than
+  `ablation` is rejected.
+- Fail fast — before `check_processed_dir`, any data load or any training — with a `ValueError`
+  that lists X's valid labels when a label is unknown or belongs to another study, when the list
+  is empty, or when `--study` is `all` (`--arms` requires exactly one study, because labels are
+  only unique within a study, e.g. `arv_mmoe` exists in A and C).
+- Without `--arms`, `run_ablation` behaves exactly as at `e0729ab`: same arms, order, study JSON
+  content, plots, summary and arm reuse. (Additive side effects allowed: failed-arm records, the
+  `code_revision` field in persisted arm files and in the study JSON's arm entries (FR-15), and
+  the per-study lock around writing study outputs.)
+
+### FR-15: Concurrency-safe study outputs and an explicit collect step
+- Every attempted arm is persisted to its arm file (`status` `ok` **or** `failed`, with
+  `arm_key` and `code_revision` = the producing process's `source_revision`). Reuse still
+  requires `status == "ok"` and a matching `arm_key` (FR-11 unchanged), so failed arms are
+  retried on re-run.
+- A study's JSON and plots are written by one function used by every path, under an exclusive
+  per-study file lock, with the JSON written atomically. Concurrent writers never produce a torn
+  or interleaved file, and writing is idempotent.
+- A run with `--arms` writes the study JSON and plots **only when the study is complete**: after
+  persisting its own arms it takes the per-study lock and checks completeness from the arm files
+  on disk; if complete it assembles the outputs, otherwise it writes nothing study-level and logs
+  which labels are missing/failed/stale. Because every process persists its arms before checking,
+  the process that persists the last missing arm always sees a complete study and draws the
+  plots. An auto-collect that cannot assemble the study logs an error and does not change the
+  run's exit status.
+- `--stage ablation_collect --study X|all` assembles study JSON + plots from the persisted arm
+  files without training or evaluating anything. It exits 0 when every requested study was
+  assembled and 1 otherwise, listing per study the missing, failed, stale and inconsistent arms,
+  and writes nothing for an incomplete study. `--allow_incomplete` assembles anyway: the JSON
+  contains every ok arm plus a placeholder (`status` `missing`, or the persisted failed record)
+  for the rest, in study order; plots use the ok arms. With `--study all` it also writes the
+  summary, marking incomplete studies.
+- Completeness/consistency rules (shared by auto-collect and the stage):
+  - every resolved label of the study has an arm file with `status == "ok"`;
+  - an arm whose `code_revision.source_hash` differs from the collecting process's is **stale**
+    (counts as missing);
+  - all arms of the study share `runtime.attention_backend` and `runtime.device_name` (the
+    one-machine rule);
+  - all arms share every `resolved_config` field that no arm of the study overrides, excluding
+    path and runtime-only fields;
+  - a violation of the last two is reported as **inconsistent**, naming the field and labels, and
+    blocks assembly even with `--allow_incomplete`.
+- The assembled study JSON lists arms in study order with the same per-arm content as the
+  persisted files; for a completed full run (no `--arms`) it equals the full run's own study
+  JSON except for the `reused_from_previous_run` flag.
+
+### FR-16: Waiting on, and taking over, a backbone another process is training
+- A process that needs fingerprint F while another process holds F's store lock blocks (no
+  timeout), logs once that it is waiting with the holder's `pid host time`, allocates no model or
+  data on the GPU while waiting (only the CUDA context from the startup backend probe exists), and
+  after acquiring the lock re-checks the store and **reuses** F's registered
+  backbone without calling `run_pretrain`.
+- If the holder dies before registering F (OOM exit 75, crash, `kill -9`), the waiter acquires the
+  lock and trains F by **resuming** the holder's `last.pt` (same fingerprint, same code), not from
+  scratch. The original holder, when its retry wrapper re-runs it, waits for the lock and reuses F.
+- Resume tolerates a different number of visible CUDA devices between the saving and the
+  resuming process (each process normally sees one GPU via `CUDA_VISIBLE_DEVICES`): it restores
+  the state for the current device and logs a warning when the counts differ, instead of raising.
+- OOM retry and resume work per arm under `--arms`: an OOM exits 75; re-running the same command
+  reuses the arms already persisted as ok and resumes the interrupted arm from its `last.pt`.
+
+### FR-17: Per-process output isolation
+- Under `--arms`, an arm's post-training side outputs (`log_dir`, `plot_dir` during the arm's
+  extras) go to `{log_dir}/arms/{study}_{label}/` and `{plot_dir}/arms/{study}_{label}/`, so two
+  arms in different processes never write the same file. Without `--arms` paths are unchanged.
+  The arm's result JSON is unaffected (path fields are excluded from `arm_key` and fingerprint).
+- `run_config.json` is written atomically and records the `--study`/`--arms` selection of the
+  process that wrote it.
+
+### FR-18: Packager: plan arms over GPUs
+- New packager options: `--gpus N` (GPU count for every machine, default 1), `--h100-gpus N` /
+  `--aws-gpus N` (per-machine override), `--h100-gpu-ids` / `--aws-gpu-ids` (explicit
+  comma-separated `CUDA_VISIBLE_DEVICES` values; their count is N), `--estimate-json PATH`.
+- A machine with N = 1 and no explicit ids gets exactly today's output: `--gpus 1` (or no flag)
+  produces byte-identical `launch/` files.
+- For N > 1 (or explicit ids) the packager plans that machine's studies:
+  - It resolves every arm and its training fingerprint with the exact config the launched
+    commands will build (same helper `_run_single_config` uses), reading dataset statistics from
+    the local processed directory.
+  - Arms sharing a fingerprint form one **group**; a group is never split across GPUs, so the
+    first arm of the group trains and the rest reuse without any GPU idling on a lock.
+  - Group cost = training hours of its fingerprint + a fixed post-training overhead per arm.
+    Training hours come from `--estimate-json` (output of `scripts/estimate_training_time.py
+    --out`, matched by `"study:label"`) when given, else from the handoff's L4 figures: 1.81 h for
+    `max_seq_length ≤ 50`, `4.5 h × max_seq_length / 100` above that, scaled by
+    `user_sample_fraction / 0.1` and `pretrain_epochs / 20`.
+  - Groups are assigned longest-processing-time-first: sorted by cost descending (ties by the
+    first arm's study/label order), each to the GPU with the least assigned hours (ties: lowest
+    index). Deterministic.
+  - Per GPU, its arms are ordered by machine study order then study order, and consecutive arms
+    of one study become one `--study X --arms ...` command.
+- Emitted per machine with N > 1: `launch/run_{machine}_gpu{id}.sh` per GPU that has work
+  (`export CUDA_VISIBLE_DEVICES={id}`; the FA3 verification gate when the backend is FA3; each
+  command through `run_with_retry.py` with the FR-12 flag set plus `--arms`, its own log; a
+  failed command does not stop the next), and `launch/run_{machine}.sh` as a driver that starts
+  every GPU script in the background, `wait`s for all, then runs `--stage ablation_collect` for
+  each of the machine's studies. The detached one-liner from FR-12 is unchanged.
+  `launch/plan_{machine}.json` records groups, fingerprints, hours source, per-GPU arms and
+  hours. `LAUNCH.md` adds the per-GPU detached one-liners (for manual use) and the collect
+  commands.
+- The packager refuses a study listed for both machines, a GPU id list with duplicates or
+  non-integers, and N < 1.
+
+## Acceptance Criteria (extension)
+
+All verifiable on the Mac (CPU) with the tiny synthetic fixture; concurrency ACs use real
+subprocesses.
+
+- **AC-32:** `run_ablation(..., study="B", arms=["input_only"])` trains and evaluates only
+  `input_only` (spies: one `_run_single_config` call, for that label) and writes only its arm
+  file; arms run in the order given.
+- **AC-33:** An unknown label, a label of another study (`--study B --arms mmoe`), an empty list,
+  and `--study all --arms x` each raise `ValueError` whose message lists the valid labels (or
+  says `--arms` needs one study) with zero calls to `check_processed_dir`, data loading or
+  `run_pretrain`; via `main.main` the process exits non-zero but not 75. Duplicates are dropped.
+- **AC-34:** Without `--arms`, every existing test in `tests/test_ablation_robustness.py` and
+  `tests/test_cli.py` passes unmodified; after a complete full run of study B,
+  `--stage ablation_collect --study B` reproduces its study JSON exactly except for
+  `reused_from_previous_run`, and the persisted arm files carry `code_revision`.
+- **AC-35:** Two real subprocesses run study B concurrently with `--arms objective_conditioned`
+  and `--arms input_only` on the tiny fixture: both exit 0; afterwards the study JSON is valid,
+  contains both arms in study order and the study plot exists. In a sequential variant, after the
+  first partial run alone neither the study JSON nor the study plot exists and the log names the
+  missing label; after the second, both exist.
+- **AC-36:** `ablation_collect`: complete study → exit 0 and JSON + plots written; a missing arm,
+  a failed arm, or a stale arm (persisted with another `source_hash`) → exit 1 naming it, nothing
+  written; `--allow_incomplete` → JSON with a `missing` placeholder / the failed record in study
+  order and plots of the ok arms; arms with different `runtime.device_name` or a differing
+  non-overridden `resolved_config` field (e.g. `batch_size`) → exit 1 naming the field, even with
+  `--allow_incomplete`.
+- **AC-37:** Two real subprocesses assembling the same complete study at the same time both exit
+  0 and leave one valid study JSON identical to a single assembly; a spy shows the per-study lock
+  serialises the writes.
+- **AC-38:** Real subprocesses on the tiny fixture: P1 runs `--study B --arms
+  objective_conditioned`; once P1 holds the store lock (lock file shows P1's pid), P2 starts
+  `--study C --arms arv_mmoe` (same fingerprint). P2 logs that it is waiting with P1's pid, never
+  trains (its result has `shared_backbone_with` = P1's run tag and the store has exactly one
+  training log), and both exit 0.
+- **AC-39:** P1 trains a fingerprint and is held after writing its epoch-0 `last.pt`; P2 waits on
+  the lock; P1 is killed with SIGKILL; P2 acquires the lock, logs `Resuming ... at epoch 1`,
+  completes and registers the backbone; its arm is `ok`.
+- **AC-40:** Under `--arms` with two arms, an OOM injected into the second arm's training makes
+  `main.main` exit 75; re-running the same command reuses the first arm (no training, no
+  evaluation) and resumes the second at its next epoch.
+- **AC-41:** With a saved CUDA RNG list of length 4 and a (mocked) process seeing one CUDA
+  device, `_restore_rng_state` restores the current device's state and warns instead of raising;
+  equal counts behave exactly as before (golden and resume tests unchanged).
+- **AC-42:** Under `--arms`, `E:global_lora` and `A:arv_mmoe_gradnorm_lora` (tiny, personalization
+  mocked to write its usual files) write their side outputs under different
+  `{log_dir}/arms/{study}_{label}/` directories and nothing to `{log_dir}/personalization_gain_*`;
+  without `--arms` the paths are as before. `run_config.json` is written via temp file + rename
+  and contains the `arms` selection.
+- **AC-43:** The packager with `--gpus 1`, and with no GPU flag, writes byte-identical `launch/`
+  files, and the existing `TestPackageAblationRun` tests pass unmodified.
+- **AC-44:** With `--aws-gpus 4 --h100-studies A,D,E --aws-studies B,C,F,G,H` (tiny fixture,
+  `--processed-dir` pointing at it): every arm of the machine appears in exactly one
+  GPU script; no fingerprint group spans two GPUs; the assignment is deterministic (two runs
+  identical) and equals the LPT result computed independently in the test; each GPU script
+  exports its `CUDA_VISIBLE_DEVICES`, routes every command through `run_with_retry.py`, carries
+  the FR-12 flags plus `--arms`, and has the FA3 gate iff the machine backend is FA3; the driver
+  starts all GPU scripts in the background, `wait`s, then runs `ablation_collect` for each study;
+  every script passes `bash -n`; `plan_aws.json` lists per-GPU arms and hours; `LAUNCH.md`
+  contains the per-GPU one-liners and the collect commands.
+- **AC-45:** The planner's fingerprints equal those `_run_single_config` records for the same
+  arms on the tiny fixture; with `--estimate-json` the group hours come from the file; without it
+  the fallback formula ranks `H2_seq200` > `H2_seq100` > base arms and scales with fraction and
+  epochs.
+- **AC-46:** The packager exits non-zero for a study on both machines, duplicate or non-integer
+  GPU ids, and `--gpus 0`.

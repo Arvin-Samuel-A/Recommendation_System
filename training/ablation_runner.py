@@ -1,6 +1,7 @@
 import copy
 import hashlib
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 import json
 import logging
 import os
@@ -148,6 +149,54 @@ def resolve_study_configs(study: str, base_config: Config) -> List[Config]:
         cfg._study_overrides = overrides
         configs.append(cfg)
     return configs
+
+
+def parse_arms(text: Optional[str]) -> Optional[List[str]]:
+    """`--arms a,b,a` -> ["a", "b"] (order kept, duplicates dropped); None -> None.
+
+    specs/ablation-run FR-14 / D15. An empty selection is an error, not "all arms".
+    """
+    if text is None:
+        return None
+    if isinstance(text, (list, tuple)):
+        items = [str(t).strip() for t in text]
+    else:
+        items = [t.strip() for t in str(text).split(",")]
+    arms: List[str] = []
+    for item in items:
+        if item and item not in arms:
+            arms.append(item)
+    if not arms:
+        raise ValueError("--arms was given but names no arm (e.g. --arms input_only,objective_conditioned)")
+    return arms
+
+
+def select_study_configs(
+    study: str, base_config: Config, arms: Optional[List[str]],
+) -> List[Config]:
+    """The resolved arm configs `run_ablation` runs: all of them, or the `--arms` subset.
+
+    specs/ablation-run D15: validated BEFORE anything touches data, so a typo costs nothing.
+    Labels are only unique within a study (e.g. `arv_mmoe` is in A and C), hence `--arms`
+    needs exactly one study.
+    """
+    if arms is None:
+        return resolve_study_configs(study, base_config)
+    arms = parse_arms(arms)
+    if study == "all":
+        raise ValueError(
+            "--arms needs exactly one --study (labels are only unique within a study); "
+            "got --study all"
+        )
+    configs = resolve_study_configs(study, base_config)
+    by_label = {cfg._study_label: cfg for cfg in configs}
+    labels = [cfg._study_label for cfg in configs]
+    unknown = [a for a in arms if a not in by_label]
+    if unknown:
+        raise ValueError(
+            f"Study {study} has no arm(s) {unknown}; valid labels: {labels}"
+        )
+    return [by_label[a] for a in arms]
 
 
 #: Study -> the extra diagnostics FR-5..FR-13 require beyond metrics.
@@ -298,6 +347,30 @@ def register_backbone(
     return entry
 
 
+def resolve_dataset_fields(cfg: Config, stats_dir: Optional[str] = None):
+    """Set `num_items`, `num_users`, `vocab_size`, `feature_dim` from a processed dir.
+
+    specs/ablation-run D20: the ONE place these dataset-derived fields are resolved for an
+    ablation arm, shared by `_run_single_config` and the packager's planner, so a plan's
+    training fingerprints are exactly the ones the launched run will compute. `stats_dir`
+    (default `cfg.processed_data_dir`) lets the packager read a local copy while the config
+    keeps the remote's relative path. Returns the aligned metadata matrix (or None).
+    """
+    from data.sequence_generator import load_metadata_matrix
+
+    directory = stats_dir or cfg.processed_data_dir
+    with open(os.path.join(directory, "dataset_stats.json")) as f:
+        stats = json.load(f)
+    cfg.num_items = stats["num_items"]
+    cfg.num_users = stats["num_users"]
+    cfg.vocab_size = cfg.num_items + 2
+    # REV-058/REV-072: one loader, so the (vocab, F) alignment applies uniformly.
+    metadata_matrix = load_metadata_matrix(directory, cfg)
+    if metadata_matrix is not None:
+        cfg.feature_dim = metadata_matrix.shape[-1]
+    return metadata_matrix
+
+
 def _runtime_record(model, cfg: Config, device: torch.device) -> Dict:
     """Backend, device and precision an arm was evaluated (and trained) under (D2)."""
     import platform
@@ -323,18 +396,18 @@ BACKBONE_LOCK_POLL_SECONDS = 5.0
 
 
 @contextmanager
-def backbone_lock(
-    checkpoint_root: str,
-    fingerprint: str,
+def file_lock(
+    path: str,
     timeout: Optional[float] = None,
-    poll: Optional[float] = None,
+    poll: float = 5.0,
+    on_wait=None,
 ):
-    """Exclusive OS lock on one fingerprint's store directory (specs/ablation-run D10).
+    """Exclusive `flock` on `path` (created if needed); the holder writes "pid host time".
 
-    `flock` locks are released by the kernel when their process dies, so an OOM-killed or
-    `kill -9`-ed trainer never leaves a stale lock (unlike an O_EXCL lock file). Waiting is
-    logged once, with the holder's "pid host time" line. `timeout=None` waits forever;
-    otherwise `TimeoutError` after `timeout` seconds.
+    specs/ablation-run D16: the loop `backbone_lock` used, extracted so the per-study lock
+    shares it. `flock` locks die with their process, so a killed holder never leaves a stale
+    lock. `on_wait(holder_line)` is called once, the first time the lock is busy.
+    `timeout=None` waits forever; otherwise `TimeoutError` after `timeout` seconds.
     """
     import errno
     import fcntl
@@ -342,11 +415,7 @@ def backbone_lock(
     import time
     from datetime import datetime, timezone
 
-    if poll is None:
-        poll = BACKBONE_LOCK_POLL_SECONDS
-    store = backbone_store_dir(checkpoint_root, fingerprint)
-    os.makedirs(store, exist_ok=True)
-    path = os.path.join(store, BACKBONE_LOCK)
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
     try:
         start = time.monotonic()
@@ -365,14 +434,12 @@ def backbone_lock(
                         holder = f.read().strip() or "unknown"
                 except OSError:
                     holder = "unknown"
-                logger.info(
-                    "Backbone %s is being trained by another process (pid host time: %s) "
-                    "-- waiting for its lock at %s", fingerprint, holder, path,
-                )
+                if on_wait is not None:
+                    on_wait(holder)
                 logged = True
             if timeout is not None and elapsed >= timeout:
                 raise TimeoutError(
-                    f"Timed out after {timeout:g} s waiting for the backbone lock {path}"
+                    f"Timed out after {timeout:g} s waiting for the lock {path}"
                 )
             wait = poll if timeout is None else min(poll, max(0.01, timeout - elapsed))
             time.sleep(wait)
@@ -389,14 +456,49 @@ def backbone_lock(
         os.close(fd)
 
 
+@contextmanager
+def backbone_lock(
+    checkpoint_root: str,
+    fingerprint: str,
+    timeout: Optional[float] = None,
+    poll: Optional[float] = None,
+):
+    """Exclusive OS lock on one fingerprint's store directory (specs/ablation-run D10).
+
+    `flock` locks are released by the kernel when their process dies, so an OOM-killed or
+    `kill -9`-ed trainer never leaves a stale lock (unlike an O_EXCL lock file). Waiting is
+    logged once, with the holder's "pid host time" line. `timeout=None` waits forever;
+    otherwise `TimeoutError` after `timeout` seconds.
+    """
+    if poll is None:
+        poll = BACKBONE_LOCK_POLL_SECONDS
+    store = backbone_store_dir(checkpoint_root, fingerprint)
+    os.makedirs(store, exist_ok=True)
+    path = os.path.join(store, BACKBONE_LOCK)
+
+    def log_wait(holder: str) -> None:
+        logger.info(
+            "Backbone %s is being trained by another process (pid host time: %s) "
+            "-- waiting for its lock at %s", fingerprint, holder, path,
+        )
+
+    with file_lock(path, timeout=timeout, poll=poll, on_wait=log_wait) as locked:
+        yield locked
+
+
 def _run_single_config(
     cfg: Config,
     model_name: str,
     study: str,
     base_config: Config,
     train: bool,
+    scoped_outputs: bool = False,
 ) -> Dict:
     """Train (or load), evaluate and diagnose one ablation config.
+
+    `scoped_outputs` (specs/ablation-run FR-17, set under `--arms`): the arm's post-training
+    side outputs go to `{log_dir}/arms/{study}_{label}/` and `{plot_dir}/arms/{study}_{label}/`
+    so arms running in different processes never write the same file.
 
     REV-006: the runner never executed an experiment -- it built a
     `{"label", "config_diff"}` dict and appended it. No model was constructed, nothing
@@ -425,18 +527,12 @@ def _run_single_config(
         "study_overrides": dict(getattr(cfg, "_study_overrides", {})),
         "resolved_config": asdict(cfg),
     }
+    if scoped_outputs:
+        cfg.log_dir = os.path.join(cfg.log_dir, "arms", f"{study}_{label}")
+        cfg.plot_dir = os.path.join(cfg.plot_dir, "arms", f"{study}_{label}")
 
     processed = cfg.processed_data_dir
-    with open(os.path.join(processed, "dataset_stats.json")) as f:
-        stats = json.load(f)
-    cfg.num_items = stats["num_items"]
-    cfg.num_users = stats["num_users"]
-    cfg.vocab_size = cfg.num_items + 2
-
-    # REV-058/REV-072: one loader, so the (vocab, F) alignment applies uniformly.
-    metadata_matrix = load_metadata_matrix(processed, cfg)
-    if metadata_matrix is not None:
-        cfg.feature_dim = metadata_matrix.shape[-1]
+    metadata_matrix = resolve_dataset_fields(cfg)
 
     # Logs and diagnostics stay namespaced per arm; the CHECKPOINT is namespaced by
     # training fingerprint instead (see `backbone_store_dir`).
@@ -721,13 +817,196 @@ def _load_persisted_arm(path: str, arm_key: str) -> Optional[Dict]:
 
 
 def _write_json_atomic(path: str, payload) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = f"{path}.tmp-{os.getpid()}"
-    with open(tmp, "w") as f:
-        json.dump(payload, f, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    from utils import atomic_write_json
+
+    atomic_write_json(path, payload)
+
+
+def _current_revision() -> Dict:
+    """This process's `source_revision` (looked up at call time, so tests can patch it)."""
+    import utils
+
+    return utils.get_source_revision()
+
+
+#: How often a process waiting for a study's output lock re-tries it.
+STUDY_LOCK_POLL_SECONDS = 0.5
+
+
+def _study_lock_path(config: Config, study: str, model_name: str) -> str:
+    """The per-study lock file (D16). Kept OUT of `arms/` so that directory holds only
+    arm results."""
+    mn = model_name.replace("-", "_")
+    return os.path.join(_results_root(config), ".locks", f"{study}_{mn}.study.lock")
+
+
+@contextmanager
+def _study_lock(config: Config, study: str, model_name: str):
+    path = _study_lock_path(config, study, model_name)
+
+    def log_wait(holder: str) -> None:
+        logger.info(
+            "Study %s outputs are being written by another process (pid host time: %s) "
+            "-- waiting for %s", study, holder, path,
+        )
+
+    with file_lock(path, poll=STUDY_LOCK_POLL_SECONDS, on_wait=log_wait) as locked:
+        yield locked
+
+
+def _write_study_outputs_unlocked(
+    config: Config, model_name: str, study: str, results: List[Dict],
+) -> None:
+    _save_study_results(config, model_name, study, results)
+    _plot_study(config, model_name, study, results)
+    # REV-065: four requirements name specific figures that the generic grouped bar
+    # chart does not produce. They are dispatched alongside it, not instead of it.
+    plot_named = _STUDY_PLOTS.get(study)
+    if plot_named is not None:
+        try:
+            plot_named(config, model_name, results)
+        except Exception as exc:  # a figure failing must not lose the results
+            logger.exception("Study %s: named figure failed: %s", study, exc)
+
+
+# ---------------- assessment and collection (specs/ablation-run FR-15, design D17) ----------
+
+
+@dataclass
+class StudyAssessment:
+    """What the persisted arm files of one study amount to (D17)."""
+
+    study: str
+    labels: List[str]                                   # expected, study order
+    ok: Dict[str, dict] = field(default_factory=dict)
+    failed: Dict[str, dict] = field(default_factory=dict)
+    missing: List[str] = field(default_factory=list)
+    stale: List[str] = field(default_factory=list)
+    inconsistent: List[str] = field(default_factory=list)
+    written: bool = False                               # set by collect_study
+
+    @property
+    def complete(self) -> bool:
+        return not (self.missing or self.stale or self.failed or self.inconsistent)
+
+    def describe(self) -> str:
+        return (
+            f"study {self.study}: {len(self.ok)}/{len(self.labels)} arms complete; "
+            f"missing {self.missing} failed {sorted(self.failed)} stale {self.stale}"
+            + (f" inconsistent {self.inconsistent}" if self.inconsistent else "")
+        )
+
+
+def _consistency_problems(study: str, records: Dict[str, dict]) -> List[str]:
+    """The one-machine and same-base-config rules over a study's persisted records."""
+    problems: List[str] = []
+    for key in ("attention_backend", "device_name"):
+        values = {
+            label: r["runtime"].get(key) for label, r in records.items()
+            if isinstance(r.get("runtime"), dict)
+        }
+        if len(set(map(str, values.values()))) > 1:
+            problems.append(f"runtime.{key} differs: {values}")
+    overridden = set()
+    for r in records.values():
+        overridden.update((r.get("study_overrides") or {}).keys())
+    excluded = overridden | _PATH_FIELDS | _RUNTIME_ONLY_FIELDS
+    configs = {
+        label: r["resolved_config"] for label, r in records.items()
+        if isinstance(r.get("resolved_config"), dict)
+    }
+    keys = sorted(set().union(*[set(c) for c in configs.values()])) if configs else []
+    for key in keys:
+        if key in excluded:
+            continue
+        values = {label: c.get(key) for label, c in configs.items()}
+        if len({json.dumps(v, sort_keys=True, default=str) for v in values.values()}) > 1:
+            problems.append(f"resolved_config.{key} differs: {values}")
+    return problems
+
+
+def assess_study(config: Config, model_name: str, study: str) -> StudyAssessment:
+    """Classify every expected arm of `study` from the arm files on disk (D17).
+
+    No file -> missing; a record produced by other code (`code_revision.source_hash`
+    differs from this process's) -> stale; `status == "failed"` -> failed; else ok. Ok and
+    failed records must agree on backend/device and on every non-overridden config field.
+    """
+    labels = [cfg._study_label for cfg in resolve_study_configs(study, config)]
+    current_hash = _current_revision().get("source_hash")
+    assessment = StudyAssessment(study=study, labels=labels)
+    for label in labels:
+        path = _arm_path(config, study, model_name, label)
+        if not os.path.exists(path):
+            assessment.missing.append(label)
+            continue
+        try:
+            with open(path) as f:
+                record = json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("Unreadable arm file %s (%s) -- counted as missing", path, exc)
+            assessment.missing.append(label)
+            continue
+        if (record.get("code_revision") or {}).get("source_hash") != current_hash:
+            assessment.stale.append(label)
+        elif record.get("status") == "failed":
+            assessment.failed[label] = record
+        elif record.get("status") == "ok":
+            assessment.ok[label] = record
+        else:
+            assessment.missing.append(label)
+    assessment.inconsistent = _consistency_problems(
+        study, {**assessment.ok, **assessment.failed},
+    )
+    return assessment
+
+
+def collect_study(
+    config: Config, model_name: str, study: str, allow_incomplete: bool = False,
+) -> StudyAssessment:
+    """Assemble a study's JSON and plots from its persisted arm files (D17).
+
+    Under the study lock, so it sees every arm file persisted before the lock was granted.
+    Inconsistent studies are never written; incomplete ones only with `allow_incomplete`
+    (missing/stale arms become `{"status": "missing"}` placeholders, failed ones keep
+    their record; plots use the ok arms).
+    """
+    with _study_lock(config, study, model_name):
+        assessment = assess_study(config, model_name, study)
+        if assessment.inconsistent:
+            logger.error(
+                "%s -- refusing to assemble an inconsistent study", assessment.describe(),
+            )
+            return assessment
+        if not assessment.complete and not allow_incomplete:
+            return assessment
+        results = []
+        for label in assessment.labels:
+            if label in assessment.ok:
+                record = dict(assessment.ok[label])
+            elif label in assessment.failed:
+                record = dict(assessment.failed[label])
+            else:
+                record = {"label": label, "study": study, "status": "missing"}
+            record.pop("reused_from_previous_run", None)
+            results.append(record)
+        _write_study_outputs_unlocked(config, model_name, study, results)
+        assessment.written = True
+        if not assessment.complete:
+            logger.warning("Assembled an INCOMPLETE %s (--allow_incomplete)", assessment.describe())
+        return assessment
+
+
+def write_study_outputs(
+    config: Config, model_name: str, study: str, results: List[Dict],
+) -> None:
+    """The ONE writer of a study's JSON and plots, under the per-study lock (FR-15, D16).
+
+    Every path that produces study-level outputs goes through here, so concurrent writers
+    are serialised and the (atomic) JSON is never torn or interleaved.
+    """
+    with _study_lock(config, study, model_name):
+        _write_study_outputs_unlocked(config, model_name, study, results)
 
 
 def run_ablation(
@@ -735,7 +1014,18 @@ def run_ablation(
     model_name: str,
     study: str = "all",
     train: bool = True,
+    arms: Optional[List[str]] = None,
 ) -> Dict:
+    # specs/ablation-run FR-14 / D15: an `--arms` selection is validated first -- before
+    # `check_processed_dir`, any data load or any training.
+    if arms is not None:
+        arms = parse_arms(arms)
+        if study not in STUDY_CONFIGS:
+            if study == "all":
+                select_study_configs(study, config, arms)  # raises the one-study error
+            raise ValueError(f"Unknown study '{study}'. Choose from {list(STUDY_CONFIGS.keys())}")
+        selected = select_study_configs(study, config, arms)
+
     # specs/ablation-run FR-7 / AC-20: refuse a mismatched user sample before any arm.
     from data.preprocessing import check_processed_dir
     check_processed_dir(config)
@@ -745,7 +1035,7 @@ def run_ablation(
 
     for s in studies:
         logger.info(f"Running ablation study {s}")
-        configs = resolve_study_configs(s, config)
+        configs = selected if arms is not None else resolve_study_configs(s, config)
         study_results = []
 
         for cfg in configs:
@@ -765,11 +1055,17 @@ def run_ablation(
                     )
                     study_results.append(persisted)
                     continue
+            # FR-15: the code that produced the record, for staleness checks at collection.
+            code_revision = _current_revision()
+            resolved_before = asdict(cfg)
             try:
+                # FR-17: arm-scoped side outputs only under --arms (paths unchanged otherwise).
+                extra = {"scoped_outputs": True} if arms is not None else {}
                 result = _run_single_config(
-                    cfg, model_name, s, config, train,
+                    cfg, model_name, s, config, train, **extra,
                 )
                 result["arm_key"] = arm_key
+                result["code_revision"] = code_revision
                 if result.get("status") == "ok":
                     _write_json_atomic(arm_path, result)
             except Exception as exc:  # one arm failing must not lose the others
@@ -784,21 +1080,38 @@ def run_ablation(
                     "status": "failed",
                     "error": f"{type(exc).__name__}: {exc}",
                     "config_diff": _config_diff(cfg, config),
-                    "resolved_config": asdict(cfg),
+                    "study_overrides": dict(getattr(cfg, "_study_overrides", {})),
+                    "resolved_config": resolved_before,
+                    "arm_key": arm_key,
+                    "code_revision": code_revision,
                 }
+                # FR-15: failed arms are persisted too (so a collector can name them); reuse
+                # still requires status "ok", so they are retried on a re-run. A failed write
+                # (e.g. disk full) must not skip the remaining arms (REV-013).
+                try:
+                    _write_json_atomic(arm_path, result)
+                except OSError as write_exc:
+                    logger.error("  Could not persist failed arm %s: %s", label, write_exc)
             study_results.append(result)
 
         all_results[s] = study_results
-        _save_study_results(config, model_name, s, study_results)
-        _plot_study(config, model_name, s, study_results)
-        # REV-065: four requirements name specific figures that the generic grouped bar
-        # chart does not produce. They are dispatched alongside it, not instead of it.
-        plot_named = _STUDY_PLOTS.get(s)
-        if plot_named is not None:
+        if arms is None:
+            write_study_outputs(config, model_name, s, study_results)
+        else:
+            # FR-15 auto-collect: this process persisted its arms BEFORE asking for the
+            # study lock, so whichever process persists the last missing arm sees a
+            # complete study and writes the study outputs. Never fails the run.
             try:
-                plot_named(config, model_name, study_results)
-            except Exception as exc:  # a figure failing must not lose the results
-                logger.exception("Study %s: named figure failed: %s", s, exc)
+                assessment = collect_study(config, model_name, s)
+                if assessment.written:
+                    logger.info("Study %s complete -- study JSON and plots written", s)
+                else:
+                    logger.info(
+                        "%s -- study JSON and plots deferred to the process that completes "
+                        "the study or to --stage ablation_collect", assessment.describe(),
+                    )
+            except Exception as exc:  # noqa: BLE001 - the arms themselves succeeded
+                logger.error("Study %s: auto-collect failed: %s", s, exc)
 
     if study == "all":
         _save_summary(config, model_name, all_results)
@@ -1070,7 +1383,9 @@ def _save_study_results(config: Config, model_name: str, study: str, results: Li
     _write_json_atomic(path, results)
 
 
-def _save_summary(config: Config, model_name: str, all_results: Dict) -> None:
+def _save_summary(
+    config: Config, model_name: str, all_results: Dict, incomplete: Optional[Dict] = None,
+) -> None:
     os.makedirs(_results_root(config), exist_ok=True)
     mn = model_name.replace("-", "_")
     summary = {}
@@ -1087,6 +1402,10 @@ def _save_summary(config: Config, model_name: str, all_results: Dict) -> None:
                 default=(None, None),
             )[1],
         }
+    # specs/ablation-run FR-15: `ablation_collect --study all` marks studies it could not
+    # assemble instead of silently leaving them out.
+    for study, entry in (incomplete or {}).items():
+        summary[study] = {"complete": False, **entry}
     path = os.path.join(_results_root(config), f"summary_{mn}.json")
     with open(path, "w") as f:
         json.dump(summary, f, indent=2)
