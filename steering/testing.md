@@ -46,7 +46,9 @@ gate on `scripts/verify_attention_backend.py --backend sdpa`.
 - Loss functions produce expected gradients on toy inputs
 - LoRA state dict keys match `lora_`/`.A`/`.B` pattern only
 - GradNorm lambda renormalization preserves sum constraint
-- NDCG/MRR/Recall/Precision on known ranking inputs
+- NDCG/MRR/Recall/Precision on known ranking inputs, **including deliberately tied scores**: ties must never favour the target (`specs/eval-integrity` FR-2)
+- Scores returned by evaluation are fp32 under mixed precision
+- Under mixed precision, a forward after `optimizer.step()` or `load_state_dict()` reflects the new weights. This is a regression guard for the stale autocast cache, checked inside the real `train_one_step`.
 
 **Integration tests:** Components interoperate correctly:
 - Preprocessing → sequence generation → tensorisation pipeline produces valid datasets
@@ -101,6 +103,7 @@ These assertions must be active during all training/evaluation:
 - LoRA state dict: no keys starting with `moe.router`, `moe.experts`, `moe.objective_embeddings`, `moe.gates`
 - Federated: global frozen-state checksum unchanged through every round
 - All losses, lambdas, and gradients are finite
+- Evaluation scores are fp32 (`score_candidates_batch` asserts it); ranking metrics reject NaN scores
 
 ## Seed and Reproducibility
 

@@ -18,6 +18,7 @@ import torch
 
 from configs.config import Config
 from models.transformer import l2_normalize
+from utils import autocast_context, autocast_disabled
 
 logger = logging.getLogger(__name__)
 
@@ -29,15 +30,22 @@ def _user_embeddings(
     moe_layer: Optional[torch.nn.Module] = None,
     metadata: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """The `(B, D)` query embedding, built exactly as the scoring path builds it."""
-    all_hidden = model(seqs, metadata=metadata, return_all_hidden=True)
-    pooled = all_hidden[:, -1, :]
-    if moe_layer is not None and moe_layer.variant != "none":
-        Z_ut, _ = moe_layer(all_hidden, pooled, 0)
-        user_emb = Z_ut[:, -1, :]
-    else:
-        user_emb = pooled
-    return l2_normalize(user_emb) if config.normalize_embeddings else user_emb
+    """The UN-normalised `(B, D)` query embedding, built as the scoring path builds it.
+
+    specs/eval-integrity FR-1.3 / FR-3.2: the forward and MoE run in their own autocast
+    region (bf16 under mixed precision); normalisation and scoring happen in fp32 in
+    `retrieve_candidates`, outside autocast.
+    """
+    device_type = next(model.parameters()).device.type
+    with autocast_context(config, device_type=device_type):
+        all_hidden = model(seqs, metadata=metadata, return_all_hidden=True)
+        pooled = all_hidden[:, -1, :]
+        if moe_layer is not None and moe_layer.variant != "none":
+            Z_ut, _ = moe_layer(all_hidden, pooled, 0)
+            user_emb = Z_ut[:, -1, :]
+        else:
+            user_emb = pooled
+    return user_emb
 
 
 def retrieve_candidates(
@@ -99,9 +107,12 @@ def retrieve_candidates(
     num_forced = 0
 
     with torch.no_grad():
-        item_embs = item_weight
-        if config.normalize_embeddings:
-            item_embs = l2_normalize(item_embs)
+        # eval-integrity FR-1.3: upcast BEFORE normalising (`l2_normalize` returns its
+        # input dtype), once for the whole table, with autocast off.
+        with autocast_disabled(param_device.type):
+            item_embs = item_weight.float()
+            if config.normalize_embeddings:
+                item_embs = l2_normalize(item_embs)
 
         for start in range(0, n, bs):
             stop = min(start + bs, n)
@@ -114,7 +125,12 @@ def retrieve_candidates(
                 )
 
             user_emb = _user_embeddings(model, seqs, config, moe_layer, meta)
-            scores = user_emb.float() @ item_embs.float().T  # (B, vocab)
+            with autocast_disabled(param_device.type):
+                user_emb = user_emb.float()
+                if config.normalize_embeddings:
+                    user_emb = l2_normalize(user_emb)
+                scores = user_emb @ item_embs.T  # (B, vocab), fp32
+            assert scores.dtype == torch.float32, f"ANN scores must be float32, got {scores.dtype}"
             scores = scores.masked_fill(invalid_ids.unsqueeze(0), float("-inf"))
 
             # Filter items the user has already interacted with. The target is exempt --

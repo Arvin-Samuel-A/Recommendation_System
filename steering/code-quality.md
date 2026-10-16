@@ -7,6 +7,26 @@
 - Experiment runs (ablations, final runs) use `--dtype bf16 --mixed_precision` — owner decision 2026-10-15; see `architecture.md`. The default is not changed to get there.
 - Never silently change dtype if a numerical issue occurs — fail explicitly.
 
+### Autocast scoping
+
+These rules come from `specs/eval-integrity` FR-3, owner-directed on 2026-10-16.
+
+- **One region per forward.** Each function that runs a model forward opens its own
+  `utils.autocast_context(config, device_type=<the model's parameter device type>)` around that
+  forward and its loss computation, and nothing else.
+  - Backward, GradNorm updates, gradient clipping and `optimizer.step()` run **outside** autocast.
+  - There is never a stage-wide or loop-wide region.
+- **The weight cache stays off.** `autocast_context` uses `cache_enabled=False`, and code never
+  uses a raw `torch.autocast` with the cache enabled around more than one forward.
+  - Why: autocast caches the bf16 cast of every fp32 leaf parameter with `requires_grad` and clears
+    the cache only when the outermost region exits. `optimizer.step()` and `load_state_dict()`
+    update parameters in place, so a cached cast goes stale.
+  - What happened: under the former stage-wide region in `main.py`, every `nn.Linear` forwarded
+    its first-step weights for a whole run (measured: forward change 0.0 after three AdamW steps).
+- **Autocast is a compute-dtype choice, never a scoring choice.** Ranking scores (L2
+  normalisation and dot products) are computed in fp32 outside autocast. See "Evaluation
+  Integrity".
+
 ## Device Handling
 
 - Always use `get_device(config)` → `torch.device`. Never call `.cuda()` or `.to("cuda")` directly.
@@ -75,6 +95,28 @@ accounts of which objective trained a single checkpoint, none matched the files,
 could not be settled from the repository at all — the checkpoint stores `config`, which the change
 in question did not touch. Provenance belongs in the artifact, not in prose about the artifact.
 
+## Evaluation Integrity
+
+These rules come from `specs/eval-integrity`, 2026-10-16. They apply to every path that reports a
+ranking metric.
+
+- **fp32 scores.** The forward may run in bf16, but scores are fp32. All candidate scoring goes
+  through `evaluation/metrics.py::score_candidates_batch`, and any other scoring site
+  (`models/ann_retrieval.py`) follows the same rule. A guard test lists the allowed scoring
+  sites.
+  - Measured: bf16 cosines tied the target in 41–52% of examples and inflated NDCG@10 by up to
+    0.08, by different amounts per arm.
+- **Ties never favour the target.** Metrics are the expectation under random tie-breaking (the
+  tie-averaged form in `compute_metrics_batch`).
+- **A popularity floor beside every reported ranking result.** Every ranking result file and every
+  ablation study carries a popularity-only reference: training-interaction counts, scored on the
+  same rows and candidates. A gain is read against that floor, not against zero.
+- **Comparisons use the full split.** Arms are compared on the full test split. A sample is
+  allowed only when explicitly requested, and it must be seeded and recorded (method, size, seed,
+  index hash) in the result file. Never score a prefix of a user-sorted split.
+- **Self-describing results.** Result files carry an `eval_protocol` stamp. A number from an
+  unstamped (pre-2026-10-16) file is not comparable with a stamped one.
+
 ## Configuration as Single Source of Truth
 
 - `configs/config.py` (`Config` dataclass) holds all hyperparameters.
@@ -90,6 +132,7 @@ in question did not touch. Provenance belongs in the artifact, not in prose abou
 ## Training Hot Path and Reproducibility
 
 - Throughput changes must leave training semantics **bit-for-bit identical** (owner decision 2026-10-15): same batches, same RNG draws, same arithmetic. A change that alters an RNG stream (e.g. moving negative sampling to a device generator) or a kernel choice is a semantic change, not an optimisation.
+- A **correctness fix** that changes what training produces for an unchanged config (for example `specs/eval-integrity` FR-3, the autocast scoping) is not a throughput change. It must bump `TRAINING_SEMANTICS_VERSION` in the training fingerprint, so backbones trained before the fix are never reused. The pure-dtype golden test must still pass with its constants untouched.
 - Batch size is a training hyperparameter, not a utilisation knob: it sets InfoNCE's in-batch negatives, the number of optimizer and GradNorm steps, and the LR schedule. Do not change it for throughput.
 - No per-step `.item()` / `.cpu()` / Python `bool()` of a device tensor in the training loop beyond the batched finite checks and syncs that are inherent to the computation (data-dependent shapes, the Python-side augmentation). Per-step loss values stay on the device and are materialised once per epoch.
 - DataLoader workers must yield the same batch sequence as `num_workers=0` (tested). `persistent_workers` stays `False` for training: a persistent iterator does not redraw its base seed between epochs, which changes the loader generator's consumption and so the data order.
@@ -118,6 +161,8 @@ in question did not touch. Provenance belongs in the artifact, not in prose abou
 - No `num_items` as mask token (that collides with the last real item ID)
 - No test data for model selection, threshold tuning, or diagnostic decisions
 - No silent dtype/backend substitution
+- No autocast region spanning more than one forward; no scoring under autocast or in bf16
+- No evaluation on a prefix of a user-sorted split; no ranking metric that resolves ties in the target's favour
 - No worker initialization when `num_workers=0`
 - No per-epoch negative pool regeneration
 - No cross-model state sharing between independently trained models

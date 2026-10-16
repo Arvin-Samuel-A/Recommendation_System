@@ -28,6 +28,8 @@ VALID_STAGES = [
     "ablation", "plots", "all",
     # specs/ablation-run FR-15: assemble study JSON + plots from persisted arm files.
     "ablation_collect",
+    # specs/eval-integrity FR-8: re-evaluate a finished run's checkpoints, no training.
+    "ablation_rescore",
 ]
 
 VALID_MODELS = ["t-small", "t-base", "t-large"]
@@ -135,7 +137,7 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         "--allow_incomplete", action="store_true", default=False,
-        help="ablation_collect only: assemble a study even if arms are missing/failed/stale "
+        help="ablation_collect / ablation_rescore: assemble a study even if arms are missing/failed/stale "
              "(placeholders in the JSON; plots of the ok arms). Never for an inconsistent study.",
     )
     return parser.parse_args(argv)
@@ -458,6 +460,18 @@ def run_evaluate_stage(config, args):
             "num_force_included": ann_report["num_force_included"],
             "num_examples": ann_report["num_examples"],
         }
+    # specs/eval-integrity FR-7.2 / FR-1.5: the popularity-only floor on the candidates
+    # actually scored (the ANN candidates when ANN is on), and the protocol stamp.
+    from evaluation.metrics import EVAL_PROTOCOL, evaluate_popularity, item_popularity
+    from training.pretrain import POPULARITY_EVAL_BATCH
+
+    with open(os.path.join(processed, "train_user_history.pkl"), "rb") as f:
+        train_user_history = pickle.load(f)
+    payload["popularity_reference"] = evaluate_popularity(
+        candidate_tensors, item_popularity(train_user_history, config.vocab_size),
+        k=config.eval_k, batch_size=POPULARITY_EVAL_BATCH,
+    )
+    payload["eval_protocol"] = dict(EVAL_PROTOCOL)
     payload["source_revision"] = source_revision
     with open(os.path.join(config.log_dir, f"test_metrics_{args.model.replace('-', '_')}.json"), "w") as f:
         json.dump(payload, f, indent=2)
@@ -775,6 +789,28 @@ def run_ablation_collect_stage(config, args):
         raise SystemExit(1)
 
 
+def run_ablation_rescore_stage(config, args):
+    """`--stage ablation_rescore` (specs/eval-integrity FR-8): rescore a finished run's
+    saved epoch checkpoints with the current evaluation protocol. Trains nothing and
+    modifies no original. Exits 1 if any selected study could not be assembled."""
+    from training.ablation_rescore import run_ablation_rescore
+
+    report = run_ablation_rescore(
+        config, args.model, args.study,
+        allow_incomplete=getattr(args, "allow_incomplete", False),
+    )
+    for study, info in report["studies"].items():
+        logger.info(
+            "Rescore %s: rescored %s, already current %s, skipped %s, failed %s -- %s",
+            study, info["rescored"], info["current"], sorted(info["skipped"]),
+            sorted(info["failed"]), info["assessment"],
+        )
+    if report["not_written"]:
+        logger.error("ablation_rescore: studies not assembled: %s", report["not_written"])
+        raise SystemExit(1)
+    return report
+
+
 def run_plots_stage(config, args):
     import matplotlib
     matplotlib.use("Agg")
@@ -1032,11 +1068,23 @@ def run_multi_seed_stage(config, args):
             "per_seed": {str(s): float(v) for s, v in zip(seeds, vals)},
         }
 
+    # specs/eval-integrity G6 / FR-1.5 (review REV-001): the headline file carries the
+    # protocol stamp and the popularity floor. The test candidates are fixed, so every
+    # seed's floor is the same; take it from the first seed that reports one.
+    from evaluation.metrics import EVAL_PROTOCOL
+
+    popularity_reference = next(
+        (per_seed[s]["popularity_reference"] for s in seeds
+         if isinstance(per_seed.get(s, {}).get("popularity_reference"), dict)),
+        None,
+    )
     out = {
         "model": args.model,
         "seeds": seeds,
         "num_seeds": len(seeds),
         "aggregated": aggregated,
+        "popularity_reference": popularity_reference,
+        "eval_protocol": dict(EVAL_PROTOCOL),
         "note": (
             "std is computed ACROSS independent seed runs (ddof=1), not from repeated "
             "evaluation of a single seed."
@@ -1101,6 +1149,7 @@ STAGE_MAP = {
     "multi_seed": run_multi_seed_stage,
     "ablation": run_ablation_stage,
     "ablation_collect": run_ablation_collect_stage,
+    "ablation_rescore": run_ablation_rescore_stage,
     "plots": run_plots_stage,
     "all": run_all_pipeline,
 }
@@ -1159,12 +1208,12 @@ def main(argv=None):
         "arms": getattr(args, "arms", None),
     }
     save_config_snapshot(config)
-    # Every stage's forward passes (training, evaluation, LoRA, federated, ablations) run
-    # under one autocast region; it is a no-op unless mixed_precision is on.
-    from utils import OOM_EXIT_CODE, autocast_context, is_oom_error
+    # specs/eval-integrity FR-3.1: no stage-wide autocast region. Each forward site opens
+    # its own (utils.autocast_context, cache off); a region spanning a whole stage froze
+    # every nn.Linear at its first-step bf16 cast under mixed precision.
+    from utils import OOM_EXIT_CODE, is_oom_error
     try:
-        with autocast_context(config):
-            STAGE_MAP[args.stage](config, args)
+        STAGE_MAP[args.stage](config, args)
     except Exception as exc:
         # specs/ablation-run FR-9: an out-of-memory error (often another user's job on a
         # shared GPU) exits with a status the retry launcher understands; completed work

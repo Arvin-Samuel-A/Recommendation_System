@@ -1001,18 +1001,33 @@ class TestMixedPrecision:
             assert p.dtype == torch.float32
         assert not torch.equal(before, model.item_emb_weight.detach()), "no update was applied"
 
-    def test_step_refuses_to_run_without_autocast(self):
+    def test_step_runs_its_own_autocast_region(self):
+        """specs/eval-integrity FR-3.4: with no caller region the step opens its own, so
+        the encoder computes in bf16 and the losses come out fp32 (this replaces the
+        former `test_step_refuses_to_run_without_autocast`)."""
         from torch.optim.lr_scheduler import LambdaLR
 
         from training.pretrain import train_one_step
 
-        config, model, moe, loss_fns, optimizer, _, rng = self._setup("fp16")
+        config, model, moe, loss_fns, optimizer, _, rng = self._setup("bf16")
         scheduler = LambdaLR(optimizer, lr_lambda=lambda step: 1.0)
-        with pytest.raises(AssertionError, match="autocast is not active"):
-            train_one_step(
+        seen = []
+        handle = model.blocks[0].attn.q_proj.register_forward_hook(
+            lambda m, a, out: seen.append(out.dtype)
+        )
+        try:
+            assert not torch.is_autocast_enabled("cpu")
+            loss_values, _ = train_one_step(
                 model, moe, TestMoECacheLifetime._batch(config), config, loss_fns,
                 None, optimizer, scheduler, 0, rng,
             )
+        finally:
+            handle.remove()
+        assert seen and all(dt == torch.bfloat16 for dt in seen)
+        for name, value in loss_values.items():
+            if not name.startswith("_"):
+                assert value.dtype == torch.float32, name
+        assert not torch.is_autocast_enabled("cpu")
 
 
 class TestBatchedFiniteChecks:

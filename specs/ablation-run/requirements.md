@@ -297,7 +297,8 @@ At HEAD the ablation cannot be run as the owner requested:
   code path resumed a run; FR-8 delivers it.
 - `ablation_eval_examples = 5000` scores the first 5000 test examples, which are ordered by user id
   (~650 users at 10%). Combined with one seed, small NDCG differences between arms are not reliable
-  (the handoff's caveat).
+  (the handoff's caveat). **Addressed by `specs/eval-integrity` FR-6** (full test split by default),
+  2026-10-16.
 
 ## Acceptance Criteria
 

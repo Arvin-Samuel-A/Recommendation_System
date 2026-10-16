@@ -41,10 +41,12 @@ from data.sequence_generator import (
 )
 from evaluation.routing_diagnostics import save_routing_diagnostics
 from evaluation.gradient_diagnostics import run_gradient_diagnostics
-from evaluation.metrics import evaluate_model
+from evaluation.metrics import (
+    EVAL_PROTOCOL, evaluate_model, evaluate_popularity, item_popularity,
+)
 from utils import (
     get_device, resolve_dtype, resolve_param_dtype, make_grad_scaler, get_source_revision,
-    atomic_torch_save,
+    atomic_torch_save, autocast_context,
 )
 
 logger = logging.getLogger(__name__)
@@ -182,13 +184,6 @@ def train_one_step(
 ) -> Tuple[Dict[str, float], Optional[Dict[str, torch.Tensor]]]:
     device = get_device(config)
     mask_id = config.num_items + 1
-    # Mixed precision keeps fp32 master weights; without an active autocast the step
-    # would silently run in fp32 instead of the configured compute dtype.
-    if config.mixed_precision:
-        assert torch.is_autocast_enabled(device.type), (
-            "mixed_precision=True but autocast is not active; wrap the call in "
-            "utils.autocast_context(config)"
-        )
     use_scaler = scaler is not None and scaler.is_enabled()
 
     seq = batch["sequences"]
@@ -213,98 +208,109 @@ def train_one_step(
         mask_positions = None
         true_ids = None
 
-    all_hidden = model(masked_seq, metadata=metadata, return_all_hidden=True)
-    pooled = all_hidden[:, -1, :]
+    # specs/eval-integrity FR-3.2 / FR-3.4: this step owns its autocast region (bf16
+    # under mixed precision), from the first forward through `L_total` -- both forwards,
+    # every MoE call and every loss. Backward, GradNorm, clipping and the optimizer step
+    # run OUTSIDE it. `autocast_context` has the weight cache off, so the forward always
+    # sees the current weights, even when a caller has its own region open.
+    with autocast_context(config, device_type=next(model.parameters()).device.type):
+        all_hidden = model(masked_seq, metadata=metadata, return_all_hidden=True)
+        pooled = all_hidden[:, -1, :]
 
-    moe.clear_cache()
-    active_losses = {}
-    routing_snapshots = {}
+        moe.clear_cache()
+        active_losses = {}
+        routing_snapshots = {}
 
-    Z_next, r_next = moe(all_hidden, pooled, 0)
-    user_emb = Z_next[:, -1, :]
-    active_losses["next_item"] = loss_fns["next_item"](user_emb, targets, neg_ids, model.item_emb_weight)
-    if r_next is not None:
-        routing_snapshots["next_item"] = r_next.detach()
+        Z_next, r_next = moe(all_hidden, pooled, 0)
+        user_emb = Z_next[:, -1, :]
+        active_losses["next_item"] = loss_fns["next_item"](user_emb, targets, neg_ids, model.item_emb_weight)
+        if r_next is not None:
+            routing_snapshots["next_item"] = r_next.detach()
 
-    # REV-048: the spec's Edge Cases require an objective with no valid positions /
-    # targets in this batch to be EXCLUDED from the GradNorm active set. Its loss is a
-    # detached 0.0, and passing that to torch.autograd.grad raises "The differentiated
-    # Tensor ... appears to not have been used in the graph", aborting a long run
-    # mid-training. `has_valid_signal` is the exclusion test.
-    skipped_objectives = []
+        # REV-048: the spec's Edge Cases require an objective with no valid positions /
+        # targets in this batch to be EXCLUDED from the GradNorm active set. Its loss is a
+        # detached 0.0, and passing that to torch.autograd.grad raises "The differentiated
+        # Tensor ... appears to not have been used in the graph", aborting a long run
+        # mid-training. `has_valid_signal` is the exclusion test.
+        skipped_objectives = []
 
-    # REV-077: both full-vocabulary objectives need the SAME normalized item table, and
-    # `l2_normalize` builds a 26 MB fp32 intermediate at t-base dimensions. Compute it
-    # once per step and share it, rather than once inside each objective.
-    normalized_item_emb = normalize_item_table(
-        model.item_emb_weight, config.normalize_embeddings,
-    )
-
-    if config.use_masked_lm and mask_positions is not None:
-        Z_mim, r_mim = moe(all_hidden, pooled, 1)
-        mim_loss = loss_fns["masked_item"](
-            Z_mim, mask_positions, true_ids, model.item_emb_weight,
-            normalized_item_emb=normalized_item_emb,
+        # REV-077: both full-vocabulary objectives need the SAME normalized item table, and
+        # `l2_normalize` builds a 26 MB fp32 intermediate at t-base dimensions. Compute it
+        # once per step and share it, rather than once inside each objective.
+        normalized_item_emb = normalize_item_table(
+            model.item_emb_weight, config.normalize_embeddings,
         )
-        if has_valid_signal(mim_loss):
-            active_losses["masked_item"] = mim_loss
-            if r_mim is not None:
-                routing_snapshots["masked_item"] = r_mim.detach()
+
+        if config.use_masked_lm and mask_positions is not None:
+            Z_mim, r_mim = moe(all_hidden, pooled, 1)
+            mim_loss = loss_fns["masked_item"](
+                Z_mim, mask_positions, true_ids, model.item_emb_weight,
+                normalized_item_emb=normalized_item_emb,
+            )
+            if has_valid_signal(mim_loss):
+                active_losses["masked_item"] = mim_loss
+                if r_mim is not None:
+                    routing_snapshots["masked_item"] = r_mim.detach()
+            else:
+                skipped_objectives.append("masked_item")
+
+        if config.use_multi_step and targets_k is not None:
+            Z_ms, r_ms = moe(all_hidden, pooled, 2)
+            ms_loss = loss_fns["multi_step"](
+                Z_ms, targets_k, model.item_emb_weight,
+                normalized_item_emb=normalized_item_emb,
+            )
+            if has_valid_signal(ms_loss):
+                active_losses["multi_step"] = ms_loss
+                if r_ms is not None:
+                    routing_snapshots["multi_step"] = r_ms.detach()
+            else:
+                skipped_objectives.append("multi_step")
+
+        is_contrastive_batch = config.use_contrastive and (batch_idx % config.contrastive_interval == 0)
+        if is_contrastive_batch:
+            Z_cl, r_cl = moe(all_hidden, pooled, 3)
+            z_orig = torch.nn.functional.normalize(Z_cl[:, -1, :].float(), p=2, dim=-1)
+
+            B, S = seq.shape
+            aug_seqs = []
+            # One device->host copy for the batch, not one sync per row.
+            seq_rows = seq.cpu().tolist()
+            for i in range(B):
+                real = [item for item in seq_rows[i] if item != 0]
+                if len(real) == 0:
+                    real = [1]
+                aug = augment_sequence(real, mask_id, rng, config.crop_ratio, config.mask_ratio)
+                padded = [0] * (S - len(aug)) + aug
+                padded = padded[-S:]
+                aug_seqs.append(padded)
+            aug_seq_t = torch.tensor(aug_seqs, dtype=torch.long, device=device)
+
+            # REV-038: the primary view is forwarded with metadata; without this the two
+            # InfoNCE views differed by metadata presence as well as by the augmentation,
+            # so the objective partly learned to bridge a metadata-present/absent gap.
+            aug_meta = None
+            if metadata is not None and metadata_matrix is not None:
+                # The full (vocab, F) metadata matrix stays on CPU; index there and move
+                # only the gathered (B, S, F) block to the accelerator.
+                # REV-072: the matrix now covers MASK_ID with an all-zero row, so the clamp
+                # that used to give augmented mask tokens the LAST REAL ITEM's genome vector
+                # is gone -- a masked position contributes nothing, as it should.
+                aug_meta = metadata_matrix[aug_seq_t.to(metadata_matrix.device)].to(device=device)
+
+            aug_hidden = model(aug_seq_t, metadata=aug_meta, return_all_hidden=True)
+            aug_pooled = aug_hidden[:, -1, :]
+            Z_aug, _ = moe(aug_hidden, aug_pooled, 3)
+            z_aug = torch.nn.functional.normalize(Z_aug[:, -1, :].float(), p=2, dim=-1)
+
+            active_losses["contrastive"] = loss_fns["contrastive"](z_orig, z_aug)
+            if r_cl is not None:
+                routing_snapshots["contrastive"] = r_cl.detach()
+
+        if gradnorm is not None:
+            L_total = gradnorm.weighted_sum(active_losses)
         else:
-            skipped_objectives.append("masked_item")
-
-    if config.use_multi_step and targets_k is not None:
-        Z_ms, r_ms = moe(all_hidden, pooled, 2)
-        ms_loss = loss_fns["multi_step"](
-            Z_ms, targets_k, model.item_emb_weight,
-            normalized_item_emb=normalized_item_emb,
-        )
-        if has_valid_signal(ms_loss):
-            active_losses["multi_step"] = ms_loss
-            if r_ms is not None:
-                routing_snapshots["multi_step"] = r_ms.detach()
-        else:
-            skipped_objectives.append("multi_step")
-
-    is_contrastive_batch = config.use_contrastive and (batch_idx % config.contrastive_interval == 0)
-    if is_contrastive_batch:
-        Z_cl, r_cl = moe(all_hidden, pooled, 3)
-        z_orig = torch.nn.functional.normalize(Z_cl[:, -1, :].float(), p=2, dim=-1)
-
-        B, S = seq.shape
-        aug_seqs = []
-        # One device->host copy for the batch, not one sync per row.
-        seq_rows = seq.cpu().tolist()
-        for i in range(B):
-            real = [item for item in seq_rows[i] if item != 0]
-            if len(real) == 0:
-                real = [1]
-            aug = augment_sequence(real, mask_id, rng, config.crop_ratio, config.mask_ratio)
-            padded = [0] * (S - len(aug)) + aug
-            padded = padded[-S:]
-            aug_seqs.append(padded)
-        aug_seq_t = torch.tensor(aug_seqs, dtype=torch.long, device=device)
-
-        # REV-038: the primary view is forwarded with metadata; without this the two
-        # InfoNCE views differed by metadata presence as well as by the augmentation,
-        # so the objective partly learned to bridge a metadata-present/absent gap.
-        aug_meta = None
-        if metadata is not None and metadata_matrix is not None:
-            # The full (vocab, F) metadata matrix stays on CPU; index there and move
-            # only the gathered (B, S, F) block to the accelerator.
-            # REV-072: the matrix now covers MASK_ID with an all-zero row, so the clamp
-            # that used to give augmented mask tokens the LAST REAL ITEM's genome vector
-            # is gone -- a masked position contributes nothing, as it should.
-            aug_meta = metadata_matrix[aug_seq_t.to(metadata_matrix.device)].to(device=device)
-
-        aug_hidden = model(aug_seq_t, metadata=aug_meta, return_all_hidden=True)
-        aug_pooled = aug_hidden[:, -1, :]
-        Z_aug, _ = moe(aug_hidden, aug_pooled, 3)
-        z_aug = torch.nn.functional.normalize(Z_aug[:, -1, :].float(), p=2, dim=-1)
-
-        active_losses["contrastive"] = loss_fns["contrastive"](z_orig, z_aug)
-        if r_cl is not None:
-            routing_snapshots["contrastive"] = r_cl.detach()
+            L_total = static_weighted_sum(active_losses, config)
 
     # REV-022b: T5.2 requires dtype assertions on outputs as well as parameters.
     # Under mixed precision autocast picks per-op dtypes (layer norm and the losses run
@@ -324,11 +330,6 @@ def train_one_step(
         assert loss.dtype == expected, (
             f"Loss '{name}' dtype {loss.dtype}, expected {expected}"
         )
-
-    if gradnorm is not None:
-        L_total = gradnorm.weighted_sum(active_losses)
-    else:
-        L_total = static_weighted_sum(active_losses, config)
 
     # Check A (specs/ablation-run D4): every active loss and the total, finite, in ONE
     # stacked check (one host sync instead of one per loss), still before backward. Only
@@ -464,6 +465,30 @@ def setup_epoch_logger(
     fh.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
     epoch_logger.addHandler(fh)
     return epoch_logger
+
+
+#: Rows per batch for the popularity-only reference (a gather plus metrics, no model).
+POPULARITY_EVAL_BATCH = 65536
+
+
+def log_popularity_header(
+    epoch_logger: logging.Logger,
+    reference: Dict[str, Dict[str, float]],
+    k: int,
+    num_rows: int,
+) -> None:
+    """The validation popularity floor (eval-integrity FR-5.3), once per run.
+
+    Deliberately free of `epoch=`: `_truncate_epoch_log` drops only per-epoch lines, and
+    readers pick epoch lines by that token.
+    """
+    parts = ["val_popularity_reference"]
+    for metric_name in ["ndcg", "mrr", "recall", "precision"]:
+        val = reference.get(metric_name, {}).get("mean", 0.0)
+        parts.append(f"popularity_{metric_name}@{k}={val:.6f}")
+    parts.append(f"rows={num_rows}")
+    parts.append(f"eval_protocol_version={EVAL_PROTOCOL['version']}")
+    epoch_logger.info(" | ".join(parts))
 
 
 def log_epoch(
@@ -634,23 +659,26 @@ def collect_validation_routing(
             metadata = batch.get("metadata")
             if isinstance(metadata, torch.Tensor):
                 metadata = metadata.to(device)
-            all_hidden = model(seq, metadata=metadata, return_all_hidden=True)
-            pooled = all_hidden[:, -1, :]
-            moe.clear_cache()
             enabled = {
                 "next_item": True,
                 "masked_item": config.use_masked_lm,
                 "multi_step": config.use_multi_step,
                 "contrastive": config.use_contrastive,
             }
-            for obj_idx, obj_name in enumerate(OBJECTIVE_ORDER):
-                if not enabled[obj_name]:
-                    continue
-                _, r = moe(all_hidden, pooled, obj_idx)
-                if r is not None:
-                    collected.setdefault(obj_name, []).append(
-                        r.detach().to("cpu", torch.float32)
-                    )
+            routing = []
+            # specs/eval-integrity FR-3.2: this batch's forward and routing own a region.
+            with autocast_context(config, device_type=next(model.parameters()).device.type):
+                all_hidden = model(seq, metadata=metadata, return_all_hidden=True)
+                pooled = all_hidden[:, -1, :]
+                moe.clear_cache()
+                for obj_idx, obj_name in enumerate(OBJECTIVE_ORDER):
+                    if not enabled[obj_name]:
+                        continue
+                    _, r = moe(all_hidden, pooled, obj_idx)
+                    if r is not None:
+                        routing.append((obj_name, r.detach()))
+            for obj_name, r in routing:
+                collected.setdefault(obj_name, []).append(r.to("cpu", torch.float32))
     if was_training:
         model.train()
         moe.train()
@@ -1022,6 +1050,12 @@ def run_pretrain(config: Config, model_name: str) -> Dict[str, float]:
     val_candidate_tensors = _load_or_build_val_candidates(
         config, processed, val_dataset, neg_array, eval_user_history, device,
     )
+    # specs/eval-integrity FR-5.3 / FR-7: the popularity-only floor on the same val rows
+    # and candidates, computed once per run (no model involved).
+    val_popularity_reference = evaluate_popularity(
+        val_candidate_tensors, item_popularity(train_user_history, config.vocab_size),
+        k=config.eval_k, batch_size=POPULARITY_EVAL_BATCH,
+    )
 
     best_val_ndcg = -1.0
     best_epoch = -1
@@ -1076,6 +1110,11 @@ def run_pretrain(config: Config, model_name: str) -> Dict[str, float]:
         os.remove(gradnorm_log_path)
 
     epoch_logger = setup_epoch_logger(config, model_name, append=resumed is not None)
+    if resumed is None:
+        # Written once, as a header: it carries no `epoch=N`, so `_truncate_epoch_log`
+        # keeps it on resume (and a resumed run does not write it again).
+        log_popularity_header(epoch_logger, val_popularity_reference, config.eval_k,
+                              int(val_candidate_tensors.shape[0]))
 
     non_blocking = device.type == "cuda" and config.pin_memory
 
@@ -1248,4 +1287,5 @@ def run_pretrain(config: Config, model_name: str) -> Dict[str, float]:
         "best_epoch": best_epoch,
         "epoch_mean_losses": epoch_mean_losses,
         "epoch_loss_windows": epoch_loss_windows,
+        "val_popularity_reference": val_popularity_reference,
     }

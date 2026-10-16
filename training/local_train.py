@@ -26,7 +26,9 @@ from data.sequence_generator import (
     filter_negatives, generate_sliding_window_examples, load_metadata_matrix,
     load_or_build_eval_candidates, load_examples,
 )
-from utils import get_device, resolve_dtype, make_grad_scaler, artifact_source_revision
+from utils import (
+    autocast_context, get_device, resolve_dtype, make_grad_scaler, artifact_source_revision,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -149,14 +151,18 @@ def train_user_lora(
             if metadata_matrix is not None:
                 meta_input = metadata_matrix[seq_input.to(metadata_matrix.device)].to(device)
 
-            all_hidden = model(seq_input, metadata=meta_input, return_all_hidden=True)
-            pooled = all_hidden[:, -1, :]
+            # specs/eval-integrity FR-3.2: forward, MoE and loss own an autocast region
+            # (cache off, so the adapters' in-place updates are always seen); backward
+            # and the scaler steps run outside it.
+            with autocast_context(config, device_type=next(model.parameters()).device.type):
+                all_hidden = model(seq_input, metadata=meta_input, return_all_hidden=True)
+                pooled = all_hidden[:, -1, :]
 
-            moe.clear_cache()
-            Z_next, _ = moe(all_hidden, pooled, 0)
-            user_emb = Z_next[:, -1, :]
+                moe.clear_cache()
+                Z_next, _ = moe(all_hidden, pooled, 0)
+                user_emb = Z_next[:, -1, :]
 
-            loss = loss_fn(user_emb, target_t, neg_ids.unsqueeze(0), model.item_emb_weight)
+                loss = loss_fn(user_emb, target_t, neg_ids.unsqueeze(0), model.item_emb_weight)
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)

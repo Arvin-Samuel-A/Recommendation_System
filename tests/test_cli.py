@@ -972,6 +972,8 @@ class TestSharedBackboneReuse:
                 patch("data.sequence_generator.load_tensorised", return_value=FakeDataset()), \
                 patch("data.sequence_generator.load_eval_candidates",
                       return_value=np.zeros((2, 11), dtype=np.int64)), \
+                patch("evaluation.metrics.load_item_popularity",
+                      return_value=torch.zeros(102)), \
                 patch("evaluation.metrics.evaluate_model",
                       return_value={"ndcg": {"mean": 0.1, "std": 0.0}}), \
                 patch("training.local_train.run_local_personalization", return_value={
@@ -1060,6 +1062,8 @@ class TestBackboneStore:
                 patch("data.sequence_generator.load_tensorised", return_value=FakeDataset()), \
                 patch("data.sequence_generator.load_eval_candidates",
                       return_value=np.zeros((2, 11), dtype=np.int64)), \
+                patch("evaluation.metrics.load_item_popularity",
+                      return_value=torch.zeros(102)), \
                 patch("evaluation.metrics.evaluate_model",
                       return_value={"ndcg": {"mean": 0.1, "std": 0.0}}), \
                 patch("training.pretrain.collect_validation_routing", return_value={}):

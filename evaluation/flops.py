@@ -11,7 +11,7 @@ from configs.config import Config
 from models.lora import count_lora_parameters
 from data.sequence_generator import load_metadata_matrix
 from models.moe import MoELayer
-from utils import get_device
+from utils import autocast_context, get_device
 
 logger = logging.getLogger(__name__)
 
@@ -75,8 +75,11 @@ def benchmark_latency(
             ).to(device=device, dtype=torch.bfloat16)
             metadata_source = "randn"
 
+    # specs/eval-integrity FR-3.2: each warm-up and timed forward owns an autocast region
+    # (inside the timed window, so latency includes the casts, as in serving).
+    region_device = next(model.parameters()).device.type
     for _ in range(config.warmup_runs):
-        with torch.no_grad():
+        with torch.no_grad(), autocast_context(config, device_type=region_device):
             all_hidden = model(dummy_seq, metadata=dummy_meta, return_all_hidden=True)
             pooled = all_hidden[:, -1, :]
             if moe_layer is not None and moe_layer.variant != "none":
@@ -88,7 +91,7 @@ def benchmark_latency(
     for _ in range(config.timed_runs):
         _synchronize(device)
         start = time.perf_counter()
-        with torch.no_grad():
+        with torch.no_grad(), autocast_context(config, device_type=region_device):
             all_hidden = model(dummy_seq, metadata=dummy_meta, return_all_hidden=True)
             pooled = all_hidden[:, -1, :]
             if moe_layer is not None and moe_layer.variant != "none":

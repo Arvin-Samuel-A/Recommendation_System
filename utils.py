@@ -39,13 +39,29 @@ def resolve_param_dtype(config) -> torch.dtype:
     return resolve_dtype(config)
 
 
-def autocast_context(config):
-    """torch.autocast in the compute dtype when mixed precision is on, else a no-op."""
+def autocast_context(config, device_type: Optional[str] = None):
+    """Autocast for ONE forward region, in the compute dtype; a no-op without mixed precision.
+
+    `cache_enabled=False` (specs/eval-integrity FR-3.3): torch.autocast caches the
+    low-precision cast of fp32 leaf params with requires_grad and clears it only when the
+    OUTERMOST region exits; `optimizer.step()` and `load_state_dict()` update params in
+    place, so a cached cast goes stale. With the cache off, no region opened here can ever
+    forward stale weights -- even nested inside a caller's region that has caching on.
+
+    `device_type` defaults to the configured device; forward sites pass the device of the
+    model's parameters, since a region for the wrong device type silently does nothing.
+    """
     return torch.autocast(
-        device_type=get_device(config).type,
+        device_type=device_type or get_device(config).type,
         dtype=resolve_dtype(config),
         enabled=getattr(config, "mixed_precision", False),
+        cache_enabled=False,
     )
+
+
+def autocast_disabled(device_type: str):
+    """A region with autocast off, e.g. for fp32 scoring inside a caller's autocast region."""
+    return torch.autocast(device_type=device_type, enabled=False)
 
 
 def make_grad_scaler(config) -> "torch.amp.GradScaler":

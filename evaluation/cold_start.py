@@ -9,8 +9,9 @@ import torch
 
 from configs.config import Config
 from evaluation.metrics import (
-    evaluate_model, score_candidates, score_candidates_batch,
-    compute_metrics, compute_metrics_batch, aggregate_metrics,
+    EVAL_PROTOCOL, evaluate_model, score_candidates, score_candidates_batch,
+    compute_metrics, compute_metrics_batch, aggregate_metrics, item_popularity,
+    popularity_scores,
 )
 from data.sequence_generator import (
     align_metadata_matrix, load_or_build_eval_candidates, load_examples,
@@ -102,9 +103,12 @@ def run_cold_start_evaluation(
     meta_matrix = align_metadata_matrix(metadata_matrix, config.vocab_size)
 
     results: Dict[str, Dict[str, Dict[str, List[torch.Tensor]]]] = {
-        "cold": {"meta_on": {}, "meta_off": {}},
-        "warm": {"meta_on": {}, "meta_off": {}},
+        "cold": {"meta_on": {}, "meta_off": {}, "popularity": {}},
+        "warm": {"meta_on": {}, "meta_off": {}, "popularity": {}},
     }
+    # specs/eval-integrity FR-7.2: the popularity-only floor per bucket, on the same rows
+    # and candidates (training-interaction counts; cold items all score 0, tie-averaged).
+    popularity = item_popularity(train_user_history, config.vocab_size)
 
     n = len(test_examples["targets"])
     bs = max(1, config.eval_batch_size)
@@ -134,10 +138,13 @@ def run_cold_start_evaluation(
             "meta_on": meta_matrix[seqs],
             "meta_off": None,
         }
-        for arm, meta in arms.items():
-            scores = score_candidates_batch(
-                model, seqs, cands, config, moe_layer=moe_layer, metadata=meta,
-            )
+        for arm, meta in list(arms.items()) + [("popularity", None)]:
+            if arm == "popularity":
+                scores = popularity_scores(cands, popularity)
+            else:
+                scores = score_candidates_batch(
+                    model, seqs, cands, config, moe_layer=moe_layer, metadata=meta,
+                )
             per_metric = compute_metrics_batch(scores, target_idx=0, k=config.eval_k)
             for bucket, sel in (("cold", is_cold), ("warm", ~is_cold)):
                 if not bool(sel.any()):
@@ -151,6 +158,8 @@ def run_cold_start_evaluation(
             key = f"{bucket}_{meta}"
             stacked = {k: torch.cat(v) for k, v in results[bucket][meta].items()}
             report[key] = aggregate_metrics(stacked) if stacked else {}
+        stacked = {k: torch.cat(v) for k, v in results[bucket]["popularity"].items()}
+        report[f"{bucket}_popularity"] = aggregate_metrics(stacked) if stacked else {}
 
     _save_report(config, model_name, report, source_revision=source_revision)
     _plot_cold_start(config, model_name, report)
@@ -174,6 +183,8 @@ def _save_report(
     # AC-09: echo the source_revision of the checkpoint these numbers came from.
     if source_revision is not None:
         serializable["source_revision"] = source_revision
+    # specs/eval-integrity FR-1.5: fp32 scores, tie-averaged metrics.
+    serializable["eval_protocol"] = dict(EVAL_PROTOCOL)
 
     with open(path, "w") as f:
         json.dump(serializable, f, indent=2)

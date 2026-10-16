@@ -375,6 +375,29 @@ suite) and only capped runs on the Mac** — see `specs/ablation-run/tasks.md` "
 
 ---
 
+## Phase 24 — Evaluation Integrity (fp32 scoring, honest ties, autocast scoping, rescore)
+
+Spec: `specs/eval-integrity/`. Prerequisite: Phase 23 implemented. The metric and scoring fixes
+land first, then the training-correctness fix, then reporting, then the rescore stage. **BUILD runs
+targeted test files only** (see `specs/eval-integrity/tasks.md` "Rules for BUILD").
+
+| # | Step | Spec Tasks | Produces |
+|---|---|---|---|
+| 24.1 | Tie-averaged metrics; cache-off autocast helpers; fp32 scoring choke point and ANN; scoring-site guard; popularity helpers | `eval-integrity T1.1–T1.6` | honest metrics, fp32 scores |
+| 24.2 | Per-forward autocast regions (training step, every eval/LoRA/diagnostic forward); no stage region; fingerprint semantics version; selection consistency | `eval-integrity T2.1–T2.5` | stale-cache fix with regression test |
+| 24.3 | Full-split ablation test eval; popularity reference and protocol stamp in every result, study, summary and plot | `eval-integrity T3.1–T3.3` | comparable, floor-referenced results |
+| 24.4 | `--stage ablation_rescore`, rescore launch scripts, runbook | `eval-integrity T4.1–T4.3` | `ablations/rescored/seed_{seed}/` |
+| 24.5 | Targeted sweep; capped Mac smoke | `eval-integrity T5.1–T5.2` | verification notes |
+
+```
+🧪 GATE: test_determinism.py golden green with constants untouched throughout Phase 24
+🧪 GATE: stale-cache regression (AC-08/AC-09) and selection consistency (AC-15) pass
+⛔ BLOCKED: no A–H re-run until Phase 24 is complete; rescored numbers are honest for old weights
+   but those weights came from the defective training loop
+```
+
+---
+
 ## Summary
 
 | Phase | Description | Test Gate |
@@ -403,6 +426,7 @@ suite) and only capped runs on the Mac** — see `specs/ablation-run/tasks.md` "
 | 21 | Multi-seed final runs | 3 independent seeds aggregated |
 | 22 | Final plots + deliverables | All outputs present |
 | 23 | Ablation run readiness (`ablation-run`) | Golden test green throughout; targeted sweep; capped smoke with resume; Phase 10 concurrency tests (real subprocesses) and `--gpus 1` byte-identity |
+| 24 | Evaluation integrity (`eval-integrity`) | Golden untouched; stale-cache regression; in-training val equals post-load val; rescore idempotent and resumable |
 
 **Critical blocking gate:** Phase 11 (end-to-end smoke tests). Full MovieLens-20M training is **forbidden** until both the one-batch and few-step T-Small smoke tests pass.
 

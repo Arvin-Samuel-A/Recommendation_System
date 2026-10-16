@@ -6,7 +6,7 @@ import json
 import logging
 import os
 from dataclasses import asdict
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -228,7 +228,8 @@ def _config_diff(cfg: Config, base: Config) -> Dict:
 #: Config fields that are read ONLY after training finishes, so two arms differing only
 #: in these produce a bit-identical backbone (REV-084). Verified against the codebase:
 #: `personalization_mode` and `system_eval` are read solely by this module's post-training
-#: extras dispatch, and `ablation_eval_examples` only bounds the evaluation slice.
+#: extras dispatch, and `ablation_eval_examples` / `ablation_eval_seed` only choose the
+#: test rows scored after training (eval-integrity FR-6.4).
 #: Anything not listed here is treated as training-relevant -- the safe default, since a
 #: missing entry only costs a redundant run, while a wrong entry would silently make two
 #: genuinely different arms share one model.
@@ -236,6 +237,7 @@ POST_TRAINING_ONLY_FIELDS = frozenset({
     "personalization_mode",
     "system_eval",
     "ablation_eval_examples",
+    "ablation_eval_seed",
 })
 
 #: Per-arm output namespaces, which carry no training semantics.
@@ -258,6 +260,25 @@ _RUN_SELECTION_FIELDS = frozenset({"final_seeds"})
 _RUNTIME_ONLY_FIELDS = frozenset({"num_workers", "pin_memory", "resume_training"})
 
 
+#: Bump when a code fix changes what training produces for an unchanged config, so
+#: backbones trained before the fix are never reused (specs/eval-integrity FR-4).
+#: 1 = implicit (<= c094b2c). 2 = eval-integrity FR-3: per-forward autocast regions with
+#: the weight cache off (mixed-precision runs before it forwarded stale bf16 casts).
+TRAINING_SEMANTICS_VERSION = 2
+
+
+def _training_fields(cfg_dict: dict) -> dict:
+    """The training-relevant subset of an `asdict(Config)` (the fingerprint's field set).
+
+    Also used by the rescore identity check (eval-integrity FR-8.9).
+    """
+    return {
+        k: v for k, v in cfg_dict.items()
+        if k not in POST_TRAINING_ONLY_FIELDS and k not in _PATH_FIELDS
+        and k not in _RUN_SELECTION_FIELDS and k not in _RUNTIME_ONLY_FIELDS
+    }
+
+
 def _training_fingerprint(cfg: Config) -> str:
     """Hash of everything about `cfg` that actually changes the trained model.
 
@@ -267,12 +288,14 @@ def _training_fingerprint(cfg: Config) -> str:
     wasted per pair, at `pretrain_epochs=20` over 7.8M examples -- and produced identical
     `metrics`, which reads as a null result for personalization rather than as what it
     is: the two arms sharing a backbone by construction.
+
+    eval-integrity FR-4: the payload also carries `TRAINING_SEMANTICS_VERSION`, so a
+    training-correctness fix changes every fingerprint and pre-fix backbones are never
+    reused. Code that needs an old backbone locates it by the fingerprint recorded in its
+    arm result, never by recomputing it.
     """
-    fields = {
-        k: v for k, v in asdict(cfg).items()
-        if k not in POST_TRAINING_ONLY_FIELDS and k not in _PATH_FIELDS
-        and k not in _RUN_SELECTION_FIELDS and k not in _RUNTIME_ONLY_FIELDS
-    }
+    fields = _training_fields(asdict(cfg))
+    fields["_training_semantics"] = TRAINING_SEMANTICS_VERSION
     payload = json.dumps(fields, sort_keys=True, default=str)
     return hashlib.sha256(payload.encode()).hexdigest()[:12]
 
@@ -369,6 +392,26 @@ def resolve_dataset_fields(cfg: Config, stats_dir: Optional[str] = None):
     if metadata_matrix is not None:
         cfg.feature_dim = metadata_matrix.shape[-1]
     return metadata_matrix
+
+
+def select_eval_rows(total: int, n: int, seed: int) -> Tuple[Optional[np.ndarray], Dict]:
+    """Which test rows an arm is scored on (specs/eval-integrity FR-6, design D7).
+
+    `n <= 0` or `n >= total`: every row (`None`, method "full"). Otherwise a seeded
+    uniform random sample of `n` rows without replacement, in sorted order -- never a
+    prefix of the user-sorted split. The descriptor is recorded in the arm result.
+    """
+    if n <= 0 or n >= total:
+        return None, {"method": "full", "num_examples": int(total), "total_rows": int(total),
+                      "seed": None}
+    idx = np.sort(np.random.default_rng(seed).choice(total, size=n, replace=False))
+    return idx, {
+        "method": "random",
+        "num_examples": int(n),
+        "total_rows": int(total),
+        "seed": int(seed),
+        "indices_sha256": hashlib.sha256(idx.astype(np.int64).tobytes()).hexdigest(),
+    }
 
 
 def _runtime_record(model, cfg: Config, device: torch.device) -> Dict:
@@ -506,7 +549,10 @@ def _run_single_config(
     results.
     """
     from training.pretrain import run_pretrain, build_model, load_checkpoint, _build_loss_fns
-    from evaluation.metrics import evaluate_model
+    from evaluation.metrics import (
+        EVAL_PROTOCOL, evaluate_model, evaluate_popularity, load_item_popularity,
+    )
+    from training.pretrain import POPULARITY_EVAL_BATCH
     from evaluation.flops import (
         benchmark_latency, count_parameters, estimate_flops_per_inference,
     )
@@ -626,12 +672,28 @@ def _run_single_config(
         os.path.join(processed, "test_tensorised.pt"), metadata_matrix,
         max_seq_length=cfg.max_seq_length,
     )
-    cand_matrix = load_eval_candidates(os.path.join(processed, "test_candidates.npy"))
-    n = min(cfg.ablation_eval_examples, len(test_dataset), cand_matrix.shape[0])
+    cand_matrix = load_eval_candidates(
+        os.path.join(processed, "test_candidates.npy"), mmap=True,
+    )
+    if cand_matrix.shape[0] != len(test_dataset):
+        raise RuntimeError(
+            f"test candidate sets have {cand_matrix.shape[0]} rows but the test split has "
+            f"{len(test_dataset)}; re-run --stage preprocess"
+        )
+    # specs/eval-integrity FR-6: the FULL test split by default; a seeded random sample
+    # only when `ablation_eval_examples > 0`. Only the selected candidate rows are read
+    # from the memory-mapped matrix.
+    idx, test_eval = select_eval_rows(
+        len(test_dataset), cfg.ablation_eval_examples, cfg.ablation_eval_seed,
+    )
     # REV-063: hand `evaluate_model` the stacked tensors and let it batch, rather than
     # building n per-example device tensors and forwarding a batch of 1 each.
-    sequences = test_dataset.sequences[:n]
-    candidates = torch.as_tensor(cand_matrix[:n], dtype=torch.long)
+    if idx is None:
+        sequences = test_dataset.sequences
+        candidates = torch.as_tensor(np.array(cand_matrix), dtype=torch.long)
+    else:
+        sequences = test_dataset.sequences[torch.from_numpy(idx)]
+        candidates = torch.as_tensor(np.array(cand_matrix[idx]), dtype=torch.long)
 
     model.eval()
     moe.eval()
@@ -643,7 +705,14 @@ def _run_single_config(
     result["metrics"] = {
         k: {sk: float(sv) for sk, sv in v.items()} for k, v in metrics.items()
     }
-    result["num_eval_examples"] = n
+    result["num_eval_examples"] = test_eval["num_examples"]
+    result["test_eval"] = test_eval
+    # FR-7: the popularity-only floor on exactly these rows and candidates.
+    result["popularity_reference"] = evaluate_popularity(
+        candidates, load_item_popularity(processed, cfg.vocab_size), k=cfg.eval_k,
+        batch_size=POPULARITY_EVAL_BATCH,
+    )
+    result["eval_protocol"] = dict(EVAL_PROTOCOL)
 
     extras = STUDY_EXTRAS.get(study, ())
 
@@ -1151,6 +1220,18 @@ def _plot_study(config: Config, model_name: str, study: str, results: List[Dict]
         vals = [r["metrics"].get(m, {}).get("mean", 0.0) for r in usable]
         ax.bar(x + i * width, vals, width, label=m.upper())
 
+    # eval-integrity FR-7.4: the popularity-only floor, so a bar is read against it.
+    pop_ndcg = next(
+        (
+            r["popularity_reference"]["ndcg"]["mean"] for r in usable
+            if ((r.get("popularity_reference") or {}).get("ndcg") or {}).get("mean")
+            is not None
+        ),
+        None,
+    )
+    if pop_ndcg is not None:
+        ax.axhline(pop_ndcg, linestyle="--", color="0.3", label=f"popularity (NDCG@{config.eval_k})")
+
     ax.set_xticks(x + width * 1.5)
     ax.set_xticklabels(labels, rotation=20, ha="right")
     ax.set_ylabel(f"Score @{config.eval_k}")
@@ -1391,29 +1472,55 @@ def _save_study_results(config: Config, model_name: str, study: str, results: Li
     _write_json_atomic(path, results)
 
 
+def _popularity_ndcg(results: List[Dict]) -> Optional[float]:
+    """The popularity-only NDCG of a study (eval-integrity FR-7.3): from the first ok arm
+    that carries one -- every ok arm of a study is scored on the same test rows."""
+    for r in results:
+        if r.get("status") == "ok":
+            ndcg = ((r.get("popularity_reference") or {}).get("ndcg") or {}).get("mean")
+            if ndcg is not None:
+                return float(ndcg)
+    return None
+
+
 def _save_summary(
-    config: Config, model_name: str, all_results: Dict, incomplete: Optional[Dict] = None,
+    config: Config,
+    model_name: str,
+    all_results: Dict,
+    incomplete: Optional[Dict] = None,
+    extra: Optional[Dict] = None,
 ) -> None:
     os.makedirs(_results_root(config), exist_ok=True)
     mn = model_name.replace("-", "_")
     summary = {}
     for study, results in all_results.items():
+        best_ndcg, best_label = max(
+            (
+                (r["metrics"]["ndcg"]["mean"], r["label"])
+                for r in results if r.get("metrics", {}).get("ndcg")
+            ),
+            default=(None, None),
+        )
+        pop_ndcg = _popularity_ndcg(results)
         summary[study] = {
             "num_configs": len(results),
             "num_ok": sum(1 for r in results if r.get("status") == "ok"),
             "num_failed": sum(1 for r in results if r.get("status") == "failed"),
-            "best": max(
-                (
-                    (r["metrics"]["ndcg"]["mean"], r["label"])
-                    for r in results if r.get("metrics", {}).get("ndcg")
-                ),
-                default=(None, None),
-            )[1],
+            "best": best_label,
+            # eval-integrity FR-7.3: a gain is read against the popularity floor.
+            "best_ndcg": best_ndcg,
+            "popularity_reference_ndcg": pop_ndcg,
+            "best_minus_popularity_ndcg": (
+                best_ndcg - pop_ndcg if best_ndcg is not None and pop_ndcg is not None
+                else None
+            ),
         }
     # specs/ablation-run FR-15: `ablation_collect --study all` marks studies it could not
     # assemble instead of silently leaving them out.
     for study, entry in (incomplete or {}).items():
         summary[study] = {"complete": False, **entry}
+    # e.g. the rescore's `rescore_caveat` (eval-integrity FR-8.7), merged at top level.
+    summary.update(extra or {})
     path = os.path.join(_results_root(config), f"summary_{mn}.json")
     with open(path, "w") as f:
         json.dump(summary, f, indent=2)

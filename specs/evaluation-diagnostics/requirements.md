@@ -44,6 +44,11 @@ Fair model comparison requires identical evaluation infrastructure. Routing and 
 - Recall@10: 1 if rank ≤ 10, else 0 (= HR@10 for single-target protocol)
 - Precision@10: `1/10` if rank ≤ 10, else 0
 - Return per-example values plus mean and std
+- *Amended 2026-10-16 by `specs/eval-integrity`:*
+  - Ties are scored as the expectation under random tie-breaking. The REV-076 rule, which gave
+    ties to the target, is superseded (eval-integrity FR-2).
+  - Candidate scores are computed in fp32 outside autocast (FR-1).
+  - Every reported result carries a popularity reference (FR-7).
 - Multi-seed final results: mean ± std across independent seeds (not repeated evaluation of one seed)
 
 ### FR-4: Cold-Start Evaluation (Step 19)

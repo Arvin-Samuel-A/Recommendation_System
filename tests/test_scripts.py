@@ -698,3 +698,71 @@ class TestMultiGpuLaunch:
             assert text.index(f"export CUDA_VISIBLE_DEVICES={gpu}") < text.index(
                 f"verify_attention_backend.py --backend flash_attention_3") < text.index("--stage ablation --study")
             assert f"logs/verify_fa3_gpu{gpu}.json" in text
+
+
+class TestRescoreScripts:
+    """specs/eval-integrity T4.3 / AC-27: launch/rescore_{machine}.sh."""
+
+    @pytest.fixture
+    def processed(self, tiny_processed_dir):
+        return tiny_processed_dir(user_sample_fraction=0.5, sequence_length_grid=[25, 50, 100, 200])
+
+    @staticmethod
+    def _base_flags(text, stage):
+        """The flags after `--study X` of every `--stage <stage>` command in a script."""
+        import re
+
+        joined = text.replace("\\\n", " ")
+        out = []
+        for line in joined.splitlines():
+            m = re.search(rf"main\.py --stage {stage} --study (\S+) (.*?)(?:\s*>|$)", line)
+            if m:
+                out.append((m.group(1), m.group(2).strip()))
+        return out
+
+    def test_rescore_scripts_mirror_the_run_commands(self, processed, tmp_path):
+        import subprocess as sp
+        import tarfile
+
+        out = tmp_path / "dist"
+        result = run_script([
+            "scripts/package_ablation_run.py", "--user-sample-fraction", "0.5",
+            "--processed-dir", processed, "--out", str(out), "--skip-data", "--allow-dirty",
+            "--rescore-scripts",
+        ])
+        assert result.returncode == 0, result.stdout + result.stderr
+        launch = out / "launch"
+        studies = {"h100": ["A", "D", "E", "H"], "aws": ["B", "C", "F", "G"]}
+        backends = {"h100": "flash_attention_3", "aws": "sdpa"}
+        with tarfile.open(out / "code.tar.gz") as tar:
+            members = set(tar.getnames())
+        for machine in ("h100", "aws"):
+            path = launch / f"rescore_{machine}.sh"
+            assert f"launch/rescore_{machine}.sh" in members
+            text = path.read_text()
+            assert sp.run(["bash", "-n", str(path)], capture_output=True).returncode == 0
+            assert os.access(path, os.X_OK)
+            assert "--stage ablation_rescore" in text
+            assert f"for STUDY in {' '.join(studies[machine])}; do" in text
+            assert "scripts/run_with_retry.py" in text
+
+            run_flags = self._base_flags((launch / f"run_{machine}.sh").read_text(), "ablation")
+            rescore_flags = self._base_flags(text, "ablation_rescore")
+            assert run_flags and rescore_flags
+            run_tail = {tail for _, tail in run_flags}
+            assert len(run_tail) == 1
+            for study, tail in rescore_flags:
+                assert study in ('"${STUDY}"', "all")
+                assert tail in run_tail, (tail, run_tail)
+                assert "--dtype bf16 --mixed_precision" in tail
+                assert f"--attention_backend {backends[machine]}" in tail
+                assert "--user_sample_fraction 0.5" in tail
+
+    def test_rescore_scripts_are_opt_in(self, processed, tmp_path):
+        out = tmp_path / "dist"
+        result = run_script([
+            "scripts/package_ablation_run.py", "--user-sample-fraction", "0.5",
+            "--processed-dir", processed, "--out", str(out), "--skip-data", "--allow-dirty",
+        ])
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert not any(p.name.startswith("rescore_") for p in (out / "launch").iterdir())

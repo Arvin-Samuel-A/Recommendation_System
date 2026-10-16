@@ -202,10 +202,14 @@ class Config:
     # per-user LoRA personalization and report the gain.
     personalization_mode: str = "none"
 
-    # Examples scored per ablation arm. The full test split is ~1M examples and each
-    # study has up to 6 arms; capping keeps a study tractable while every arm is scored
-    # on the SAME prefix of the same stored candidate sets, so arms stay comparable.
-    ablation_eval_examples: int = 5000
+    # Test rows scored per ablation arm (specs/eval-integrity FR-6). 0 = every row of the
+    # stored test split -- the default: a full test pass costs ~5% of an arm's evaluation
+    # time. N > 0 = a seeded uniform random sample of N rows (`ablation_eval_seed`), for
+    # tests and quick checks only. It used to be the first 5000 rows, which the
+    # user-sorted split drew from only 637 of 13,582 users.
+    ablation_eval_examples: int = 0
+    # Seed of the random test-row sample; independent of the training `seed`.
+    ablation_eval_seed: int = 0
 
     # --- Diagnostics ---
     routing_diag_interval_epochs: int = 5
@@ -297,6 +301,13 @@ class Config:
                 "dtype='fp16' requires mixed_precision=True: pure fp16 weights underflow "
                 "small updates and gradients without fp32 master weights and loss scaling."
             )
+        if self.ablation_eval_examples < 0:
+            raise ValueError(
+                f"ablation_eval_examples must be >= 0 (0 = all test rows), "
+                f"got {self.ablation_eval_examples}"
+            )
+        if self.ablation_eval_seed < 0:
+            raise ValueError(f"ablation_eval_seed must be >= 0, got {self.ablation_eval_seed}")
         if self.hidden_dim % self.num_heads != 0:
             raise ValueError(
                 f"hidden_dim ({self.hidden_dim}) must be divisible by "

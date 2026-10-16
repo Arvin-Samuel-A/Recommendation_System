@@ -6,6 +6,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from utils import autocast_context
+
 
 def gradient_cosine_similarity(
     per_objective_losses: Dict[str, torch.Tensor],
@@ -195,60 +197,64 @@ def run_gradient_diagnostics(
                 mask_positions = None
                 true_ids = None
 
-            all_hidden = model(masked_seq, metadata=metadata, return_all_hidden=True)
-            pooled = all_hidden[:, -1, :]
+            # specs/eval-integrity FR-3.2: the forwards and per-objective losses own an
+            # autocast region (cache off); `torch.autograd.grad` and the cosine/norm
+            # arithmetic below run outside it.
+            with autocast_context(config, device_type=device.type):
+                all_hidden = model(masked_seq, metadata=metadata, return_all_hidden=True)
+                pooled = all_hidden[:, -1, :]
 
-            per_objective_losses = {}
-            moe_layer.clear_cache()
+                per_objective_losses = {}
+                moe_layer.clear_cache()
 
-            Z_next, _ = moe_layer(all_hidden, pooled, 0)
-            user_emb = Z_next[:, -1, :]
-            per_objective_losses["next_item"] = loss_fns["next_item"](
-                user_emb, targets, neg_ids, model.item_emb_weight,
-            )
-
-            if config.use_masked_lm and mask_positions is not None and "masked_item" in loss_fns:
-                Z_mim, _ = moe_layer(all_hidden, pooled, 1)
-                per_objective_losses["masked_item"] = loss_fns["masked_item"](
-                    Z_mim, mask_positions, true_ids, model.item_emb_weight,
+                Z_next, _ = moe_layer(all_hidden, pooled, 0)
+                user_emb = Z_next[:, -1, :]
+                per_objective_losses["next_item"] = loss_fns["next_item"](
+                    user_emb, targets, neg_ids, model.item_emb_weight,
                 )
 
-            if config.use_multi_step and targets_k is not None and "multi_step" in loss_fns:
-                Z_ms, _ = moe_layer(all_hidden, pooled, 2)
-                per_objective_losses["multi_step"] = loss_fns["multi_step"](
-                    Z_ms, targets_k, model.item_emb_weight,
-                )
-
-            # REV-009b: the contrastive objective participates in the (T, T) matrix.
-            if config.use_contrastive and "contrastive" in loss_fns:
-                Z_cl, _ = moe_layer(all_hidden, pooled, 3)
-                z_orig = torch.nn.functional.normalize(Z_cl[:, -1, :].float(), p=2, dim=-1)
-
-                B, S = seq.shape
-                aug_seqs = []
-                for i in range(B):
-                    real = seq[i][seq[i] != 0].tolist()
-                    if len(real) == 0:
-                        real = [1]
-                    aug = augment_sequence(
-                        real, mask_id, augment_rng, config.crop_ratio, config.mask_ratio,
+                if config.use_masked_lm and mask_positions is not None and "masked_item" in loss_fns:
+                    Z_mim, _ = moe_layer(all_hidden, pooled, 1)
+                    per_objective_losses["masked_item"] = loss_fns["masked_item"](
+                        Z_mim, mask_positions, true_ids, model.item_emb_weight,
                     )
-                    padded = ([0] * (S - len(aug)) + aug)[-S:]
-                    aug_seqs.append(padded)
-                aug_seq_t = torch.tensor(aug_seqs, dtype=torch.long, device=device)
 
-                aug_meta = None
-                if metadata is not None and metadata_matrix is not None:
-                    # The full (vocab, F) metadata matrix stays on CPU; index there and move
-                    # only the gathered (B, S, F) block to the accelerator.
-                    # REV-072: the matrix covers MASK_ID with an all-zero row, so the
-                    # clamp that mapped mask tokens onto the last real item is gone.
-                    aug_meta = metadata_matrix[aug_seq_t.to(metadata_matrix.device)].to(device=device)
+                if config.use_multi_step and targets_k is not None and "multi_step" in loss_fns:
+                    Z_ms, _ = moe_layer(all_hidden, pooled, 2)
+                    per_objective_losses["multi_step"] = loss_fns["multi_step"](
+                        Z_ms, targets_k, model.item_emb_weight,
+                    )
 
-                aug_hidden = model(aug_seq_t, metadata=aug_meta, return_all_hidden=True)
-                Z_aug, _ = moe_layer(aug_hidden, aug_hidden[:, -1, :], 3)
-                z_aug = torch.nn.functional.normalize(Z_aug[:, -1, :].float(), p=2, dim=-1)
-                per_objective_losses["contrastive"] = loss_fns["contrastive"](z_orig, z_aug)
+                # REV-009b: the contrastive objective participates in the (T, T) matrix.
+                if config.use_contrastive and "contrastive" in loss_fns:
+                    Z_cl, _ = moe_layer(all_hidden, pooled, 3)
+                    z_orig = torch.nn.functional.normalize(Z_cl[:, -1, :].float(), p=2, dim=-1)
+
+                    B, S = seq.shape
+                    aug_seqs = []
+                    for i in range(B):
+                        real = seq[i][seq[i] != 0].tolist()
+                        if len(real) == 0:
+                            real = [1]
+                        aug = augment_sequence(
+                            real, mask_id, augment_rng, config.crop_ratio, config.mask_ratio,
+                        )
+                        padded = ([0] * (S - len(aug)) + aug)[-S:]
+                        aug_seqs.append(padded)
+                    aug_seq_t = torch.tensor(aug_seqs, dtype=torch.long, device=device)
+
+                    aug_meta = None
+                    if metadata is not None and metadata_matrix is not None:
+                        # The full (vocab, F) metadata matrix stays on CPU; index there and move
+                        # only the gathered (B, S, F) block to the accelerator.
+                        # REV-072: the matrix covers MASK_ID with an all-zero row, so the
+                        # clamp that mapped mask tokens onto the last real item is gone.
+                        aug_meta = metadata_matrix[aug_seq_t.to(metadata_matrix.device)].to(device=device)
+
+                    aug_hidden = model(aug_seq_t, metadata=aug_meta, return_all_hidden=True)
+                    Z_aug, _ = moe_layer(aug_hidden, aug_hidden[:, -1, :], 3)
+                    z_aug = torch.nn.functional.normalize(Z_aug[:, -1, :].float(), p=2, dim=-1)
+                    per_objective_losses["contrastive"] = loss_fns["contrastive"](z_orig, z_aug)
 
             if objective_names is None:
                 objective_names = list(per_objective_losses.keys())

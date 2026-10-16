@@ -9,8 +9,8 @@ import torch
 
 from configs.config import Config
 from evaluation.metrics import (
-    score_candidates, score_candidates_batch, compute_metrics,
-    compute_metrics_batch, aggregate_metrics,
+    EVAL_PROTOCOL, score_candidates, score_candidates_batch, compute_metrics,
+    compute_metrics_batch, aggregate_metrics, load_item_popularity, popularity_scores,
 )
 from data.sequence_generator import (
     load_metadata_matrix, load_or_build_eval_candidates, load_examples,
@@ -142,6 +142,10 @@ def run_longtail_evaluation(
 
     bucket_names = ["head", "mid", "tail"]
     results: Dict[str, Dict[str, List[torch.Tensor]]] = {b: {} for b in bucket_names}
+    # specs/eval-integrity FR-7.2: the popularity-only floor per bucket, same rows and
+    # candidates, same source as the buckets (`train_user_history.pkl`).
+    popularity = load_item_popularity(processed, config.vocab_size)
+    pop_results: Dict[str, Dict[str, List[torch.Tensor]]] = {b: {} for b in bucket_names}
 
     n = len(test_examples["targets"])
     bs = max(1, config.eval_batch_size)
@@ -170,6 +174,9 @@ def run_longtail_evaluation(
             model, seqs, cands, config, moe_layer=moe_layer, metadata=batch_meta,
         )
         per_metric = compute_metrics_batch(scores, target_idx=0, k=config.eval_k)
+        pop_metric = compute_metrics_batch(
+            popularity_scores(cands, popularity), target_idx=0, k=config.eval_k,
+        )
 
         bucket_arr = np.asarray(bucket_of)
         for bucket in bucket_names:
@@ -178,11 +185,16 @@ def run_longtail_evaluation(
                 continue
             for key, val in per_metric.items():
                 results[bucket].setdefault(key, []).append(val.detach().cpu()[sel])
+            for key, val in pop_metric.items():
+                pop_results[bucket].setdefault(key, []).append(val.detach().cpu()[sel])
 
     report = {}
     for bucket in bucket_names:
         stacked = {k: torch.cat(v) for k, v in results[bucket].items()}
         report[bucket] = aggregate_metrics(stacked) if stacked else {}
+    for bucket in bucket_names:
+        stacked = {k: torch.cat(v) for k, v in pop_results[bucket].items()}
+        report[f"popularity_{bucket}"] = aggregate_metrics(stacked) if stacked else {}
     _save_report(config, model_name, report, buckets, source_revision=source_revision)
     _plot_longtail(config, model_name, report)
     return report
@@ -236,6 +248,8 @@ def _save_report(
     # AC-09: echo the source_revision of the checkpoint these numbers came from.
     if source_revision is not None:
         serializable["source_revision"] = source_revision
+    # specs/eval-integrity FR-1.5: fp32 scores, tie-averaged metrics.
+    serializable["eval_protocol"] = dict(EVAL_PROTOCOL)
 
     with open(path, "w") as f:
         json.dump(serializable, f, indent=2)

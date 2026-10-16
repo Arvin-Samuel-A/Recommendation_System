@@ -320,6 +320,48 @@ tail -f logs/run_h100.log logs/ablation_A_t_base_seed42.log
   (`outputs/checkpoints/ablations/by_fingerprint/<fp>/logs/`) from both machines; every arm records the backend and device it
   ran on under `runtime`.
 
+#### Rescoring a finished run
+
+`--stage ablation_rescore` (`specs/eval-integrity` FR-8) re-evaluates a finished run's saved
+epoch checkpoints with the current evaluation protocol: fp32 scores, tie-averaged metrics,
+the full test split and a popularity floor. It trains nothing and modifies no checkpoint and
+no original result.
+
+```bash
+# 1. Mac: package the new code with the rescore scripts (same flags as the run's package)
+uv run python scripts/package_ablation_run.py --rescore-scripts --skip-data   # dist/code.tar.gz
+# 2. each machine, in the run's own directory: extract the new code OVER the old code.
+#    The tarball holds only tracked code + launch/, never outputs/ or data/, so the
+#    checkpoints, results and processed data stay untouched.
+tar -xzf code.tar.gz
+# 3. rescore detached (resumable: a re-run continues at the first unscored epoch)
+mkdir -p logs && setsid nohup bash launch/rescore_aws.sh > logs/rescore_aws.log 2>&1 < /dev/null &
+tail -f logs/rescore_aws.log logs/rescore_B_t_base_seed42.log
+```
+
+- **What it runs.** `launch/rescore_<machine>.sh` runs `--stage ablation_rescore --study X`
+  for each of that machine's studies, with exactly the base flags of its run commands
+  (sample fraction and seed, `--dtype bf16 --mixed_precision`, the backend), through
+  `scripts/run_with_retry.py`. A final `--study all` writes the rescored summary; it exits 1
+  because the other machine's studies are absent there, which is expected.
+- **Outputs.** `outputs/ablations/rescored/seed_42/` (rescored arm records under `arms/`,
+  study JSONs and `summary_t_base.json`), one `rescore.json` per backbone in
+  `outputs/checkpoints/ablations/by_fingerprint/<fp>/`, and plots in `outputs/plots/rescored/`.
+  The original `outputs/ablations/seed_42/` stays next to them. Each rescored arm keeps the
+  original numbers under `rescore.original_*`, and its weight-dependent extras (routing,
+  gradient, cold-start, long-tail, personalisation, communication) under
+  `rescore.pre_rescore_extras`.
+- **Locally.** Copy a machine's `outputs/` and the processed data into the checkout and run the
+  same command with `uv run python main.py --stage ablation_rescore --study B ...` (the run's
+  flags). The device is chosen automatically (CUDA, then MPS, then CPU). Use MPS: about 8 min
+  per backbone, against about 3 h on CPU. `--study` limits the work.
+- **Caveat.** Rescoring gives honest numbers for these weights, but the weights were trained
+  under the stale-autocast-cache bug (eval-integrity FR-3). The A–H comparison requires a
+  re-run with the fixed training code.
+- **The re-run retrains every arm.** The training fingerprint now carries a
+  training-semantics version (FR-4), so the next `--stage ablation` on these machines never
+  reuses a pre-fix backbone; it trains new ones beside the old store entries.
+
 ### Splitting studies across GPUs
 
 On a machine with several GPUs the packager plans that machine's arms over them

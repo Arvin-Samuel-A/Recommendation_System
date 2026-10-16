@@ -10,6 +10,7 @@ ARV-MMoE is a communication-efficient multi-objective federated sequential recom
 - **Python:** 3.10+
 - **Environment manager:** `uv venv` only (no conda, no `python -m venv`)
 - **Dtype:** BF16 by default (`torch.bfloat16`). Optional mixed precision (`mixed_precision=True`): fp32 master weights + autocast in bf16 or fp16; fp16 requires it and adds a GradScaler
+  - Autocast regions are scoped to one forward each, with the weight cache off. Ranking scores are fp32 (owner directive 2026-10-16, `specs/eval-integrity`; see `code-quality.md` "Autocast scoping").
   - **Experiment runs use mixed bf16** (`--dtype bf16 --mixed_precision`) — owner decision 2026-10-15. Pure bf16 weights round away updates below ~0.4% of the weight and plateau (measured: next-item loss 4.56 flat vs 4.436 still falling under mixed precision, T4, t-small, 360 steps). The `Config` default stays pure bf16; the run commands carry the flags.
 - **Dataset:** MovieLens-20M via Kaggle API; experiment runs may use a seeded user sample (`user_sample_fraction`, processed into its own `data/processed_users{pct}pct` directory)
 - **Dev hardware:** Apple Silicon Mac (MPS, SDPA). Never runs CUDA code; FlashAttention is never imported there.
@@ -81,6 +82,10 @@ Serving:
 Approved pattern introduced by `specs/ablation-run` (owner decisions 2026-10-15); the backbone store exists today, the rest lands with that spec.
 
 - **Backbone store.** Ablation arms are trained into `checkpoints/ablations/by_fingerprint/<training fingerprint>/` and reused by every arm, study and process on that machine whose training-relevant config matches. Training a fingerprint holds an exclusive OS file lock on its store directory.
+  - The fingerprint includes `TRAINING_SEMANTICS_VERSION` (`specs/eval-integrity` FR-4), which is bumped whenever a fix changes what training computes. Code that needs an old backbone locates it by the fingerprint recorded in its arm result, never by recomputing it.
+- **Rescore.** `--stage ablation_rescore` (`specs/eval-integrity` FR-8) re-evaluates a finished run's saved epoch checkpoints with the current evaluation protocol, without training.
+  - It never modifies checkpoints or original results. It writes `by_fingerprint/<fp>/rescore.json` and a parallel results tree, `ablations/rescored/seed_{seed}/`.
+  - Rescoring gives honest numbers for old weights. It cannot repair a training defect.
 - **Resume.** `run_pretrain` writes `last.pt` (full state incl. RNGs and loader generators) atomically at every epoch end and resumes from it by default; it refuses to resume across a different training fingerprint or `source_revision`. Resume is epoch-granular.
 - **OOM.** An out-of-memory error ends the process with exit status 75; `scripts/run_with_retry.py` waits and re-runs the same command, which resumes. Completed ablation arms are persisted and reused on re-run.
 - **Code transport.** Target machines without git receive code as a tarball of the tracked files; their `source_revision` is identified by `source_hash`.

@@ -69,7 +69,9 @@ outputs/
 ├── checkpoints/ablations/by_fingerprint/{fp}/   # shared backbone store (+ .train.lock, backbone.json)
 ├── logs/                          # JSON/JSONL/log files per experiment
 ├── plots/                         # All PNG plots (150 DPI)
-└── ablations/seed_{seed}/         # Per-study JSON results (A–H), summary, arms/{study}_{model}/{label}.json (+ .study.lock)
+├── ablations/seed_{seed}/         # Per-study JSON results (A–H), summary, arms/{study}_{model}/{label}.json (+ .study.lock)
+├── ablations/rescored/seed_{seed}/  # Same layout, written only by --stage ablation_rescore (specs/eval-integrity)
+└── plots/rescored/                # Plots of the rescored studies
 ```
 
 Ablation results are seed-namespaced (`specs/ablation-run` FR-11) so runs with different seeds never overwrite each other.
@@ -99,6 +101,8 @@ When arms run in separate processes (`--arms`, `specs/ablation-run` FR-17), each
 ## Embedding Normalization
 
 When `config.normalize_embeddings = True` (default), L2-normalize both user and item embeddings before any dot-product scoring, in both training and evaluation.
+
+Evaluation scoring upcasts both sides to fp32 **before** normalising. `l2_normalize` returns its input dtype, so normalising a bf16 tensor yields bf16. The dot product runs outside autocast (`specs/eval-integrity` FR-1).
 
 ## Plot Standards
 

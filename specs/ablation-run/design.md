@@ -45,6 +45,9 @@ Per-step host syncs in the training hot path at HEAD (input to D4):
   the run manifest and the training fingerprint.
 - `main.py` — `parse_args` / `apply_cli_overrides` (logs `CLI override: field old -> new`),
   `_resolve_before_snapshot`, `save_config_snapshot`, one `autocast_context` around every stage.
+  *Superseded 2026-10-16 by `specs/eval-integrity` FR-3.* The stage-wide region froze every
+  `nn.Linear` at its first-step bf16 cast through autocast's weight cache. Each forward now opens
+  its own region, with the cache off.
 - `data/preprocessing.py::run_preprocessing` — single pass from `_read_ratings` through splits,
   cold items, metadata, sequences, pool, candidates, popularity buckets, manifest.
 - `data/sequence_generator.py` — `generate_sequences` (int32 preallocated arrays),
