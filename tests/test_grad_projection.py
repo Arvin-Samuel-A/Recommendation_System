@@ -112,19 +112,17 @@ class TestConfigAndArm:
             with pytest.raises(ValueError):
                 other.validate()
 
-    def test_projection_arm_and_fingerprints(self):
+    def test_projection_changes_only_its_own_fingerprint(self):
+        """No study arm uses projection yet (docs/gradient-projection.md): defaults keep
+        every fingerprint, and switching it on for arv_mmoe gives a new one."""
         from training.ablation_runner import _training_fingerprint, resolve_study_configs
 
         arms = {c._study_label: c for c in resolve_study_configs("A", Config())}
-        proj = arms["arv_mmoe_projection"]
-        assert proj.grad_projection == "next_item" and not proj.use_gradnorm
-        assert proj.moe_variant == arms["arv_mmoe"].moe_variant
+        assert all(not c.grad_projection for c in arms.values())
+        proj = copy.deepcopy(arms["arv_mmoe"])
+        proj.grad_projection = "next_item"
         proj.validate()
         assert _training_fingerprint(proj) != _training_fingerprint(arms["arv_mmoe"])
-        # Same as arv_mmoe except for the projection.
-        same = copy.deepcopy(proj)
-        same.grad_projection = ""
-        assert _training_fingerprint(same) == _training_fingerprint(arms["arv_mmoe"])
 
 
 class TestPretrain:

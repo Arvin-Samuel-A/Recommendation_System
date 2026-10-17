@@ -295,8 +295,6 @@ class TestFingerprint:
         assert _training_fingerprint(base) == self._legacy_fingerprint(base)
         for study in ("A", "D", "E"):
             for arm in resolve_study_configs(study, base):
-                if arm.grad_projection:  # an arm that exists only with the new field
-                    continue
                 assert _training_fingerprint(arm) == self._legacy_fingerprint(arm)
 
     @pytest.mark.parametrize("field,value", [
