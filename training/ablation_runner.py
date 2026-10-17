@@ -277,7 +277,15 @@ _DEFAULT_OMITTED_FIELDS = {
     "logit_scale_max": 100.0,
     "shared_logit_temperature": False,
     "gradnorm_renorm_scope": "active",
+    "gradnorm_primary_objective": "",
+    "gradnorm_aux_budget": None,
 }
+
+#: GradNorm fields added after TRAINING_SEMANTICS_VERSION 2 that `run_pretrain` reads only
+#: when `use_gradnorm` is on. They are left out of a no-GradNorm arm's payload whatever
+#: their value, so passing them on every command (as the packager does) never retrains an
+#: equal-weight arm.
+_GRADNORM_ONLY_FIELDS = frozenset({"gradnorm_primary_objective", "gradnorm_aux_budget"})
 
 
 def _training_fields(cfg_dict: dict) -> dict:
@@ -291,6 +299,7 @@ def _training_fields(cfg_dict: dict) -> dict:
         and k not in _RUN_SELECTION_FIELDS and k not in _RUNTIME_ONLY_FIELDS
         and not (k in _DEFAULT_OMITTED_FIELDS and v == _DEFAULT_OMITTED_FIELDS[k]
                  and type(v) is type(_DEFAULT_OMITTED_FIELDS[k]))
+        and not (k in _GRADNORM_ONLY_FIELDS and not cfg_dict.get("use_gradnorm", True))
     }
 
 

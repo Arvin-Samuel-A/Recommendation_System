@@ -1048,6 +1048,8 @@ def run_pretrain(config: Config, model_name: str) -> Dict[str, float]:
             config.gradnorm_alpha, config.gradnorm_lr,
             renorm_scope=config.gradnorm_renorm_scope,
             enabled_objectives=enabled_objectives(config),
+            primary_objective=config.gradnorm_primary_objective or None,
+            aux_budget=config.gradnorm_aux_budget,
         )
         gradnorm.log_lambdas = torch.nn.Parameter(gradnorm.log_lambdas.data.to(device=device))
         gradnorm.optimizer = torch.optim.Adam([gradnorm.log_lambdas], lr=config.gradnorm_lr)

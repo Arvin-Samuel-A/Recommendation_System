@@ -182,6 +182,9 @@ class Bench:
             if hasattr(P, "enabled_objectives"):  # older checkouts have no renorm scope
                 gn_kwargs = dict(renorm_scope=cfg.gradnorm_renorm_scope,
                                  enabled_objectives=P.enabled_objectives(cfg))
+            if getattr(cfg, "gradnorm_primary_objective", ""):
+                gn_kwargs.update(primary_objective=cfg.gradnorm_primary_objective,
+                                 aux_budget=cfg.gradnorm_aux_budget)
             gn = P.GradNormController(cfg.gradnorm_alpha, cfg.gradnorm_lr, **gn_kwargs)
             gn.log_lambdas = torch.nn.Parameter(gn.log_lambdas.data.to(device=device))
             gn.optimizer = torch.optim.Adam([gn.log_lambdas], lr=cfg.gradnorm_lr)

@@ -140,6 +140,13 @@ class Config:
     # it, so on its steps it can only take the remainder. "enabled": every enabled
     # objective, active this step or not, to sum to the number of enabled objectives.
     gradnorm_renorm_scope: str = "active"
+    # Primary-objective GradNorm. "" (the previous behaviour): GradNorm balances every
+    # active objective. An objective name (e.g. "next_item", the one ranking is evaluated
+    # on): that objective's lambda is fixed at 1 and left out of GradNorm, which balances
+    # only the auxiliary objectives; their lambdas are renormalised to sum to
+    # `gradnorm_aux_budget` (None = their count, i.e. the same total as before).
+    gradnorm_primary_objective: str = ""
+    gradnorm_aux_budget: Optional[float] = None
 
     # --- Training ---
     pretrain_epochs: int = 20
@@ -356,6 +363,18 @@ class Config:
                 f"Unknown gradnorm_renorm_scope '{self.gradnorm_renorm_scope}'. "
                 "Choose from 'active', 'enabled'"
             )
+        if self.gradnorm_primary_objective not in ("",) + tuple(OBJECTIVE_ORDER):
+            raise ValueError(
+                f"Unknown gradnorm_primary_objective '{self.gradnorm_primary_objective}'. "
+                f"Choose from {OBJECTIVE_ORDER} or '' (off)"
+            )
+        if self.gradnorm_aux_budget is not None:
+            if not self.gradnorm_primary_objective:
+                raise ValueError("gradnorm_aux_budget requires gradnorm_primary_objective")
+            if not self.gradnorm_aux_budget > 0:
+                raise ValueError(
+                    f"gradnorm_aux_budget must be > 0, got {self.gradnorm_aux_budget}"
+                )
         if self.contrastive_interval == 0 and self.use_contrastive:
             raise ValueError(
                 "contrastive_interval=0 is invalid; "

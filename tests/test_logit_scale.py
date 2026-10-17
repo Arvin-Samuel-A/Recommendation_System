@@ -28,6 +28,7 @@ from training.losses import (
 NEW_FIELDS = (
     "logit_temperature", "learnable_logit_scale", "logit_scale_max",
     "shared_logit_temperature", "gradnorm_renorm_scope",
+    "gradnorm_primary_objective", "gradnorm_aux_budget",
 )
 
 

@@ -1,3 +1,4 @@
+import math
 from typing import Dict, List, Optional
 
 import torch
@@ -46,6 +47,8 @@ class GradNormController:
     def __init__(
         self, alpha: float, lr: float, renorm_scope: str = "active",
         enabled_objectives: Optional[List[str]] = None,
+        primary_objective: Optional[str] = None,
+        aux_budget: Optional[float] = None,
     ):
         """`renorm_scope`: which lambdas `_renormalize` rescales after each update.
 
@@ -54,6 +57,13 @@ class GradNormController:
         (default: all of OBJECTIVE_ORDER), active this step or not, to sum to their
         count -- so an intermittent objective's lambda is not reset by the steps it
         skips. Disabled objectives keep lambda 1 either way and are never rescaled.
+
+        `primary_objective` (default None, the original behaviour): that objective's lambda
+        is fixed at 1 and it takes no part in GradNorm -- no target, no renormalisation.
+        GradNorm balances only the other (auxiliary) objectives, and their lambdas are
+        renormalised to sum to `aux_budget` (None: their count). Under renorm_scope
+        "active" the active auxiliaries share `aux_budget * n_active / n_enabled`, which
+        is the full budget whenever every auxiliary is active.
         """
         if renorm_scope not in RENORM_SCOPES:
             raise ValueError(
@@ -71,6 +81,28 @@ class GradNormController:
         if unknown:
             raise ValueError(f"Unknown objectives {unknown}; choose from {OBJECTIVE_ORDER}")
         self._enabled_indices = [self._obj_to_idx[n] for n in OBJECTIVE_ORDER if n in enabled]
+        if primary_objective is not None and primary_objective not in self._obj_to_idx:
+            raise ValueError(
+                f"Unknown primary_objective '{primary_objective}'; choose from {OBJECTIVE_ORDER}"
+            )
+        if aux_budget is not None:
+            if primary_objective is None:
+                raise ValueError("aux_budget requires primary_objective")
+            if not aux_budget > 0:
+                raise ValueError(f"aux_budget must be > 0, got {aux_budget}")
+        self.primary_objective = primary_objective
+        self.aux_budget = aux_budget
+        self._primary_idx = (
+            self._obj_to_idx[primary_objective] if primary_objective is not None else None
+        )
+        self._enabled_aux_indices = [i for i in self._enabled_indices if i != self._primary_idx]
+        if aux_budget is not None and self._enabled_aux_indices:
+            # Start the auxiliaries on the budget instead of at 1 each, so the first steps
+            # (before the first renormalisation) already weight them as configured.
+            with torch.no_grad():
+                self.log_lambdas[self._enabled_aux_indices] = math.log(
+                    aux_budget / len(self._enabled_aux_indices)
+                )
 
     @property
     def lambdas(self) -> torch.Tensor:
@@ -96,9 +128,12 @@ class GradNormController:
             if name not in self.initial_losses:
                 self.initial_losses[name] = loss.detach().float().item()
 
-        active_names = list(active_losses.keys())
+        # The primary objective is weighted at a fixed 1 and is not balanced: GradNorm
+        # sees only the auxiliary objectives.
+        active_names = [n for n in active_losses.keys() if n != self.primary_objective]
+        if len(active_names) == 0:
+            return None
         active_indices = [self._obj_to_idx[n] for n in active_names]
-        num_active = len(active_names)
 
         # REV-120 / design D7: G_t is built in its FACTORED form, `lambda_t * ||grad_W L_t||`,
         # with the norm detached and `create_graph=False`. lambda_t is a scalar held in
@@ -157,22 +192,27 @@ class GradNormController:
         if self.renorm_scope == "enabled":
             # Active objectives are always enabled; the union guards a caller that passes
             # an objective it did not declare.
-            self._renormalize(sorted(set(self._enabled_indices) | set(active_indices)))
+            indices = sorted(set(self._enabled_aux_indices) | set(active_indices))
+            target = self.aux_budget if self.aux_budget is not None else len(indices)
         else:
-            self._renormalize(active_indices)
+            indices = active_indices
+            target = len(indices)
+            if self.aux_budget is not None:
+                target = self.aux_budget * len(indices) / max(len(self._enabled_aux_indices), 1)
+        self._renormalize(indices, target)
 
         return gradnorm_loss.detach()
 
-    def _renormalize(self, active_indices: List[int]) -> None:
+    def _renormalize(self, active_indices: List[int], target: Optional[float] = None) -> None:
         """Rescale the given lambdas (the active ones, or every enabled one under
-        renorm_scope "enabled") to sum to their count.
+        renorm_scope "enabled") to sum to `target` (default: their count).
 
         specs/ablation-run D4: branch-free. `if renorm > 0:` was a host sync every step.
         Same elementwise arithmetic as the previous per-index loop (each index reads the
         lambdas before any of them is rewritten), and when renorm <= 0 the old values are
         kept exactly, as the branch did.
         """
-        num_active = len(active_indices)
+        num_active = len(active_indices) if target is None else target
         with torch.no_grad():
             idx = torch.tensor(active_indices, device=self.log_lambdas.device)
             lam = self.lambdas[idx]

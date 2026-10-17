@@ -67,6 +67,9 @@ def parse_args(argv=None):
     p.add_argument("--logit-scale-max", type=float, default=None)
     p.add_argument("--shared-logit-temperature", action="store_true")
     p.add_argument("--gradnorm-renorm-scope", default=None, choices=["active", "enabled"])
+    p.add_argument("--gradnorm-primary-objective", default=None,
+                   choices=["next_item", "masked_item", "multi_step", "contrastive"])
+    p.add_argument("--gradnorm-aux-budget", type=float, default=None)
     p.add_argument("--contrastive-interval", type=int, default=None)
     p.add_argument("--sequence-length-grid", type=int, nargs="+", default=None)
     p.add_argument("--processed-dir", default=None,
@@ -175,14 +178,15 @@ def study_command(
 
 
 def training_option_flags(args) -> List[str]:
-    """The optional training flags (logit scale, GradNorm scope, contrastive interval)
-    the package was asked to pass through; empty when none was given."""
+    """The optional training flags (logit scale, GradNorm scope and primary objective,
+    contrastive interval) the package was asked to pass through; empty when none was
+    given."""
     out: List[str] = []
-    for name in ("logit_temperature", "logit_scale_max"):
+    for name in ("logit_temperature", "logit_scale_max", "gradnorm_aux_budget"):
         value = getattr(args, name, None)
         if value is not None:
             out += [f"--{name}", repr(float(value))]
-    for name in ("gradnorm_renorm_scope", "contrastive_interval"):
+    for name in ("gradnorm_renorm_scope", "gradnorm_primary_objective", "contrastive_interval"):
         value = getattr(args, name, None)
         if value is not None:
             out += [f"--{name}", str(value)]

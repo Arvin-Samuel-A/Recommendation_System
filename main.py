@@ -11,7 +11,7 @@ from typing import Optional
 import numpy as np
 import torch
 
-from configs.config import Config
+from configs.config import OBJECTIVE_ORDER, Config
 from models.transformer import VALID_BACKENDS
 from utils import set_seed
 
@@ -160,6 +160,15 @@ def parse_args(argv=None):
              "over every enabled objective.",
     )
     parser.add_argument(
+        "--gradnorm_primary_objective", default=None, choices=OBJECTIVE_ORDER,
+        help="Fix this objective's GradNorm lambda at 1 and balance only the others.",
+    )
+    parser.add_argument(
+        "--gradnorm_aux_budget", type=float, default=None,
+        help="With --gradnorm_primary_objective: the auxiliary lambdas sum to this "
+             "(default: their count).",
+    )
+    parser.add_argument(
         "--contrastive_interval", type=int, default=None,
         help="Run the contrastive objective every N steps.",
     )
@@ -257,6 +266,8 @@ def apply_cli_overrides(config: Config, args) -> None:
         ("logit_temperature", "logit_temperature"),
         ("logit_scale_max", "logit_scale_max"),
         ("gradnorm_renorm_scope", "gradnorm_renorm_scope"),
+        ("gradnorm_primary_objective", "gradnorm_primary_objective"),
+        ("gradnorm_aux_budget", "gradnorm_aux_budget"),
         ("contrastive_interval", "contrastive_interval"),
     ):
         value = getattr(args, flag, None)
