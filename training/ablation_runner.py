@@ -267,6 +267,19 @@ _RUNTIME_ONLY_FIELDS = frozenset({"num_workers", "pin_memory", "resume_training"
 TRAINING_SEMANTICS_VERSION = 2
 
 
+#: Training fields added after TRAINING_SEMANTICS_VERSION 2, with the value that
+#: reproduces the code before them. At that value a field is left out of the payload, so
+#: every fingerprint computed before it existed stays valid (backbones are reused, `last.pt`
+#: resumes); any other value is hashed and changes the fingerprint.
+_DEFAULT_OMITTED_FIELDS = {
+    "logit_temperature": 1.0,
+    "learnable_logit_scale": False,
+    "logit_scale_max": 100.0,
+    "shared_logit_temperature": False,
+    "gradnorm_renorm_scope": "active",
+}
+
+
 def _training_fields(cfg_dict: dict) -> dict:
     """The training-relevant subset of an `asdict(Config)` (the fingerprint's field set).
 
@@ -276,6 +289,8 @@ def _training_fields(cfg_dict: dict) -> dict:
         k: v for k, v in cfg_dict.items()
         if k not in POST_TRAINING_ONLY_FIELDS and k not in _PATH_FIELDS
         and k not in _RUN_SELECTION_FIELDS and k not in _RUNTIME_ONLY_FIELDS
+        and not (k in _DEFAULT_OMITTED_FIELDS and v == _DEFAULT_OMITTED_FIELDS[k]
+                 and type(v) is type(_DEFAULT_OMITTED_FIELDS[k]))
     }
 
 

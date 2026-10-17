@@ -182,6 +182,13 @@ def score_candidates_batch(
                 item_embs = l2_normalize(item_embs)
 
             scores = torch.einsum("bd,bcd->bc", user_emb, item_embs)
+            # The training logit scale (`logit_temperature` / `learnable_logit_scale`,
+            # training/losses.LogitScale) is deliberately NOT applied: every metric here
+            # depends only on the rank of the target among the candidates, and ranks are
+            # invariant to multiplying all scores by a positive scalar (ties included).
+            # Validation, test, cold-start, long-tail, federated and personalisation
+            # scoring all go through this function; the ANN path
+            # (models/ann_retrieval.py) takes a top-k over the same cosines.
 
             if temperature != 1.0:
                 scores = scores / temperature

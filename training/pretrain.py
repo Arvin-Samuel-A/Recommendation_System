@@ -25,9 +25,13 @@ from training.losses import (
     static_weighted_sum,
     has_valid_signal,
     normalize_item_table,
+    LogitScale,
+    clamp_logit_scales_,
+    learnable_logit_scale_parameters,
+    learnable_logit_scale_values,
 )
 from training.gradnorm import (
-    GradNormController, get_anchor_layer_params,
+    GradNormController, enabled_objectives, get_anchor_layer_params,
 )
 from data.augmentation import augment_sequence
 from data.sequence_generator import (
@@ -380,6 +384,8 @@ def train_one_step(
         scaler.update()
     else:
         optimizer.step()
+    # Learnable logit scales back inside their bound (a no-op without them).
+    clamp_logit_scales_(loss_fns)
     scheduler.step()
 
     # specs/ablation-run D4: 0-d device tensors, not `.item()` (one sync each). They
@@ -498,6 +504,7 @@ def log_epoch(
     val_metrics: Dict[str, Dict[str, float]],
     lr: float,
     gradnorm: Optional[GradNormController],
+    loss_fns: Optional[dict] = None,
 ) -> None:
     parts = [f"epoch={epoch}"]
     parts.append(f"train_loss_total={train_losses.get('total', 0.0):.6f}")
@@ -513,6 +520,9 @@ def log_epoch(
         lambdas = gradnorm.lambdas.detach().cpu()
         for i, obj_name in enumerate(OBJECTIVE_ORDER):
             parts.append(f"lambda_{obj_name}={lambdas[i].item():.6f}")
+    # Only learnable scales are logged; a fixed one is 1/logit_temperature in the config.
+    for obj_name, value in learnable_logit_scale_values(loss_fns or {}).items():
+        parts.append(f"logit_scale_{obj_name}={value:.6f}")
     # AC-09: the per-epoch log is the artifact REV-129 had to reconstruct a timeline to
     # date. Stamping each line makes "which code wrote this number?" a lookup.
     revision = get_source_revision()
@@ -571,21 +581,58 @@ def plot_gradnorm_trajectory(config: Config, model_name: str) -> None:
     plt.close(fig)
 
 
+def build_logit_scale(config: Config, device: Optional[torch.device] = None) -> LogitScale:
+    """One objective's logit scale from the config (fixed 1/logit_temperature, or a
+    learnable fp32 log-scale with that init). Identity at the defaults."""
+    scale = LogitScale(
+        config.logit_temperature, learnable=config.learnable_logit_scale,
+        max_scale=config.logit_scale_max,
+    )
+    return scale.to(device) if device is not None else scale
+
+
 def _build_loss_fns(config: Config, device: torch.device) -> dict:
     dtype = resolve_param_dtype(config)
     norm = config.normalize_embeddings
     loss_fns = {
-        "next_item": SampledSoftmaxLoss(normalize_embeddings=norm),
+        "next_item": SampledSoftmaxLoss(
+            normalize_embeddings=norm, logit_scale=build_logit_scale(config, device),
+        ),
     }
     if config.use_masked_lm:
-        loss_fns["masked_item"] = MaskedItemLoss(normalize_embeddings=norm)
+        loss_fns["masked_item"] = MaskedItemLoss(
+            normalize_embeddings=norm, logit_scale=build_logit_scale(config, device),
+        )
     if config.use_multi_step:
-        loss_fns["multi_step"] = MultiStepLoss(
+        multi_step = MultiStepLoss(
             config.hidden_dim, config.multi_step_k, normalize_embeddings=norm,
         ).to(device=device, dtype=dtype)
+        # Attached after the dtype cast so a learnable log-scale stays fp32.
+        multi_step.logit_scale = build_logit_scale(config, device)
+        loss_fns["multi_step"] = multi_step
     if config.use_contrastive:
-        loss_fns["contrastive"] = InfoNCELoss(config.contrastive_temperature)
+        if not config.shared_logit_temperature:
+            loss_fns["contrastive"] = InfoNCELoss(config.contrastive_temperature)
+        elif config.learnable_logit_scale:
+            loss_fns["contrastive"] = InfoNCELoss(
+                config.logit_temperature, logit_scale=build_logit_scale(config, device),
+            )
+        else:
+            loss_fns["contrastive"] = InfoNCELoss(config.logit_temperature)
     return loss_fns
+
+
+def build_optimizer_param_groups(params: List[torch.nn.Parameter], loss_fns: dict):
+    """`params` as-is, or -- when learnable logit scales exist -- two groups with the
+    scales excluded from weight decay (decay would pull log-scale toward 0, i.e. scale
+    toward 1, as CLIP's recipe avoids)."""
+    scale_ids = {id(p) for p in learnable_logit_scale_parameters(loss_fns)}
+    if not scale_ids:
+        return params
+    return [
+        {"params": [p for p in params if id(p) not in scale_ids]},
+        {"params": [p for p in params if id(p) in scale_ids], "weight_decay": 0.0},
+    ]
 
 
 ROUTING_BUFFER_MAX_BATCHES = 256
@@ -977,7 +1024,7 @@ def run_pretrain(config: Config, model_name: str) -> Dict[str, float]:
     # registered in it.
     loss_fns = _build_loss_fns(config, device)
     optimizer = torch.optim.AdamW(
-        collect_trainable_parameters(model, moe, loss_fns),
+        build_optimizer_param_groups(collect_trainable_parameters(model, moe, loss_fns), loss_fns),
         lr=config.learning_rate,
         weight_decay=config.weight_decay,
         fused=True,
@@ -997,7 +1044,11 @@ def run_pretrain(config: Config, model_name: str) -> Dict[str, float]:
 
     gradnorm = None
     if config.use_gradnorm:
-        gradnorm = GradNormController(config.gradnorm_alpha, config.gradnorm_lr)
+        gradnorm = GradNormController(
+            config.gradnorm_alpha, config.gradnorm_lr,
+            renorm_scope=config.gradnorm_renorm_scope,
+            enabled_objectives=enabled_objectives(config),
+        )
         gradnorm.log_lambdas = torch.nn.Parameter(gradnorm.log_lambdas.data.to(device=device))
         gradnorm.optimizer = torch.optim.Adam([gradnorm.log_lambdas], lr=config.gradnorm_lr)
 
@@ -1213,7 +1264,10 @@ def run_pretrain(config: Config, model_name: str) -> Dict[str, float]:
         epoch_mean_losses.append(avg_losses.get("total", float("nan")))
 
         current_lr = scheduler.get_last_lr()[0]
-        log_epoch(epoch_logger, epoch, avg_losses, val_metrics, current_lr, gradnorm)
+        log_epoch(
+            epoch_logger, epoch, avg_losses, val_metrics, current_lr, gradnorm,
+            loss_fns=loss_fns,
+        )
 
         if (
             config.routing_diag_interval_epochs > 0
@@ -1282,10 +1336,14 @@ def run_pretrain(config: Config, model_name: str) -> Dict[str, float]:
     if gradnorm is not None:
         plot_gradnorm_trajectory(config, model_name)
 
-    return {
+    result = {
         "best_val_ndcg": best_val_ndcg,
         "best_epoch": best_epoch,
         "epoch_mean_losses": epoch_mean_losses,
         "epoch_loss_windows": epoch_loss_windows,
         "val_popularity_reference": val_popularity_reference,
     }
+    final_scales = learnable_logit_scale_values(loss_fns)
+    if final_scales:
+        result["final_logit_scales"] = final_scales
+    return result

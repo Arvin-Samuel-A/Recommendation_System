@@ -60,6 +60,14 @@ def parse_args(argv=None):
     p.add_argument("--max-retries", type=int, default=20)
     p.add_argument("--retry-wait", type=int, default=300)
     p.add_argument("--out", default="dist")
+    # Training options passed through to every main.py command when given (absent = not
+    # rendered, so the configured defaults apply and the commands are unchanged).
+    p.add_argument("--logit-temperature", type=float, default=None)
+    p.add_argument("--learnable-logit-scale", action="store_true")
+    p.add_argument("--logit-scale-max", type=float, default=None)
+    p.add_argument("--shared-logit-temperature", action="store_true")
+    p.add_argument("--gradnorm-renorm-scope", default=None, choices=["active", "enabled"])
+    p.add_argument("--contrastive-interval", type=int, default=None)
     p.add_argument("--processed-dir", default=None,
                    help="Default: derived exactly as main.py derives it from the fraction/seed.")
     p.add_argument("--h100-ssh", default=None, help="ssh destination or config alias")
@@ -159,9 +167,28 @@ def study_command(
         "--attention_backend", backend,
         "--num_workers", str(args.num_workers),
     ]
+    parts += training_option_flags(args)
     if arms:
         parts += ["--arms", ",".join(arms)]
     return " ".join(parts)
+
+
+def training_option_flags(args) -> List[str]:
+    """The optional training flags (logit scale, GradNorm scope, contrastive interval)
+    the package was asked to pass through; empty when none was given."""
+    out: List[str] = []
+    for name in ("logit_temperature", "logit_scale_max"):
+        value = getattr(args, name, None)
+        if value is not None:
+            out += [f"--{name}", repr(float(value))]
+    for name in ("gradnorm_renorm_scope", "contrastive_interval"):
+        value = getattr(args, name, None)
+        if value is not None:
+            out += [f"--{name}", str(value)]
+    for name in ("learnable_logit_scale", "shared_logit_temperature"):
+        if getattr(args, name, False):
+            out.append(f"--{name}")
+    return out
 
 
 def study_argv(args, backend: str, study: str) -> List[str]:

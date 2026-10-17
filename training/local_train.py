@@ -19,7 +19,7 @@ from models.lora import (
     load_lora_state_dict,
     count_lora_parameters,
 )
-from training.losses import SampledSoftmaxLoss
+from training.losses import LogitScale, SampledSoftmaxLoss
 from training.pretrain import build_model, load_checkpoint
 from evaluation.metrics import evaluate_model, score_candidates, compute_metrics
 from data.sequence_generator import (
@@ -121,7 +121,13 @@ def train_user_lora(
     # because 100 is truthy and `normalize_embeddings` defaults to True; with
     # `normalize_embeddings=False` the adapter would have been trained under a different
     # scoring geometry than `score_candidates` evaluates it in.
-    loss_fn = SampledSoftmaxLoss(normalize_embeddings=config.normalize_embeddings)
+    # The adapter trains on the backbone's next-item logit scale, fixed at
+    # 1/logit_temperature (a learned backbone scale is not carried over; it is frozen
+    # with the backbone in spirit, and the init is its reference value). Identity at 1.0.
+    loss_fn = SampledSoftmaxLoss(
+        normalize_embeddings=config.normalize_embeddings,
+        logit_scale=LogitScale(config.logit_temperature),
+    )
     mask_id = config.num_items + 1
 
     for epoch in range(config.local_epochs):

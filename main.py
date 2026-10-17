@@ -135,6 +135,34 @@ def parse_args(argv=None):
         "--arms", default=None,
         help="Ablations only: comma-separated arm labels of ONE --study to run.",
     )
+    # Logit scale / GradNorm options for capped experiments. Absent = the configured
+    # values (whose defaults reproduce the previous training exactly).
+    parser.add_argument(
+        "--logit_temperature", type=float, default=None,
+        help="Divide next-item, masked-item and multi-step cosine logits by this (> 0).",
+    )
+    parser.add_argument(
+        "--learnable_logit_scale", action="store_true", default=False,
+        help="Learn each objective's logit scale (log-param, init 1/logit_temperature).",
+    )
+    parser.add_argument(
+        "--logit_scale_max", type=float, default=None,
+        help="Upper clamp of a learnable logit scale (default 100).",
+    )
+    parser.add_argument(
+        "--shared_logit_temperature", action="store_true", default=False,
+        help="Contrastive uses logit_temperature (and a learnable scale with "
+             "--learnable_logit_scale) instead of contrastive_temperature.",
+    )
+    parser.add_argument(
+        "--gradnorm_renorm_scope", default=None, choices=["active", "enabled"],
+        help="GradNorm renormalisation over this step's active objectives (default) or "
+             "over every enabled objective.",
+    )
+    parser.add_argument(
+        "--contrastive_interval", type=int, default=None,
+        help="Run the contrastive objective every N steps.",
+    )
     parser.add_argument(
         "--allow_incomplete", action="store_true", default=False,
         help="ablation_collect / ablation_rescore: assemble a study even if arms are missing/failed/stale "
@@ -226,6 +254,10 @@ def apply_cli_overrides(config: Config, args) -> None:
         ("attention_backend", "attention_backend"),
         ("num_workers", "num_workers"),
         ("min_lr_ratio", "min_lr_ratio"),
+        ("logit_temperature", "logit_temperature"),
+        ("logit_scale_max", "logit_scale_max"),
+        ("gradnorm_renorm_scope", "gradnorm_renorm_scope"),
+        ("contrastive_interval", "contrastive_interval"),
     ):
         value = getattr(args, flag, None)
         if value is not None:
@@ -235,6 +267,10 @@ def apply_cli_overrides(config: Config, args) -> None:
         grid = list(args.sequence_length_grid)
         overrides.append(("sequence_length_grid", config.sequence_length_grid, grid))
         config.sequence_length_grid = grid
+    for flag in ("learnable_logit_scale", "shared_logit_temperature"):
+        if getattr(args, flag, False):
+            overrides.append((flag, getattr(config, flag), True))
+            setattr(config, flag, True)
     if getattr(args, "no_resume", False):
         overrides.append(("resume_training", config.resume_training, False))
         config.resume_training = False

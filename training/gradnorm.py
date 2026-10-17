@@ -28,14 +28,49 @@ def get_anchor_layer_params(model: nn.Module, config=None) -> List[nn.Parameter]
     return [p for p in last_block.parameters() if p.requires_grad]
 
 
+RENORM_SCOPES = ("active", "enabled")
+
+
+def enabled_objectives(config) -> List[str]:
+    """The objectives a config trains, in OBJECTIVE_ORDER (next_item is always on)."""
+    flags = {
+        "next_item": True,
+        "masked_item": config.use_masked_lm,
+        "multi_step": config.use_multi_step,
+        "contrastive": config.use_contrastive,
+    }
+    return [name for name in OBJECTIVE_ORDER if flags[name]]
+
+
 class GradNormController:
-    def __init__(self, alpha: float, lr: float):
+    def __init__(
+        self, alpha: float, lr: float, renorm_scope: str = "active",
+        enabled_objectives: Optional[List[str]] = None,
+    ):
+        """`renorm_scope`: which lambdas `_renormalize` rescales after each update.
+
+        "active" (default, the original behaviour): only this step's active objectives,
+        to sum to their count. "enabled": every objective in `enabled_objectives`
+        (default: all of OBJECTIVE_ORDER), active this step or not, to sum to their
+        count -- so an intermittent objective's lambda is not reset by the steps it
+        skips. Disabled objectives keep lambda 1 either way and are never rescaled.
+        """
+        if renorm_scope not in RENORM_SCOPES:
+            raise ValueError(
+                f"Unknown renorm_scope '{renorm_scope}'. Choose from {list(RENORM_SCOPES)}"
+            )
         self.alpha = alpha
         self.num_objectives = len(OBJECTIVE_ORDER)
         self.log_lambdas = nn.Parameter(torch.zeros(self.num_objectives))
         self.optimizer = torch.optim.Adam([self.log_lambdas], lr=lr)
         self.initial_losses: Dict[str, float] = {}
         self._obj_to_idx = {name: i for i, name in enumerate(OBJECTIVE_ORDER)}
+        self.renorm_scope = renorm_scope
+        enabled = list(OBJECTIVE_ORDER) if enabled_objectives is None else list(enabled_objectives)
+        unknown = [n for n in enabled if n not in self._obj_to_idx]
+        if unknown:
+            raise ValueError(f"Unknown objectives {unknown}; choose from {OBJECTIVE_ORDER}")
+        self._enabled_indices = [self._obj_to_idx[n] for n in OBJECTIVE_ORDER if n in enabled]
 
     @property
     def lambdas(self) -> torch.Tensor:
@@ -119,12 +154,18 @@ class GradNormController:
         self.log_lambdas.grad = lambda_grad.detach()
         self.optimizer.step()
 
-        self._renormalize(active_indices)
+        if self.renorm_scope == "enabled":
+            # Active objectives are always enabled; the union guards a caller that passes
+            # an objective it did not declare.
+            self._renormalize(sorted(set(self._enabled_indices) | set(active_indices)))
+        else:
+            self._renormalize(active_indices)
 
         return gradnorm_loss.detach()
 
     def _renormalize(self, active_indices: List[int]) -> None:
-        """Rescale the active lambdas to sum to the number of active objectives.
+        """Rescale the given lambdas (the active ones, or every enabled one under
+        renorm_scope "enabled") to sum to their count.
 
         specs/ablation-run D4: branch-free. `if renorm > 0:` was a host sync every step.
         Same elementwise arithmetic as the previous per-index loop (each index reads the

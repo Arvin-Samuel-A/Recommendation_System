@@ -1,7 +1,9 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple, Optional
+from typing import List, Optional, Tuple
 
 from models.transformer import l2_normalize
 
@@ -50,13 +52,115 @@ def _shared_normalized_table(
     return l2_normalize(item_emb_weight)
 
 
+class LogitScale(nn.Module):
+    """Multiplies an objective's logits by 1/temperature, fixed or learnable.
+
+    Fixed (the default): a Python float. At temperature 1.0 `forward` returns its input
+    unchanged, so the default adds no op and no parameter -- training is bit-identical to
+    the code before this module existed.
+
+    Learnable (CLIP-style): `log_scale` is an fp32 parameter initialised to
+    log(1/temperature). The forward clamps its value at log(max_scale) straight-through
+    (gradient kept), and `clamp_logit_scales_` clamps the stored value after every
+    optimizer step, so the scale sits at the bound with a live gradient and can come
+    back down from it. The parameter stays fp32 even when the model is pure bf16: a
+    bf16 log-scale near 2.66 has a resolution of 0.016, coarser than one AdamW step.
+
+    Evaluation never applies it: ranking candidates is invariant to a positive scalar, so
+    `score_candidates_batch` and the ANN retrieval rank raw cosines (see there).
+    """
+
+    def __init__(self, temperature: float = 1.0, learnable: bool = False,
+                 max_scale: float = 100.0):
+        super().__init__()
+        if not temperature > 0:
+            raise ValueError(f"temperature must be > 0, got {temperature}")
+        self.learnable = learnable
+        self.max_log_scale = math.log(max_scale)
+        if learnable:
+            init = math.log(1.0 / temperature)
+            if init > self.max_log_scale + 1e-12:
+                raise ValueError(
+                    f"initial scale 1/{temperature:g} exceeds max_scale {max_scale:g}"
+                )
+            self.log_scale = nn.Parameter(torch.tensor(init, dtype=torch.float32))
+            self.fixed_scale = None
+        else:
+            self.fixed_scale = 1.0 / temperature
+
+    def scale(self):
+        """The current multiplier: a 0-d tensor (learnable) or a float (fixed)."""
+        if self.learnable:
+            # Straight-through clamp: the value never exceeds the bound, but the gradient
+            # is that of the unclamped log-scale. A plain `clamp` has zero gradient at and
+            # past the bound (fp32 rounding of log(max) puts a clamped value just past
+            # it), so the scale could never be pulled back down once it got there.
+            over = (self.log_scale - self.max_log_scale).clamp(min=0).detach()
+            return (self.log_scale - over).exp()
+        return self.fixed_scale
+
+    def forward(self, logits: torch.Tensor) -> torch.Tensor:
+        if not self.learnable:
+            if self.fixed_scale == 1.0:
+                return logits
+            return logits * self.fixed_scale
+        # A 0-d fp32 tensor times a bf16 tensor stays bf16, so the loss dtypes are those
+        # of the unscaled path.
+        return logits * self.scale()
+
+    @torch.no_grad()
+    def clamp_(self) -> None:
+        if self.learnable:
+            self.log_scale.clamp_(max=self.max_log_scale)
+
+    def extra_repr(self) -> str:
+        if self.learnable:
+            return f"learnable, max_scale={math.exp(self.max_log_scale):g}"
+        return f"fixed scale={self.fixed_scale:g}"
+
+
+def logit_scales(loss_fns: dict) -> dict:
+    """`{objective: LogitScale}` for every loss module that has one."""
+    out = {}
+    for name, fn in loss_fns.items():
+        scale = getattr(fn, "logit_scale", None)
+        if isinstance(scale, LogitScale):
+            out[name] = scale
+    return out
+
+
+def learnable_logit_scale_parameters(loss_fns: dict) -> List[nn.Parameter]:
+    return [s.log_scale for s in logit_scales(loss_fns).values() if s.learnable]
+
+
+def clamp_logit_scales_(loss_fns: dict) -> None:
+    """Clamp every learnable scale to its bound; call after each optimizer step."""
+    for scale in logit_scales(loss_fns).values():
+        if scale.learnable:
+            scale.clamp_()
+
+
+def learnable_logit_scale_values(loss_fns: dict) -> dict:
+    """`{objective: current scale}` of the learnable scales, as floats (one sync each)."""
+    return {
+        name: float(scale.scale().detach())
+        for name, scale in logit_scales(loss_fns).items() if scale.learnable
+    }
+
+
+def _scale_or_identity(logit_scale: Optional[LogitScale]) -> LogitScale:
+    return logit_scale if logit_scale is not None else LogitScale()
+
+
 class SampledSoftmaxLoss(nn.Module):
-    def __init__(self, normalize_embeddings: bool = False):
+    def __init__(self, normalize_embeddings: bool = False,
+                 logit_scale: Optional[LogitScale] = None):
         # REV-049: the number of negatives is implied by `neg_ids.shape[-1]` and is not a
         # constructor argument. `training/local_train.py` used to pass it positionally,
         # which raised TypeError on the first call and blocked every personalization run.
         super().__init__()
         self.normalize_embeddings = normalize_embeddings
+        self.logit_scale = _scale_or_identity(logit_scale)
 
     def forward(
         self,
@@ -75,15 +179,17 @@ class SampledSoftmaxLoss(nn.Module):
         pos_score = (user_emb * pos_emb).sum(dim=-1, keepdim=True)
         neg_scores = torch.bmm(neg_emb, user_emb.unsqueeze(-1)).squeeze(-1)
 
-        logits = torch.cat([pos_score, neg_scores], dim=-1)
+        logits = self.logit_scale(torch.cat([pos_score, neg_scores], dim=-1))
         labels = torch.zeros(logits.shape[0], dtype=torch.long, device=logits.device)
         return F.cross_entropy(logits, labels)
 
 
 class MaskedItemLoss(nn.Module):
-    def __init__(self, normalize_embeddings: bool = False):
+    def __init__(self, normalize_embeddings: bool = False,
+                 logit_scale: Optional[LogitScale] = None):
         super().__init__()
         self.normalize_embeddings = normalize_embeddings
+        self.logit_scale = _scale_or_identity(logit_scale)
 
     def forward(
         self,
@@ -105,12 +211,13 @@ class MaskedItemLoss(nn.Module):
         w = _shared_normalized_table(
             item_emb_weight, normalized_item_emb, self.normalize_embeddings,
         )
-        logits = h @ w.T
+        logits = self.logit_scale(h @ w.T)
         return F.cross_entropy(logits, masked_targets)
 
 
 class MultiStepLoss(nn.Module):
-    def __init__(self, hidden_dim: int, multi_step_k: int, normalize_embeddings: bool = False):
+    def __init__(self, hidden_dim: int, multi_step_k: int, normalize_embeddings: bool = False,
+                 logit_scale: Optional[LogitScale] = None):
         super().__init__()
         self.step_projections = nn.ModuleList([
             nn.Linear(hidden_dim, hidden_dim, bias=False)
@@ -118,6 +225,10 @@ class MultiStepLoss(nn.Module):
         ])
         self.multi_step_k = multi_step_k
         self.normalize_embeddings = normalize_embeddings
+        # One scale for the objective, shared by its k horizons. A learnable scale must be
+        # attached AFTER any `.to(dtype=...)` of this module, so it stays fp32 (see
+        # `training.pretrain._build_loss_fns`).
+        self.logit_scale = _scale_or_identity(logit_scale)
 
     def forward(
         self,
@@ -157,7 +268,7 @@ class MultiStepLoss(nn.Module):
             valid_hidden = _maybe_normalize(projected[valid_mask], self.normalize_embeddings)
             valid_targets = step_targets[valid_mask]
 
-            logits = valid_hidden @ w.T
+            logits = self.logit_scale(valid_hidden @ w.T)
             step_loss = F.cross_entropy(logits, valid_targets)
             total_loss = total_loss + step_loss
             valid_steps += 1
@@ -169,9 +280,13 @@ class MultiStepLoss(nn.Module):
 
 
 class InfoNCELoss(nn.Module):
-    def __init__(self, temperature: float = 0.07):
+    def __init__(self, temperature: float = 0.07, logit_scale: Optional[LogitScale] = None):
+        """`logit_scale`, when given (`shared_logit_temperature` with a learnable scale),
+        replaces the fixed division by `temperature`."""
         super().__init__()
         self.temperature = temperature
+        if logit_scale is not None:
+            self.logit_scale = logit_scale
 
     def forward(self, z_orig: torch.Tensor, z_aug: torch.Tensor) -> torch.Tensor:
         # InfoNCE is computed in fp32 by design; under mixed precision autocast would
@@ -186,7 +301,10 @@ class InfoNCELoss(nn.Module):
         z = torch.cat([z_orig, z_aug], dim=0)
         B2 = z.shape[0]
 
-        sim = z @ z.T / self.temperature
+        if hasattr(self, "logit_scale"):
+            sim = self.logit_scale(z @ z.T)
+        else:
+            sim = z @ z.T / self.temperature
 
         mask = torch.eye(B2, device=z.device, dtype=torch.bool)
         sim = sim.masked_fill(mask, -1e9)

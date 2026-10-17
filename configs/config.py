@@ -104,12 +104,42 @@ class Config:
     contrastive_temperature: float = 0.07
     contrastive_weight: float = 1.0
 
+    # --- Loss: logit scale (next_item, masked_item, multi_step) ---
+    # Those three objectives score L2-normalised cosines, so their logits lie in [-1, 1]
+    # and their cross-entropy cannot fall below log(1 + (C-1)e^-2): 2.68 for next_item
+    # (C = 101 candidates, chance 4.62) and ~7.5 for the full-catalogue objectives
+    # (C ~ 13.5k, chance ~9.5). Logits are multiplied by 1/logit_temperature. 1.0 is the
+    # previous behaviour exactly (no op is applied).
+    logit_temperature: float = 1.0
+    # CLIP-style learnable scale, stored as log(scale), initialised to log(1/
+    # logit_temperature), and clamped to <= logit_scale_max (after every optimizer step
+    # and inside the forward). ONE SCALE PER OBJECTIVE, not one shared: the objectives
+    # rank different candidate sets (101 sampled, ~13.5k full catalogue, 2B-1 in-batch),
+    # whose CE-optimal scale differs, and a shared scalar would be pulled between them.
+    # Each scale lives in its loss module (so `loss_fns_state_dict` checkpoints it), is
+    # excluded from weight decay, and is logged per epoch. Per-user LoRA training uses the
+    # fixed 1/logit_temperature, not the learned value.
+    learnable_logit_scale: bool = False
+    logit_scale_max: float = 100.0
+    # True: contrastive uses logit_temperature (and, with learnable_logit_scale, its own
+    # learnable scale with the same init and clamp) instead of contrastive_temperature,
+    # so all four objectives start on one logit scale. False: contrastive keeps its fixed
+    # 1/contrastive_temperature (the previous behaviour).
+    shared_logit_temperature: bool = False
+
     # --- GradNorm ---
     use_gradnorm: bool = True
     gradnorm_alpha: float = 1.5
     gradnorm_lr: float = 1e-2
     # REV-055: T3.3 specifies a config-driven anchor selection.
     gradnorm_anchor: str = "last_shared_transformer"
+    # Which lambdas are rescaled after each GradNorm step. "active" (the previous
+    # behaviour): only this step's active objectives, to sum to their count. An
+    # intermittent objective (contrastive, active every `contrastive_interval` steps) is
+    # then pinned near 1: the other lambdas are reset to sum to 3 on every step without
+    # it, so on its steps it can only take the remainder. "enabled": every enabled
+    # objective, active this step or not, to sum to the number of enabled objectives.
+    gradnorm_renorm_scope: str = "active"
 
     # --- Training ---
     pretrain_epochs: int = 20
@@ -312,6 +342,19 @@ class Config:
             raise ValueError(
                 f"hidden_dim ({self.hidden_dim}) must be divisible by "
                 f"num_heads ({self.num_heads})"
+            )
+        if not self.logit_temperature > 0:
+            raise ValueError(f"logit_temperature must be > 0, got {self.logit_temperature}")
+        if self.learnable_logit_scale and 1.0 / self.logit_temperature > self.logit_scale_max:
+            raise ValueError(
+                f"learnable_logit_scale: initial scale 1/logit_temperature = "
+                f"{1.0 / self.logit_temperature:g} exceeds logit_scale_max "
+                f"{self.logit_scale_max:g}"
+            )
+        if self.gradnorm_renorm_scope not in ("active", "enabled"):
+            raise ValueError(
+                f"Unknown gradnorm_renorm_scope '{self.gradnorm_renorm_scope}'. "
+                "Choose from 'active', 'enabled'"
             )
         if self.contrastive_interval == 0 and self.use_contrastive:
             raise ValueError(

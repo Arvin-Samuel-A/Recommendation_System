@@ -178,7 +178,11 @@ class Bench:
         sched = P.build_scheduler(opt, cfg, 100_000)
         gn = None
         if cfg.use_gradnorm:
-            gn = P.GradNormController(cfg.gradnorm_alpha, cfg.gradnorm_lr)
+            gn_kwargs = {}
+            if hasattr(P, "enabled_objectives"):  # older checkouts have no renorm scope
+                gn_kwargs = dict(renorm_scope=cfg.gradnorm_renorm_scope,
+                                 enabled_objectives=P.enabled_objectives(cfg))
+            gn = P.GradNormController(cfg.gradnorm_alpha, cfg.gradnorm_lr, **gn_kwargs)
             gn.log_lambdas = torch.nn.Parameter(gn.log_lambdas.data.to(device=device))
             gn.optimizer = torch.optim.Adam([gn.log_lambdas], lr=cfg.gradnorm_lr)
         scaler = utils.make_grad_scaler(cfg) if STEP_TAKES_SCALER and HAS_MIXED else None
