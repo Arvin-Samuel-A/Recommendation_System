@@ -33,6 +33,7 @@ from training.losses import (
 from training.gradnorm import (
     GradNormController, enabled_objectives, get_anchor_layer_params,
 )
+from training.grad_projection import project_conflicting_gradients, static_objective_weights
 from data.augmentation import augment_sequence
 from data.sequence_generator import (
     load_tensorised,
@@ -347,22 +348,32 @@ def train_one_step(
             assert torch.isfinite(loss), f"{name} loss is not finite: {loss.item()}"
         raise AssertionError(f"Total loss not finite: {L_total.item()}")
 
+    trainable = list(model.parameters()) + list(moe.parameters())
+    for fn in loss_fns.values():
+        trainable += list(fn.parameters())
+
     # REV-022a: code-quality.md requires set_to_none=True on the hot path.
     optimizer.zero_grad(set_to_none=True)
-    # fp16 only: scale the loss so small gradients do not underflow. GradNorm below
-    # differentiates the UNSCALED losses -- it needs only norms, which are dominated by
-    # the large components that fp16 represents fine, and scaling would add overflow.
-    (scaler.scale(L_total) if use_scaler else L_total).backward(
-        retain_graph=(gradnorm is not None),
-    )
+    projection_stats = {}
+    if config.grad_projection:
+        # One backward pass per objective; the projected sum is written into `.grad`.
+        # Config.validate keeps GradNorm and fp16 loss scaling out of this path.
+        projection_stats = project_conflicting_gradients(
+            active_losses, static_objective_weights(config),
+            [p for p in trainable if p.requires_grad], primary=config.grad_projection,
+        )
+    else:
+        # fp16 only: scale the loss so small gradients do not underflow. GradNorm below
+        # differentiates the UNSCALED losses -- it needs only norms, which are dominated
+        # by the large components that fp16 represents fine, and scaling would add
+        # overflow.
+        (scaler.scale(L_total) if use_scaler else L_total).backward(
+            retain_graph=(gradnorm is not None),
+        )
 
     if gradnorm is not None:
         anchor_params = get_anchor_layer_params(model, config)
         gradnorm.update(active_losses, anchor_params)
-
-    trainable = list(model.parameters()) + list(moe.parameters())
-    for fn in loss_fns.values():
-        trainable += list(fn.parameters())
 
     # REV-022c: FR-7 and AC-08 both require finite-value assertions on GRADIENTS.
     # A NaN appearing in gradients rather than in the loss scalar previously passed
@@ -393,6 +404,7 @@ def train_one_step(
     # epoch, producing the same floats.
     loss_values = {name: loss.detach() for name, loss in active_losses.items()}
     loss_values["total"] = L_total.detach()
+    loss_values.update(projection_stats)
     if skipped_objectives:
         loss_values["_skipped"] = skipped_objectives
 
@@ -520,6 +532,10 @@ def log_epoch(
         lambdas = gradnorm.lambdas.detach().cpu()
         for i, obj_name in enumerate(OBJECTIVE_ORDER):
             parts.append(f"lambda_{obj_name}={lambdas[i].item():.6f}")
+    # Gradient projection: per auxiliary, the epoch-mean cosine with next-item's gradient
+    # before projection and the fraction of steps it was projected.
+    for key in sorted(k for k in train_losses if k.startswith("proj_")):
+        parts.append(f"{key}={train_losses[key]:.4f}")
     # Only learnable scales are logged; a fixed one is 1/logit_temperature in the config.
     for obj_name, value in learnable_logit_scale_values(loss_fns or {}).items():
         parts.append(f"logit_scale_{obj_name}={value:.6f}")

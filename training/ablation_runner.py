@@ -36,6 +36,9 @@ STUDY_CONFIGS = {
         # `run_federated` (rounds, final val NDCG, cumulative KB); `personalization_mode`
         # stays "lora" because T2.2 names both, and federated training here IS LoRA-based.
         {"label": "arv_mmoe_gradnorm_lora", "use_masked_lm": True, "use_multi_step": True, "use_contrastive": True, "moe_variant": "arv_mmoe", "use_gradnorm": True, "personalization_mode": "lora", "system_eval": "communication"},
+        # GradNorm replaced by next-item-protected gradient projection, at the equal static
+        # weights of `arv_mmoe` (training/grad_projection.py).
+        {"label": "arv_mmoe_projection", "use_masked_lm": True, "use_multi_step": True, "use_contrastive": True, "moe_variant": "arv_mmoe", "use_gradnorm": False, "grad_projection": "next_item"},
     ],
     "B": [
         {"label": "objective_conditioned", "moe_variant": "arv_mmoe", "router_conditioning": "objective_conditioned"},
@@ -279,6 +282,7 @@ _DEFAULT_OMITTED_FIELDS = {
     "gradnorm_renorm_scope": "active",
     "gradnorm_primary_objective": "",
     "gradnorm_aux_budget": None,
+    "grad_projection": "",
 }
 
 #: GradNorm fields added after TRAINING_SEMANTICS_VERSION 2 that `run_pretrain` reads only

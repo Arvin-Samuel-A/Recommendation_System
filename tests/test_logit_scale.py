@@ -28,7 +28,7 @@ from training.losses import (
 NEW_FIELDS = (
     "logit_temperature", "learnable_logit_scale", "logit_scale_max",
     "shared_logit_temperature", "gradnorm_renorm_scope",
-    "gradnorm_primary_objective", "gradnorm_aux_budget",
+    "gradnorm_primary_objective", "gradnorm_aux_budget", "grad_projection",
 )
 
 
@@ -295,6 +295,8 @@ class TestFingerprint:
         assert _training_fingerprint(base) == self._legacy_fingerprint(base)
         for study in ("A", "D", "E"):
             for arm in resolve_study_configs(study, base):
+                if arm.grad_projection:  # an arm that exists only with the new field
+                    continue
                 assert _training_fingerprint(arm) == self._legacy_fingerprint(arm)
 
     @pytest.mark.parametrize("field,value", [

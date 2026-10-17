@@ -147,6 +147,12 @@ class Config:
     # `gradnorm_aux_budget` (None = their count, i.e. the same total as before).
     gradnorm_primary_objective: str = ""
     gradnorm_aux_budget: Optional[float] = None
+    # Gradient projection instead of GradNorm. "" (default): off. "next_item": each
+    # auxiliary gradient that conflicts with next-item's (negative dot product) loses its
+    # component along it; next-item's gradient is never changed. Uses the static weights
+    # (masked_lm_weight, ...), so it requires use_gradnorm=False. One backward pass per
+    # objective. See training/grad_projection.py.
+    grad_projection: str = ""
 
     # --- Training ---
     pretrain_epochs: int = 20
@@ -375,6 +381,14 @@ class Config:
                 raise ValueError(
                     f"gradnorm_aux_budget must be > 0, got {self.gradnorm_aux_budget}"
                 )
+        if self.grad_projection not in ("", "next_item"):
+            raise ValueError(
+                f"Unknown grad_projection '{self.grad_projection}'. Choose from '', 'next_item'"
+            )
+        if self.grad_projection and self.use_gradnorm:
+            raise ValueError("grad_projection replaces GradNorm: set use_gradnorm=False")
+        if self.grad_projection and self.dtype == "fp16":
+            raise ValueError("grad_projection does not support fp16 loss scaling")
         if self.contrastive_interval == 0 and self.use_contrastive:
             raise ValueError(
                 "contrastive_interval=0 is invalid; "
