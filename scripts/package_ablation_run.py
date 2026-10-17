@@ -71,6 +71,9 @@ def parse_args(argv=None):
                    choices=["next_item", "masked_item", "multi_step", "contrastive"])
     p.add_argument("--gradnorm-aux-budget", type=float, default=None)
     p.add_argument("--contrastive-interval", type=int, default=None)
+    p.add_argument("--epochs", type=int, default=None,
+                   help="pretrain_epochs for every arm (main.py --epochs). An --estimate-json "
+                        "measured at a different epoch count must be rescaled to match.")
     p.add_argument("--sequence-length-grid", type=int, nargs="+", default=None)
     p.add_argument("--processed-dir", default=None,
                    help="Default: derived exactly as main.py derives it from the fraction/seed.")
@@ -179,14 +182,15 @@ def study_command(
 
 def training_option_flags(args) -> List[str]:
     """The optional training flags (logit scale, GradNorm scope and primary objective,
-    contrastive interval) the package was asked to pass through; empty when none was
-    given."""
+    contrastive interval, epochs) the package was asked to pass through; empty when none
+    was given."""
     out: List[str] = []
     for name in ("logit_temperature", "logit_scale_max", "gradnorm_aux_budget"):
         value = getattr(args, name, None)
         if value is not None:
             out += [f"--{name}", repr(float(value))]
-    for name in ("gradnorm_renorm_scope", "gradnorm_primary_objective", "contrastive_interval"):
+    for name in ("gradnorm_renorm_scope", "gradnorm_primary_objective", "contrastive_interval",
+                 "epochs"):
         value = getattr(args, name, None)
         if value is not None:
             out += [f"--{name}", str(value)]

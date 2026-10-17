@@ -357,6 +357,17 @@ class TestCLI:
         assert base.logit_temperature == 0.07 and base.learnable_logit_scale is True
         assert base.gradnorm_renorm_scope == "enabled" and base.contrastive_interval == 1
 
+    def test_packager_passes_epochs_through(self):
+        import scripts.package_ablation_run as pkg
+
+        args = pkg.parse_args([])
+        assert "--epochs" not in pkg.study_command(args, "sdpa", "python3", study="A")
+        args = pkg.parse_args(["--epochs", "10"])
+        cmd = pkg.study_command(args, "sdpa", "python3", study="A", stage="ablation_collect")
+        assert "--epochs 10" in cmd
+        base = pkg.base_config_from_argv(pkg.study_argv(args, "sdpa", "A"))
+        assert base.pretrain_epochs == 10
+
     def test_packager_sequence_length_grid_narrows_study_h(self):
         import scripts.package_ablation_run as pkg
         from training.ablation_runner import resolve_study_configs
