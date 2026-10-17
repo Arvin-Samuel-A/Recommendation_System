@@ -356,6 +356,19 @@ class TestCLI:
         assert base.logit_temperature == 0.07 and base.learnable_logit_scale is True
         assert base.gradnorm_renorm_scope == "enabled" and base.contrastive_interval == 1
 
+    def test_packager_sequence_length_grid_narrows_study_h(self):
+        import scripts.package_ablation_run as pkg
+        from training.ablation_runner import resolve_study_configs
+
+        args = pkg.parse_args([])
+        assert "sequence_length_grid" not in pkg.study_command(args, "sdpa", "python3", study="H")
+        args.sequence_length_grid = [25, 50, 100]
+        cmd = pkg.study_command(args, "sdpa", "python3", study="H", stage="ablation_collect")
+        assert "--sequence_length_grid 25 50 100" in cmd
+        base = pkg.base_config_from_argv(pkg.study_argv(args, "sdpa", "H"))
+        labels = [c._study_label for c in resolve_study_configs("H", base)]
+        assert "H2_seq200" not in labels and "H2_seq100" in labels
+
 
 class TestCheckpointRoundTrip:
     def _run(self, tiny_processed_dir, tmp_path, **overrides):

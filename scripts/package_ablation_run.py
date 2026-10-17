@@ -68,6 +68,7 @@ def parse_args(argv=None):
     p.add_argument("--shared-logit-temperature", action="store_true")
     p.add_argument("--gradnorm-renorm-scope", default=None, choices=["active", "enabled"])
     p.add_argument("--contrastive-interval", type=int, default=None)
+    p.add_argument("--sequence-length-grid", type=int, nargs="+", default=None)
     p.add_argument("--processed-dir", default=None,
                    help="Default: derived exactly as main.py derives it from the fraction/seed.")
     p.add_argument("--h100-ssh", default=None, help="ssh destination or config alias")
@@ -188,6 +189,11 @@ def training_option_flags(args) -> List[str]:
     for name in ("learnable_logit_scale", "shared_logit_temperature"):
         if getattr(args, name, False):
             out.append(f"--{name}")
+    # Narrows study H's sequence-length sweep (e.g. drop seq200). Rendered on every
+    # command, collect included, so the planner and ablation_collect expect the same arms.
+    grid = getattr(args, "sequence_length_grid", None)
+    if grid:
+        out += ["--sequence_length_grid"] + [str(int(v)) for v in grid]
     return out
 
 
