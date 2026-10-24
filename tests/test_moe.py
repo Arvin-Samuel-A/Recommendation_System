@@ -75,6 +75,40 @@ class TestShapes:
         assert r_ut is None
 
 
+class TestPerPositionRouting:
+    """Objectives that predict at every position route each position from its own
+    hidden state, so routing never carries information from later items."""
+
+    @pytest.mark.parametrize("variant", ["arv_mmoe", "mmoe"])
+    def test_shapes_and_last_position_equals_pooled_routing(self, base_config, variant):
+        base_config.moe_variant = variant
+        torch.manual_seed(0)
+        moe = MoELayer(base_config).eval()
+        B, S, D = 3, 7, base_config.hidden_dim
+        all_hidden = torch.randn(B, S, D)
+
+        Z_pos, r_pos = moe(all_hidden, all_hidden, 0)
+        assert Z_pos.shape == (B, S, D)
+        assert r_pos.shape == (B, S, base_config.num_experts)
+
+        Z_pool, r_pool = moe(all_hidden, all_hidden[:, -1, :], 0)
+        assert torch.allclose(r_pos[:, -1], r_pool)
+        assert torch.allclose(Z_pos[:, -1], Z_pool[:, -1])
+
+    def test_a_position_does_not_depend_on_later_positions(self, base_config):
+        base_config.moe_variant = "arv_mmoe"
+        torch.manual_seed(0)
+        moe = MoELayer(base_config).eval()
+        B, S, D = 2, 6, base_config.hidden_dim
+        all_hidden = torch.randn(B, S, D)
+        Z, _ = moe(all_hidden, all_hidden, 0)
+        changed = all_hidden.clone()
+        changed[:, 3:] += 2.0
+        moe.clear_cache()
+        Z_changed, _ = moe(changed, changed, 0)
+        assert torch.allclose(Z[:, :3], Z_changed[:, :3])
+
+
 class TestRoutingDifferentiation:
     def test_different_objectives_different_routing(self, base_config, device, dtype):
         base_config.moe_variant = "arv_mmoe"

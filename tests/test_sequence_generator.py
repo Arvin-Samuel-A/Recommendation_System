@@ -10,14 +10,15 @@ from configs.config import Config
 from data.sequence_generator import (
     RecDataset,
     _left_pad,
-    generate_sliding_window_examples,
+    chunk_user_history,
+    chunk_training_histories,
     generate_sequences,
     tensorise_examples,
     build_dataloader,
     GlobalNegativePool,
     filter_negatives,
-    generate_eval_candidates,
     load_tensorised,
+    load_train_dataset,
 )
 
 
@@ -35,108 +36,79 @@ class TestLeftPad:
         assert result == [3, 4, 5]
 
 
-class TestSlidingWindow:
-    def test_basic_examples(self):
-        items = [1, 2, 3, 4, 5]
-        seqs, targets, _ = generate_sliding_window_examples(items, max_seq_length=5)
-        assert len(seqs) == 4
-        assert targets == [2, 3, 4, 5]
+class TestChunking:
+    """LLM-style training rows: whole histories, a next-item target at every position."""
 
-    def test_left_padding_alignment(self):
-        items = [1, 2, 3, 4, 5]
-        seqs, _, _ = generate_sliding_window_examples(items, max_seq_length=5)
-        assert seqs[0] == [0, 0, 0, 0, 1]
-        assert seqs[0][-1] == 1
+    def test_short_history_is_one_chunk_of_shifted_targets(self):
+        assert chunk_user_history([1, 2, 3, 4, 5], 8) == [([1, 2, 3, 4], [2, 3, 4, 5])]
 
-    def test_multi_step_no_cross_split(self):
-        items = [1, 2, 3, 4, 5]
-        split_end = 4
-        _, _, targets_k = generate_sliding_window_examples(
-            items, max_seq_length=5, multi_step_k=2, split_end_idx=split_end
-        )
-        for i, tk in enumerate(targets_k):
-            for t in tk:
-                if t != 0:
-                    assert t in items
+    def test_long_history_is_cut_from_the_end(self):
+        chunks = chunk_user_history(list(range(1, 11)), 4)
+        assert chunks == [
+            ([1], [2]),
+            ([2, 3, 4, 5], [3, 4, 5, 6]),
+            ([6, 7, 8, 9], [7, 8, 9, 10]),
+        ]
+
+    def test_every_item_after_the_first_is_a_target_exactly_once(self):
+        items = list(range(1, 38))
+        for width in (1, 3, 5, 36, 50):
+            targets = [t for _, tgts in chunk_user_history(items, width) for t in tgts]
+            assert targets == items[1:], width
+
+    def test_single_item_history_yields_nothing(self):
+        assert chunk_user_history([7], 4) == []
+
+    def test_rows_are_left_padded_and_aligned(self):
+        out = chunk_training_histories({0: [1, 2, 3], 1: list(range(10, 16))}, 4)
+        assert out["sequences"].tolist() == [
+            [0, 0, 1, 2],
+            [0, 0, 0, 10],
+            [11, 12, 13, 14],
+        ]
+        assert out["targets"].tolist() == [
+            [0, 0, 2, 3],
+            [0, 0, 0, 11],
+            [12, 13, 14, 15],
+        ]
+        assert out["user_ids"].tolist() == [0, 1, 1]
+        assert out["lengths"].tolist() == [2, 1, 4]
+        # A position is real exactly when it has a target.
+        assert np.array_equal(out["sequences"] != 0, out["targets"] != 0)
 
 
 class TestGenerateSequences:
     def test_separate_history_dicts(self):
         config = Config()
         config.max_seq_length = 10
-        config.multi_step_k = 2
         user_seqs = {0: list(range(1, 21))}
-        train = {0: list(range(1, 17))}
-        val = {0: [17, 18]}
-        test = {0: [19, 20]}
+        train = {0: list(range(1, 19))}
+        val = {0: [19]}
+        test = {0: [20]}
 
-        _, _, _, train_hist, eval_hist = generate_sequences(
+        _, _, train_hist, eval_hist = generate_sequences(
             user_seqs, train, val, test, config
         )
         assert train_hist is not eval_hist
-        assert train_hist[0] != eval_hist[0]
-        assert len(eval_hist[0]) > len(train_hist[0])
+        assert train_hist[0] == list(range(1, 19))
+        assert eval_hist[0] == list(range(1, 20))
 
-    def test_split_before_truncate(self):
+    def test_leave_one_out_rows(self):
+        """One val and one test row per user, each with its full preceding context."""
         config = Config()
         config.max_seq_length = 5
-        config.multi_step_k = 0
-        items = list(range(1, 21))
-        user_seqs = {0: items}
-        train = {0: items[:16]}
-        val = {0: items[16:18]}
-        test = {0: items[18:]}
+        user_seqs = {0: list(range(1, 11)), 1: [11, 12, 13]}
+        train = {0: list(range(1, 9)), 1: [11]}
+        val = {0: [9], 1: [12]}
+        test = {0: [10], 1: [13]}
 
-        train_ex, val_ex, test_ex, _, _ = generate_sequences(
-            user_seqs, train, val, test, config
-        )
-        for seq in train_ex["sequences"]:
-            assert len(seq) == config.max_seq_length
-
-    def test_train_lengths_are_per_example(self):
-        """REV-088: `lengths` must be each example's own non-pad count, not the user's."""
-        config = Config()
-        config.max_seq_length = 10
-        config.multi_step_k = 0
-        items = [1, 2, 3, 4, 5, 6]
-        train_ex, _, _, _, _ = generate_sequences(
-            {0: items}, {0: items}, {0: []}, {0: []}, config
-        )
-        assert len(train_ex["sequences"]) == len(items) - 1
-        for i, seq in enumerate(train_ex["sequences"]):
-            assert train_ex["lengths"][i] == int((seq != 0).sum()), (
-                f"example {i}: lengths={train_ex['lengths'][i]} "
-                f"but non-pad count is {int((seq != 0).sum())}"
-            )
-
-    def test_train_lengths_saturate_at_max_seq_length(self):
-        """Contexts longer than S are truncated, so `lengths` caps at S."""
-        config = Config()
-        config.max_seq_length = 4
-        config.multi_step_k = 0
-        items = list(range(1, 11))
-        train_ex, _, _, _, _ = generate_sequences(
-            {0: items}, {0: items}, {0: []}, {0: []}, config
-        )
-        for i, seq in enumerate(train_ex["sequences"]):
-            assert train_ex["lengths"][i] == int((seq != 0).sum())
-        assert train_ex["lengths"].max() == config.max_seq_length
-
-    def test_generates_examples(self):
-        config = Config()
-        config.max_seq_length = 10
-        config.multi_step_k = 2
-        user_seqs = {0: list(range(1, 11)), 1: list(range(11, 21))}
-        train = {0: list(range(1, 9)), 1: list(range(11, 19))}
-        val = {0: [9], 1: [19]}
-        test = {0: [10], 1: [20]}
-
-        train_ex, val_ex, test_ex, _, _ = generate_sequences(
-            user_seqs, train, val, test, config
-        )
-        assert len(train_ex["sequences"]) > 0
-        assert len(val_ex["sequences"]) > 0
-        assert len(test_ex["sequences"]) > 0
+        val_ex, test_ex, _, _ = generate_sequences(user_seqs, train, val, test, config)
+        assert val_ex["targets"].tolist() == [9, 12]
+        assert test_ex["targets"].tolist() == [10, 13]
+        assert val_ex["sequences"].tolist() == [[4, 5, 6, 7, 8], [0, 0, 0, 0, 11]]
+        assert test_ex["sequences"].tolist() == [[5, 6, 7, 8, 9], [0, 0, 0, 11, 12]]
+        assert val_ex["lengths"].tolist() == [5, 1]
+        assert test_ex["lengths"].tolist() == [5, 2]
 
 
 class TestRecDataset:
@@ -154,18 +126,17 @@ class TestRecDataset:
         assert isinstance(item["targets"], torch.Tensor)
         assert len(ds) == n
 
-    def test_optional_fields(self):
+    def test_per_position_targets(self):
         n = 5
         S = 3
         ds = RecDataset(
             torch.zeros(n, S, dtype=torch.long),
+            torch.ones(n, S, dtype=torch.long),
             torch.zeros(n, dtype=torch.long),
             torch.zeros(n, dtype=torch.long),
-            torch.zeros(n, dtype=torch.long),
-            targets_k=torch.zeros(n, 2, dtype=torch.long),
         )
         item = ds[0]
-        assert "targets_k" in item
+        assert item["targets"].shape == (S,)
 
 
 class TestDataLoader:
@@ -182,6 +153,21 @@ class TestDataLoader:
         loader = build_dataloader(ds, config, shuffle=False)
         batch = next(iter(loader))
         assert batch["sequences"].shape[0] == 4
+
+
+class TestEpochPermutationSampler:
+    def test_one_draw_per_epoch_however_far_it_is_read(self):
+        """A capped epoch must leave the generator where a full epoch would, so data
+        order never depends on how far worker prefetch read."""
+        from data.sequence_generator import EpochPermutationSampler
+
+        partial, full = torch.Generator().manual_seed(0), torch.Generator().manual_seed(0)
+        it = iter(EpochPermutationSampler(10, partial))
+        first = [next(it) for _ in range(3)]
+        everything = list(EpochPermutationSampler(10, full))
+        assert first == everything[:3]
+        assert sorted(everything) == list(range(10))
+        assert torch.equal(partial.get_state(), full.get_state())
 
 
 class TestGlobalNegativePool:
@@ -241,99 +227,6 @@ class TestFilterNegatives:
             filter_negatives(pool, target=1, history_set={2, 3}, num_negatives=5)
 
 
-class TestEvalCandidates:
-    def test_target_always_first(self):
-        pool = np.arange(1, 101)
-        examples = {
-            "targets": [50, 75],
-            "user_ids": [0, 1],
-            "sequences": [[1, 2, 3], [4, 5, 6]],
-        }
-        history = {0: [1, 2, 3], 1: [4, 5, 6]}
-        candidates = generate_eval_candidates(
-            examples, pool, history, num_negatives=10, padding_id=0, mask_id=101
-        )
-        assert len(candidates) == 2
-        assert candidates[0][0] == 50
-        assert candidates[1][0] == 75
-        assert len(candidates[0]) == 11
-
-    def test_identical_across_configs(self):
-        pool = np.arange(1, 101)
-        examples = {"targets": [10], "user_ids": [0], "sequences": [[1, 2]]}
-        history = {0: [1, 2]}
-        c1 = generate_eval_candidates(examples, pool, history, 10, 0, 101)
-        c2 = generate_eval_candidates(examples, pool, history, 10, 0, 101)
-        assert np.array_equal(c1[0], c2[0])
-
-    def test_no_list_of_arrays_or_matrix_copy(self, tmp_path):
-        """REV-087: rows go into one preallocated array, optionally an on-disk memmap.
-
-        The old form returned N separate `(101,)` arrays (~0.9 GB of per-array overhead
-        for the test split) which `save_eval_candidates` then copied into a contiguous
-        matrix -- another 0.86 GB, at the same point in the pipeline as the other peaks.
-        """
-        import numpy as np
-        from data.sequence_generator import save_eval_candidates, load_eval_candidates
-
-        pool = np.arange(1, 201)
-        examples = {"targets": [50, 75, 12], "user_ids": [0, 1, 2]}
-        history = {0: [1, 2, 3], 1: [4, 5, 6], 2: [7]}
-
-        in_memory = generate_eval_candidates(examples, pool, history, 10, 0, 999)
-        assert isinstance(in_memory, np.ndarray) and not isinstance(in_memory, list)
-        assert in_memory.shape == (3, 11) and in_memory.dtype == np.int64
-
-        path = str(tmp_path / "test_candidates.npy")
-        on_disk = generate_eval_candidates(
-            examples, pool, history, 10, 0, 999, out_path=path,
-        )
-        assert isinstance(on_disk, np.memmap), "out_path must allocate an on-disk memmap"
-        assert np.array_equal(np.asarray(on_disk), in_memory)
-
-        # The memmap is already backed by `path`, so saving must not rewrite it, and the
-        # fingerprint contract must be byte-identical to the whole-matrix digest.
-        fingerprint = save_eval_candidates(on_disk, path)
-        assert fingerprint == hashlib.sha256(in_memory.tobytes()).hexdigest()[:16]
-        assert np.array_equal(load_eval_candidates(path), in_memory)
-
-        # REV-119: the memory-mapped read must be the SAME rows, verified the same way.
-        # `run_local_personalization` addresses a few thousand rows of an 856 MB matrix,
-        # so it reads this way; FR-1's "one candidate protocol" depends on the two paths
-        # being indistinguishable in content.
-        mapped = load_eval_candidates(path, mmap=True)
-        assert isinstance(mapped, np.memmap), "mmap=True must not materialise the matrix"
-        assert np.array_equal(np.asarray(mapped), in_memory)
-        assert np.array_equal(mapped[1], in_memory[1]), "row slicing must agree"
-        # Fingerprint verification must run -- and pass -- over the memmap too, otherwise
-        # the mapped path would silently skip the integrity check the eager path enforces.
-        with pytest.raises(RuntimeError, match="fingerprint mismatch"):
-            import json as _json
-            meta_path = path + ".meta.json"
-            with open(meta_path) as f:
-                meta = _json.load(f)
-            good = meta["fingerprint"]
-            meta["fingerprint"] = "0" * 16
-            with open(meta_path, "w") as f:
-                _json.dump(meta, f)
-            try:
-                load_eval_candidates(path, mmap=True)
-            finally:
-                meta["fingerprint"] = good
-                with open(meta_path, "w") as f:
-                    _json.dump(meta, f)
-
-    def test_block_fingerprint_matches_whole_matrix_digest(self):
-        """REV-087: block-wise hashing must reproduce the digest byte-for-byte."""
-        import numpy as np
-        from data.sequence_generator import _fingerprint_rows
-
-        matrix = np.arange(100 * 101, dtype=np.int64).reshape(100, 101)
-        expected = hashlib.sha256(matrix.tobytes()).hexdigest()[:16]
-        for block_rows in (1, 7, 100, 4096):
-            assert _fingerprint_rows(matrix, block_rows=block_rows) == expected
-
-
 class TestLazyMetadataGather:
     """REV-058: `RecDataset` must never materialise a dense `(N, S, F)` metadata block.
 
@@ -349,7 +242,7 @@ class TestLazyMetadataGather:
         user_ids = torch.zeros(n, dtype=torch.long)
         lengths = torch.full((n,), s, dtype=torch.long)
         matrix = np.random.rand(vocab, f).astype(np.float32)
-        return RecDataset(sequences, targets, user_ids, lengths, None, matrix), matrix
+        return RecDataset(sequences, targets, user_ids, lengths, matrix), matrix
 
     def test_resident_tensor_is_the_vocab_matrix_not_n_s_f(self):
         n, s, f, vocab = 5000, 50, 39, 200
@@ -402,7 +295,6 @@ class TestLazyMetadataGather:
             torch.ones(4, dtype=torch.long),
             torch.zeros(4, dtype=torch.long),
             torch.full((4,), 10, dtype=torch.long),
-            None,
             matrix,
         )
         assert torch.all(ds[0]["metadata"] == 0)
@@ -423,7 +315,6 @@ class TestLazyMetadataGather:
             torch.ones(4, dtype=torch.long),
             torch.zeros(4, dtype=torch.long),
             torch.full((4,), 10, dtype=torch.long),
-            None,
             short_matrix,
         )
         assert ds.metadata_matrix.shape[0] == mask_id + 1
@@ -436,7 +327,7 @@ class TestStoredWidth:
 
     STORED = 16
     MODEL = 8
-    SPLITS = ("train", "val", "test")
+    SPLITS = ("val", "test")
 
     @staticmethod
     def _pickle(processed, name):
@@ -471,7 +362,7 @@ class TestStoredWidth:
             user_sequences, splits["train"], splits["val"], splits["test"], cfg,
             width=self.MODEL,
         )
-        for split, expected in zip(self.SPLITS, generated[:3]):
+        for split, expected in zip(self.SPLITS, generated[:2]):
             narrowed = load_tensorised(
                 os.path.join(processed, f"{split}_tensorised.pt"),
                 max_seq_length=self.MODEL,
@@ -488,6 +379,19 @@ class TestStoredWidth:
             assert np.array_equal(ex["sequences"], expected["sequences"]), split
             assert np.array_equal(ex["lengths"], expected["lengths"]), split
             assert np.array_equal(ex["targets"], expected["targets"]), split
+
+    def test_training_split_is_chunked_at_the_reader_width(self, tiny_processed_dir):
+        """The training split is never narrowed: each width gets its own chunks."""
+        processed = tiny_processed_dir()
+        history = self._pickle(processed, "train_user_history.pkl")
+        for width in (4, self.MODEL, self.STORED):
+            ds = load_train_dataset(processed, width)
+            expected = chunk_training_histories(history, width)
+            assert ds.sequences.shape[1] == width
+            assert torch.equal(ds.sequences, torch.from_numpy(expected["sequences"]).long())
+            assert torch.equal(ds.targets, torch.from_numpy(expected["targets"]).long())
+            n_targets = sum(max(0, len(v) - 1) for v in history.values())
+            assert int((ds.targets != 0).sum()) == n_targets
 
     def test_requesting_more_than_is_stored_raises(self, tiny_processed_dir):
         from data.sequence_generator import load_examples

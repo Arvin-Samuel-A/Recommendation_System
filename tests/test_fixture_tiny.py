@@ -9,21 +9,17 @@ from tests.conftest import TINY_MAX_BYTES, dir_size_bytes, tiny_config
 RUN_PRETRAIN_ARTIFACTS = (
     "dataset_stats.json",
     "item_metadata.npy",
-    "train_tensorised.pt",
     "val_tensorised.pt",
-    "global_negative_pool.npy",
-    "global_negative_pool.npy.meta.json",
     "train_user_history.pkl",
     "eval_user_history.pkl",
-    "val_candidates.npy",
-    "val_candidates.npy.meta.json",
+    "preprocessing_manifest.json",
 )
 
 #: Read by evaluation, cold-start, long-tail, personalization and federated stages.
 DOWNSTREAM_ARTIFACTS = (
     "test_tensorised.pt",
-    "test_candidates.npy",
-    "train_examples.pkl",
+    "global_negative_pool.npy",
+    "global_negative_pool.npy.meta.json",
     "val_examples.pkl",
     "test_examples.pkl",
     "cold_items.pkl",
@@ -32,7 +28,6 @@ DOWNSTREAM_ARTIFACTS = (
     "splits.pkl",
     "user_mapping.pkl",
     "item_mapping.pkl",
-    "preprocessing_manifest.json",
 )
 
 

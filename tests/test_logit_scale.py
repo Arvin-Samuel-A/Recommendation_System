@@ -292,6 +292,9 @@ class TestFingerprint:
         from training.ablation_runner import _training_fingerprint, resolve_study_configs
 
         base = Config()
+        # The GradNorm-primary defaults changed on 2026-10-25; at their pre-feature values
+        # they are omitted from the payload like every other new field.
+        base.gradnorm_primary_objective, base.gradnorm_aux_budget = "", None
         assert _training_fingerprint(base) == self._legacy_fingerprint(base)
         for study in ("A", "D", "E"):
             for arm in resolve_study_configs(study, base):

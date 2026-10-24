@@ -287,19 +287,13 @@ class TestColdStartMetadataArms:
 
 
 class TestCandidateSetConsistency:
-    """REV-095 / AC-01: every evaluation entry point must score the SAME candidate rows.
+    """REV-095 / AC-01: every evaluation entry point must score the SAME rows.
 
-    The test this replaces constructed no model and ran no evaluation -- it called
-    `generate_eval_candidates` twice with identical arguments and asserted the results
-    matched, i.e. that a seeded generator is deterministic. That is a different property
-    (already covered by `TestEvalCandidates::test_identical_across_configs`) and it could
-    not detect the real risk AC-01 exists to catch: two evaluation entry points scoring
-    the same example against DIFFERENT candidate sets, which is exactly what REV-093
-    found in `longtail.py` and `cold_start.py`.
-
-    This drives the property at the evaluation boundary instead: build a small processed
-    directory, run both entry points, and assert the candidate rows each one hands to
-    `score_candidates_batch` are the stored `test_candidates.npy` rows.
+    The risk AC-01 exists to catch is two evaluation entry points scoring the same
+    example on DIFFERENT protocols, which is what REV-093 found in `longtail.py` and
+    `cold_start.py`. Drive it at the evaluation boundary: build a small processed
+    directory, run both entry points, and assert the full-ranking rows each one ranks
+    (target + excluded history) are the test split's rows from `load_full_ranking`.
     """
 
     N_EXAMPLES = 12
@@ -330,7 +324,7 @@ class TestCandidateSetConsistency:
 
         import numpy as np
 
-        from data.sequence_generator import generate_eval_candidates, save_eval_candidates
+        from evaluation.metrics import load_full_ranking
 
         processed = cfg.processed_data_dir
         os.makedirs(processed, exist_ok=True)
@@ -375,13 +369,7 @@ class TestCandidateSetConsistency:
             ]),
         )
 
-        candidates = generate_eval_candidates(
-            test_examples, pool, eval_history, cfg.num_sampled_negatives,
-            padding_id=0, mask_id=cls.NUM_ITEMS + 1, seed=cfg.seed,
-        )
-        path = os.path.join(processed, "test_candidates.npy")
-        save_eval_candidates(candidates, path)
-        return np.load(path)
+        return load_full_ranking(processed, "test", targets, user_ids)
 
     @staticmethod
     def _model(cfg):
@@ -397,21 +385,46 @@ class TestCandidateSetConsistency:
 
     @staticmethod
     def _record_candidates(monkeypatch, module_name):
-        """Capture the candidate rows the entry point actually scores."""
+        """Capture `(ranking rows, metadata)` for every model scoring call the entry point
+        makes: the metadata from `score_catalogue_batch`, the rows from the
+        `catalogue_ranking_scores` call that consumes its scores."""
         import importlib
 
         import evaluation.metrics as metrics_mod
 
         module = importlib.import_module(module_name)
         seen = []
-        real = metrics_mod.score_candidates_batch
+        real_score = metrics_mod.score_catalogue_batch
+        real_rank = metrics_mod.catalogue_ranking_scores
+        pending = []
 
-        def spy(model, seqs, candidate_ids, config, **kwargs):
-            seen.append((candidate_ids.detach().cpu().clone(), kwargs.get("metadata")))
-            return real(model, seqs, candidate_ids, config, **kwargs)
+        def score_spy(model, seqs, config, **kwargs):
+            out = real_score(model, seqs, config, **kwargs)
+            pending.append((out, kwargs.get("metadata")))
+            return out
 
-        monkeypatch.setattr(module, "score_candidates_batch", spy)
+        def rank_spy(item_scores, ranking):
+            for i, (out, meta) in enumerate(pending):
+                if out is item_scores:
+                    seen.append((ranking, meta))
+                    del pending[i]
+                    break
+            return real_rank(item_scores, ranking)
+
+        monkeypatch.setattr(module, "score_catalogue_batch", score_spy)
+        monkeypatch.setattr(module, "catalogue_ranking_scores", rank_spy)
         return seen
+
+    @staticmethod
+    def _concat(rankings):
+        """(targets, per-row excluded tuples) of a list of ranking batches."""
+        targets, excluded = [], []
+        for r in rankings:
+            targets += [int(t) for t in r.targets]
+            for i in range(len(r)):
+                lo, hi = int(r.exclude_ptr[i]), int(r.exclude_ptr[i + 1])
+                excluded.append(tuple(int(x) for x in r.exclude_items[lo:hi]))
+        return targets, excluded
 
     def test_longtail_and_cold_start_score_the_stored_candidate_rows(
         self, tmp_path, monkeypatch
@@ -431,7 +444,7 @@ class TestCandidateSetConsistency:
         cs_seen = self._record_candidates(monkeypatch, "evaluation.cold_start")
         run_cold_start_evaluation(model, moe, cfg, "t-small")
 
-        lt_rows = torch.cat([rows for rows, _ in lt_seen]).numpy()
+        lt_rows = self._concat([rows for rows, _ in lt_seen])
 
         # Cold-start scores each batch twice -- metadata ON then OFF -- so the recorded
         # calls interleave per batch (b0,b0,b1,b1,...), not as two whole passes back to
@@ -441,20 +454,21 @@ class TestCandidateSetConsistency:
             "the fixture must span more than one batch for this to test anything -- "
             "raise N_EXAMPLES or lower eval_batch_size"
         )
-        cs_on = torch.cat([rows for rows, meta in cs_seen if meta is not None]).numpy()
-        cs_off = torch.cat([rows for rows, meta in cs_seen if meta is None]).numpy()
+        cs_on = self._concat([rows for rows, meta in cs_seen if meta is not None])
+        cs_off = self._concat([rows for rows, meta in cs_seen if meta is None])
+        stored = self._concat([stored])
 
-        assert np.array_equal(lt_rows, stored), (
-            "run_longtail_evaluation scored candidates that are not the stored "
-            "test_candidates.npy rows -- the long-tail numbers are on a different "
-            "candidate protocol from the headline test metrics"
+        assert lt_rows == stored, (
+            "run_longtail_evaluation ranked rows that are not the test split's rows -- "
+            "the long-tail numbers are on a different protocol from the headline test "
+            "metrics"
         )
         for arm, cs_rows in (("meta_on", cs_on), ("meta_off", cs_off)):
-            assert np.array_equal(cs_rows, stored), (
-                f"run_cold_start_evaluation's {arm} arm scored candidates that are not "
-                f"the stored test_candidates.npy rows"
+            assert cs_rows == stored, (
+                f"run_cold_start_evaluation's {arm} arm ranked rows that are not the "
+                f"test split's rows"
             )
-        assert np.array_equal(lt_rows, cs_on), (
+        assert lt_rows == cs_on, (
             "the two entry points disagree on the candidate set for the same examples"
         )
 
@@ -476,7 +490,7 @@ class TestCandidateSetConsistency:
                 "run_longtail_evaluation scored without metadata; the metadata "
                 "projection contributed nothing on exactly the items it should help most"
             )
-            assert metadata.shape[:2] == rows.shape[:1] + (cfg.max_seq_length,)
+            assert tuple(metadata.shape[:2]) == (len(rows), cfg.max_seq_length)
 
 
 class TestLatencyBenchmarkPath:
@@ -677,9 +691,7 @@ class TestGradientDiagnosticsRestoresTrainingMode:
         b, S = 2, cfg.max_seq_length
         batches = dataloader if dataloader is not None else [{
             "sequences": torch.randint(1, cfg.num_items + 1, (b, S)),
-            "targets": torch.randint(1, cfg.num_items + 1, (b,)),
-            "neg_ids": torch.randint(1, cfg.num_items + 1, (b, cfg.num_sampled_negatives)),
-            "targets_k": torch.randint(1, cfg.num_items + 1, (b, cfg.multi_step_k)),
+            "targets": torch.randint(1, cfg.num_items + 1, (b, S)),
         }]
         run_gradient_diagnostics(
             model, moe, batches, loss_fns, get_anchor_layer_params(model, cfg),

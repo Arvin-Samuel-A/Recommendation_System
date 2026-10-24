@@ -100,10 +100,11 @@ in question did not touch. Provenance belongs in the artifact, not in prose abou
 These rules come from `specs/eval-integrity`, 2026-10-16. They apply to every path that reports a
 ranking metric.
 
-- **fp32 scores.** The forward may run in bf16, but scores are fp32. All candidate scoring goes
-  through `evaluation/metrics.py::score_candidates_batch`, and any other scoring site
-  (`models/ann_retrieval.py`) follows the same rule. A guard test lists the allowed scoring
-  sites.
+- **fp32 scores.** The forward may run in bf16, but scores are fp32. All scoring goes through
+  `evaluation/metrics.py::score_catalogue_batch` (the full-catalogue protocol) or
+  `score_candidates_batch` (explicit candidate rows, e.g. after ANN retrieval), and any other
+  scoring site (`models/ann_retrieval.py`) follows the same rule. A guard test lists the
+  allowed scoring sites.
   - Measured: bf16 cosines tied the target in 41–52% of examples and inflated NDCG@10 by up to
     0.08, by different amounts per arm.
 - **Ties never favour the target.** Metrics are the expectation under random tie-breaking (the

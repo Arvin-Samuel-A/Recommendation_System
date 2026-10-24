@@ -9,13 +9,10 @@ import torch
 
 from configs.config import Config
 from evaluation.metrics import (
-    EVAL_PROTOCOL, evaluate_model, score_candidates, score_candidates_batch,
-    compute_metrics, compute_metrics_batch, aggregate_metrics, item_popularity,
-    popularity_scores,
+    EVAL_PROTOCOL, aggregate_metrics, catalogue_ranking_scores, compute_metrics_batch,
+    item_popularity, load_full_ranking, popularity_ranking_scores, score_catalogue_batch,
 )
-from data.sequence_generator import (
-    align_metadata_matrix, load_or_build_eval_candidates, load_examples,
-)
+from data.sequence_generator import align_metadata_matrix, load_examples
 from utils import get_device
 
 logger = logging.getLogger(__name__)
@@ -60,8 +57,6 @@ def run_cold_start_evaluation(
         f"re-run --stage preprocess."
     )
 
-    neg_pool = np.load(os.path.join(processed, "global_negative_pool.npy"))
-
     # specs/ablation-run FR-7: splits are stored wider than the model; narrow on read.
     test_examples = load_examples(
         os.path.join(processed, "test_examples.pkl"), config.max_seq_length,
@@ -86,16 +81,10 @@ def run_cold_start_evaluation(
             "model trained with use_metadata=True."
         )
 
-    # REV-030: seed the candidate draw so the cold-start candidate sets are reproducible.
-    # REV-093: score against the FIXED stored candidate sets rather than rebuilding
-    # them. This path happened to reproduce the stored sets -- it passed a shared
-    # RandomState(config.seed) and the iteration order matched -- but only by
-    # coincidence, not by construction, and any change to either side would have put
-    # cold-start on a different candidate protocol from `test_metrics_{model}.json`.
-    cand_matrix = load_or_build_eval_candidates(
-        os.path.join(processed, "test_candidates.npy"),
-        test_examples, neg_pool, eval_user_history, config,
-        expected_rows=len(test_examples["targets"]),
+    # REV-093: the same rows as `test_metrics_{model}.json` -- each test target ranked
+    # against the full catalogue minus the user's history.
+    test_ranking = load_full_ranking(
+        processed, "test", test_examples["targets"], test_examples["user_ids"],
     )
 
     # REV-072: the matrix spans the full vocabulary (pad row 0, MASK_ID row last), so a
@@ -107,7 +96,7 @@ def run_cold_start_evaluation(
         "warm": {"meta_on": {}, "meta_off": {}, "popularity": {}},
     }
     # specs/eval-integrity FR-7.2: the popularity-only floor per bucket, on the same rows
-    # and candidates (training-interaction counts; cold items all score 0, tie-averaged).
+    # (training-interaction counts; cold items all score 0, tie-averaged).
     popularity = item_popularity(train_user_history, config.vocab_size)
 
     n = len(test_examples["targets"])
@@ -118,32 +107,29 @@ def run_cold_start_evaluation(
     # pass each; the arithmetic per example is unchanged.
     for start in range(0, n, bs):
         stop = min(start + bs, n)
-        seq_rows, cand_rows, cold_flags = [], [], []
-
-        for i in range(start, stop):
-            target = test_examples["targets"][i]
-            seq = test_examples["sequences"][i]
-            cand_rows.append(cand_matrix[i])
-            seq_rows.append(seq if isinstance(seq, torch.Tensor) else torch.as_tensor(seq, dtype=torch.long))
-            cold_flags.append(target in cold_item_set)
-
-        seqs = torch.stack([r.long() for r in seq_rows])
-        cands = torch.as_tensor(np.asarray(cand_rows), dtype=torch.long)
-        is_cold = torch.tensor(cold_flags, dtype=torch.bool)
+        seqs = torch.as_tensor(np.asarray(test_examples["sequences"][start:stop])).long()
+        rows = test_ranking.rows(start, stop)
+        is_cold = torch.tensor(
+            [int(t) in cold_item_set for t in test_examples["targets"][start:stop]],
+            dtype=torch.bool,
+        )
 
         # ON: the sequence's item metadata is supplied, as at training time.
-        # OFF: the same model and the same candidates, with no metadata -- the
-        # projection is simply skipped, which is the metadata-free serving path.
+        # OFF: the same model and the same rows, with no metadata -- the projection is
+        # simply skipped, which is the metadata-free serving path.
         arms = {
             "meta_on": meta_matrix[seqs],
             "meta_off": None,
         }
         for arm, meta in list(arms.items()) + [("popularity", None)]:
             if arm == "popularity":
-                scores = popularity_scores(cands, popularity)
+                scores = popularity_ranking_scores(rows, popularity)
             else:
-                scores = score_candidates_batch(
-                    model, seqs, cands, config, moe_layer=moe_layer, metadata=meta,
+                scores = catalogue_ranking_scores(
+                    score_catalogue_batch(
+                        model, seqs, config, moe_layer=moe_layer, metadata=meta,
+                    ),
+                    rows,
                 )
             per_metric = compute_metrics_batch(scores, target_idx=0, k=config.eval_k)
             for bucket, sel in (("cold", is_cold), ("warm", ~is_cold)):

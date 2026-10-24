@@ -6,8 +6,7 @@ full 20-epoch runs, seeds and model sizes. Nothing is trained to completion and 
 under `outputs/` is written.
 
 Needs `data/processed/` from `--stage preprocess` (at minimum: dataset_stats.json,
-item_metadata.npy, global_negative_pool.npy + .meta.json, train_user_history.pkl,
-train_tensorised.pt; val_tensorised.pt + val_candidates.npy are used for the
+item_metadata.npy, train_user_history.pkl; val_tensorised.pt is used for the
 validation-overhead measurement when present).
 
 Examples:
@@ -22,13 +21,11 @@ import inspect
 import json
 import math
 import os
-import pickle
 import platform
 import random
 import sys
 import time
 
-import numpy as np
 import torch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -39,8 +36,9 @@ import training.pretrain as P  # noqa: E402
 import utils  # noqa: E402
 from configs.config import Config  # noqa: E402
 from data.sequence_generator import (  # noqa: E402
-    GlobalNegativePool, build_dataloader, load_eval_candidates, load_tensorised,
+    build_dataloader, load_tensorised, load_train_dataset,
 )
+from evaluation.metrics import load_full_ranking  # noqa: E402
 from training.ablation_runner import (  # noqa: E402
     STUDY_CONFIGS, _training_fingerprint, resolve_study_configs,
 )
@@ -121,11 +119,6 @@ class Bench:
         self.proc = os.path.join(ROOT, "data", "processed")
         with open(os.path.join(self.proc, "dataset_stats.json")) as f:
             self.stats = json.load(f)
-        self.pool = GlobalNegativePool.load(
-            os.path.join(self.proc, "global_negative_pool.npy"), set()).pool
-        with open(os.path.join(self.proc, "train_user_history.pkl"), "rb") as f:
-            hist = pickle.load(f)
-        self.hist = {int(u): np.asarray(v, dtype=np.int64) for u, v in hist.items()}
         self._datasets = {}
         self.n_train = None
 
@@ -147,9 +140,8 @@ class Bench:
         key = (cfg.max_seq_length, cfg.use_metadata)
         if key not in self._datasets:
             meta = P.load_metadata_matrix(self.proc, cfg)
-            self._datasets[key] = (load_tensorised(
-                os.path.join(self.proc, "train_tensorised.pt"), meta,
-                max_seq_length=cfg.max_seq_length), meta)
+            self._datasets[key] = (
+                load_train_dataset(self.proc, cfg.max_seq_length, meta), meta)
             if self.n_train is None:
                 self.n_train = len(self._datasets[key][0])
         return self._datasets[key]
@@ -159,7 +151,7 @@ class Bench:
             else _Null()
 
     def time_config(self, cfg, model, batch, steps, warmup):
-        """Mean wall ms per step (data loading + negatives + step) and peak memory."""
+        """Mean wall ms per step (data loading + step) and peak memory."""
         cfg = copy.deepcopy(cfg)
         cfg.batch_size = batch
         device = P.get_device(cfg)
@@ -191,8 +183,6 @@ class Bench:
         scaler = utils.make_grad_scaler(cfg) if STEP_TAKES_SCALER and HAS_MIXED else None
         param_dtype = utils.resolve_param_dtype(cfg) if HAS_MIXED else P.resolve_dtype(cfg)
         meta_t = meta.to(param_dtype) if meta is not None else None
-        neg_rng = np.random.RandomState(0)
-        buf = np.zeros((batch, cfg.num_items + 2), dtype=bool)
         mask_rng = torch.Generator(device="cpu").manual_seed(0)
         rng = random.Random(0)
         extra = {"scaler": scaler} if STEP_TAKES_SCALER else {}
@@ -200,7 +190,6 @@ class Bench:
         def one(i):
             b = next(it)
             b = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in b.items()}
-            b = P.attach_training_negatives(b, self.pool, self.hist, cfg, neg_rng, device, buf)
             with self._amp(cfg):
                 P.train_one_step(model_, moe, b, cfg, loss_fns, gn, opt, sched, i, rng,
                                  mask_rng=mask_rng, metadata_matrix=meta_t, **extra)
@@ -230,8 +219,7 @@ class Bench:
     def validation_seconds(self, cfg, model, moe, meta, n=5120):
         """Seconds for one full validation pass, extrapolated from `n` examples."""
         vt = os.path.join(self.proc, "val_tensorised.pt")
-        vc = os.path.join(self.proc, "val_candidates.npy")
-        if not (os.path.exists(vt) and os.path.exists(vc)):
+        if not os.path.exists(vt):
             return None
         from evaluation.metrics import evaluate_model
         try:
@@ -241,10 +229,8 @@ class Bench:
                 self._val = {}
             if cfg.max_seq_length not in self._val:
                 vds = load_tensorised(vt, meta, max_seq_length=cfg.max_seq_length)
-                cands = load_eval_candidates(vc, verify=False, mmap=True)
-                self._val[cfg.max_seq_length] = (
-                    vds, len(vds), torch.as_tensor(np.array(cands[:n]), dtype=torch.long),
-                )
+                ranking = load_full_ranking(self.proc, "val", vds.targets, vds.user_ids)
+                self._val[cfg.max_seq_length] = (vds, len(vds), ranking.rows(0, min(n, len(vds))))
             vds, n_val, cands = self._val[cfg.max_seq_length]
             seqs = vds.sequences[:n]
             model.eval(); moe.eval()

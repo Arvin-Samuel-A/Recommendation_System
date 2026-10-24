@@ -9,12 +9,11 @@ import torch
 
 from configs.config import Config
 from evaluation.metrics import (
-    EVAL_PROTOCOL, score_candidates, score_candidates_batch, compute_metrics,
-    compute_metrics_batch, aggregate_metrics, load_item_popularity, popularity_scores,
+    EVAL_PROTOCOL, aggregate_metrics, catalogue_ranking_scores, compute_metrics_batch,
+    load_full_ranking, load_item_popularity, popularity_ranking_scores,
+    score_catalogue_batch,
 )
-from data.sequence_generator import (
-    load_metadata_matrix, load_or_build_eval_candidates, load_examples,
-)
+from data.sequence_generator import load_metadata_matrix, load_examples
 from utils import get_device
 
 logger = logging.getLogger(__name__)
@@ -112,26 +111,15 @@ def run_longtail_evaluation(
         all_items = set(range(1, config.num_items + 1))
         buckets = compute_popularity_buckets(train_history, all_items, buckets_path)
 
-    with open(os.path.join(processed, "eval_user_history.pkl"), "rb") as f:
-        eval_user_history = pickle.load(f)
-    neg_pool = np.load(os.path.join(processed, "global_negative_pool.npy"))
-
     # specs/ablation-run FR-7: splits are stored wider than the model; narrow on read.
     test_examples = load_examples(
         os.path.join(processed, "test_examples.pkl"), config.max_seq_length,
     )
 
-    # REV-093: score against the FIXED stored candidate sets. This used to rebuild them
-    # per call with `filter_negatives` and no `rng=`, so every example's negatives were
-    # a deterministic function of its TARGET ITEM -- a head item appearing thousands of
-    # times in the test split met the same 100 negatives every time, correlating the
-    # per-bucket errors in the one study whose entire point is comparing across
-    # popularity buckets, and putting these numbers on a different candidate protocol
-    # from `test_metrics_{model}.json`.
-    cand_matrix = load_or_build_eval_candidates(
-        os.path.join(processed, "test_candidates.npy"),
-        test_examples, neg_pool, eval_user_history, config,
-        expected_rows=len(test_examples["targets"]),
+    # REV-093: the same rows as `test_metrics_{model}.json` -- each test target ranked
+    # against the full catalogue minus the user's history.
+    test_ranking = load_full_ranking(
+        processed, "test", test_examples["targets"], test_examples["user_ids"],
     )
 
     # REV-094: the backbone is pretrained with metadata, the best checkpoint is selected
@@ -142,8 +130,8 @@ def run_longtail_evaluation(
 
     bucket_names = ["head", "mid", "tail"]
     results: Dict[str, Dict[str, List[torch.Tensor]]] = {b: {} for b in bucket_names}
-    # specs/eval-integrity FR-7.2: the popularity-only floor per bucket, same rows and
-    # candidates, same source as the buckets (`train_user_history.pkl`).
+    # specs/eval-integrity FR-7.2: the popularity-only floor per bucket, same rows, same
+    # source as the buckets (`train_user_history.pkl`).
     popularity = load_item_popularity(processed, config.vocab_size)
     pop_results: Dict[str, Dict[str, List[torch.Tensor]]] = {b: {} for b in bucket_names}
 
@@ -151,31 +139,25 @@ def run_longtail_evaluation(
     bs = max(1, config.eval_batch_size)
 
     # REV-063: one forward per example cost ~40 minutes over the test split. Scoring is
-    # batched; candidate rows are sliced straight out of the stored matrix (REV-093).
+    # batched.
     for start in range(0, n, bs):
         stop = min(start + bs, n)
-        seq_rows, cand_rows, bucket_of = [], [], []
-
-        for i in range(start, stop):
-            target = test_examples["targets"][i]
-            seq = test_examples["sequences"][i]
-            cand_rows.append(cand_matrix[i])
-            seq_rows.append(seq if isinstance(seq, torch.Tensor) else torch.as_tensor(seq, dtype=torch.long))
-            bucket_of.append(
-                "head" if target in buckets["head"]
-                else "mid" if target in buckets["mid"] else "tail"
-            )
-
-        seqs = torch.stack([r.long() for r in seq_rows])
-        cands = torch.as_tensor(np.asarray(cand_rows), dtype=torch.long)
+        seqs = torch.as_tensor(np.asarray(test_examples["sequences"][start:stop])).long()
+        rows = test_ranking.rows(start, stop)
+        bucket_of = [
+            "head" if int(t) in buckets["head"]
+            else "mid" if int(t) in buckets["mid"] else "tail"
+            for t in test_examples["targets"][start:stop]
+        ]
 
         batch_meta = None if metadata_matrix is None else metadata_matrix[seqs]
-        scores = score_candidates_batch(
-            model, seqs, cands, config, moe_layer=moe_layer, metadata=batch_meta,
+        scores = catalogue_ranking_scores(
+            score_catalogue_batch(model, seqs, config, moe_layer=moe_layer, metadata=batch_meta),
+            rows,
         )
         per_metric = compute_metrics_batch(scores, target_idx=0, k=config.eval_k)
         pop_metric = compute_metrics_batch(
-            popularity_scores(cands, popularity), target_idx=0, k=config.eval_k,
+            popularity_ranking_scores(rows, popularity), target_idx=0, k=config.eval_k,
         )
 
         bucket_arr = np.asarray(bucket_of)
@@ -283,3 +265,5 @@ def _plot_longtail(config: Config, model_name: str, report: Dict) -> None:
     fig.tight_layout()
     fig.savefig(os.path.join(config.plot_dir, f"longtail_{mn}.png"), dpi=config.plot_dpi)
     plt.close(fig)
+
+# temporary provenance probe

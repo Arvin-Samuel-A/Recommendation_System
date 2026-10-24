@@ -235,8 +235,10 @@ def test_ann_retrieval_ranks_by_fp32_scores(monkeypatch, enclosing):
 #: `models/ann_retrieval.py`, as (file, enclosing function). A new site fails the test until
 #: it is audited: a scoring site must score in fp32 outside autocast (eval-integrity FR-1).
 AUDITED_SCORING_SITES = {
-    # The single scoring choke point: fp32 normalise + einsum under autocast_disabled.
+    # The two scoring choke points: fp32 normalise + einsum / matmul under
+    # autocast_disabled, over candidate rows or over the whole catalogue.
     ("evaluation/metrics.py", "score_candidates_batch"),
+    ("evaluation/metrics.py", "score_catalogue_batch"),
     # Full-vocabulary ANN scoring: fp32 normalise + matmul under autocast_disabled.
     ("models/ann_retrieval.py", "retrieve_candidates"),
 }
@@ -354,7 +356,10 @@ def test_load_item_popularity_reads_train_history(tmp_path):
 def test_eval_protocol_constant():
     from evaluation.metrics import EVAL_PROTOCOL
 
-    assert EVAL_PROTOCOL == {"version": 2, "scoring": "fp32", "ties": "tie_averaged"}
+    assert EVAL_PROTOCOL == {
+        "version": 3, "scoring": "fp32", "ties": "tie_averaged",
+        "split": "leave_one_out", "candidates": "full_catalogue",
+    }
 
 
 # ---------------------------------------------------------------------------------------
@@ -385,9 +390,7 @@ def _train_batch(cfg: Config, seed: int):
     b, n = cfg.batch_size, cfg.num_items
     return {
         "sequences": torch.randint(1, n + 1, (b, cfg.max_seq_length), generator=gen),
-        "targets": torch.randint(1, n + 1, (b,), generator=gen),
-        "neg_ids": torch.randint(1, n + 1, (b, cfg.num_sampled_negatives), generator=gen),
-        "targets_k": torch.randint(1, n + 1, (b, cfg.multi_step_k), generator=gen),
+        "targets": torch.randint(1, n + 1, (b, cfg.max_seq_length), generator=gen),
     }
 
 
@@ -475,6 +478,7 @@ FORWARD_SITES = [
     "train_one_step",
     "collect_validation_routing",
     "score_candidates_batch",
+    "score_catalogue_batch",
     "run_gradient_diagnostics",
     "benchmark_latency",
     "retrieve_candidates",
@@ -515,13 +519,19 @@ def _run_forward_site(site: str):
             from training.pretrain import collect_validation_routing
 
             n = seqs.shape[0]
-            ds = RecDataset(seqs, batch["targets"][:1].repeat(n), torch.arange(n),
+            ds = RecDataset(seqs, torch.ones(n, dtype=torch.long), torch.arange(n),
                             torch.full((n,), cfg.max_seq_length))
             collect_validation_routing(model, moe, ds, cfg)
         elif site == "score_candidates_batch":
             from evaluation.metrics import score_candidates_batch
 
             score_candidates_batch(model, seqs, cands, cfg, moe_layer=moe)
+        elif site == "score_catalogue_batch":
+            from evaluation.metrics import score_catalogue_batch
+
+            scores = score_catalogue_batch(model, seqs, cfg, moe_layer=moe)
+            assert scores.dtype == torch.float32
+            assert scores.shape == (seqs.shape[0], cfg.num_items + 2)
         elif site == "run_gradient_diagnostics":
             from evaluation.gradient_diagnostics import run_gradient_diagnostics
 
@@ -642,8 +652,8 @@ def test_fingerprint_changes_with_semantics_version(monkeypatch):
 
     cfg = Config()
     current = ar._training_fingerprint(cfg)
-    assert ar.TRAINING_SEMANTICS_VERSION == 2
-    monkeypatch.setattr(ar, "TRAINING_SEMANTICS_VERSION", 3)
+    assert ar.TRAINING_SEMANTICS_VERSION == 4
+    monkeypatch.setattr(ar, "TRAINING_SEMANTICS_VERSION", 5)
     assert ar._training_fingerprint(cfg) != current
 
 
@@ -706,8 +716,8 @@ def test_legacy_backbone_is_not_reused(tiny_processed_dir, tmp_path, monkeypatch
 
 def _post_load_val_ndcg(cfg: Config, ckpt_path: str) -> float:
     """NDCG@k of a checkpoint loaded into a freshly built model, on the full val split."""
-    from data.sequence_generator import load_eval_candidates, load_tensorised
-    from evaluation.metrics import evaluate_model
+    from data.sequence_generator import load_tensorised
+    from evaluation.metrics import evaluate_model, load_full_ranking
     from training.ablation_runner import resolve_dataset_fields
     from training.pretrain import build_model, load_checkpoint
 
@@ -716,10 +726,7 @@ def _post_load_val_ndcg(cfg: Config, ckpt_path: str) -> float:
         os.path.join(cfg.processed_data_dir, "val_tensorised.pt"), meta,
         max_seq_length=cfg.max_seq_length,
     )
-    cands = torch.as_tensor(
-        load_eval_candidates(os.path.join(cfg.processed_data_dir, "val_candidates.npy")),
-        dtype=torch.long,
-    )
+    cands = load_full_ranking(cfg.processed_data_dir, "val", val.targets, val.user_ids)
     model, moe = build_model(cfg)
     load_checkpoint(ckpt_path, model, moe)
     model.eval()
@@ -776,8 +783,8 @@ def _arm_base(tiny_processed_dir, out_dir, **overrides):
 
 
 def _full_test_metrics(cfg: Config, ckpt_path: str):
-    from data.sequence_generator import load_eval_candidates, load_tensorised
-    from evaluation.metrics import evaluate_model
+    from data.sequence_generator import load_tensorised
+    from evaluation.metrics import evaluate_model, load_full_ranking
     from training.ablation_runner import resolve_dataset_fields
     from training.pretrain import build_model, load_checkpoint
 
@@ -787,10 +794,7 @@ def _full_test_metrics(cfg: Config, ckpt_path: str):
     meta = resolve_dataset_fields(cfg)
     test = load_tensorised(os.path.join(cfg.processed_data_dir, "test_tensorised.pt"), meta,
                            max_seq_length=cfg.max_seq_length)
-    cands = torch.as_tensor(
-        load_eval_candidates(os.path.join(cfg.processed_data_dir, "test_candidates.npy")),
-        dtype=torch.long,
-    )
+    cands = load_full_ranking(cfg.processed_data_dir, "test", test.targets, test.user_ids)
     model, moe = build_model(cfg)
     load_checkpoint(ckpt_path, model, moe)
     model.eval()

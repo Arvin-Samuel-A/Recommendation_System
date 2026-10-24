@@ -113,7 +113,6 @@ def run_gradient_diagnostics(
     shared_params: List[nn.Parameter],
     config,
     model_name: str,
-    negative_sampler=None,
     metadata_matrix=None,
     augment_rng=None,
     write_report: bool = True,
@@ -121,17 +120,14 @@ def run_gradient_diagnostics(
 ) -> dict:
     """Per-objective gradient conflict/dominance diagnostics.
 
-    REV-009: (a) `batch["neg_ids"]` is not produced by `build_dataloader` -- it is
-    attached by the training loop -- so a plain train_loader used to raise KeyError.
-    `negative_sampler` is the shared attachment helper (`attach_training_negatives`),
-    which keeps this path identical to the training path while drawing FRESH diagnostic
-    batches rather than optimizer-step batches. (b) The contrastive objective was
-    omitted, capping the cosine matrix at 3x3 where FR-9 specifies (T, T) over all
-    objectives under comparison.
+    Computes each objective exactly as `train_one_step` does (full-catalogue next-item
+    and multi-step losses at every position, routed per position) on FRESH batches from
+    `dataloader`, not the optimizer-step batches. REV-009(b): the contrastive objective
+    is included, so the cosine matrix is (T, T) over all objectives under comparison.
     """
     import random as _random
 
-    from training.losses import apply_masking, mask_metadata
+    from training.losses import apply_masking, mask_metadata, normalize_item_table
     from data.augmentation import augment_sequence
     from configs.config import OBJECTIVE_ORDER
 
@@ -166,21 +162,10 @@ def run_gradient_diagnostics(
                 break
 
             device = next(model.parameters()).device
-            # specs/ablation-run D4: negatives are drawn from the loader's CPU batch
-            # BEFORE the host->device copy (identical draws, no device->host round trip).
-            if "neg_ids" not in batch:
-                if negative_sampler is None:
-                    raise ValueError(
-                        "run_gradient_diagnostics needs `negative_sampler` when the "
-                        "dataloader does not already provide `neg_ids`."
-                    )
-                batch = negative_sampler(batch)
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
             seq = batch["sequences"]
             targets = batch["targets"]
-            neg_ids = batch["neg_ids"]
-            targets_k = batch.get("targets_k")
             metadata = batch.get("metadata")
             mask_id = config.num_items + 1
 
@@ -191,9 +176,8 @@ def run_gradient_diagnostics(
                 # REV-059/REV-059b: this reproduced the training loop's metadata leak --
                 # masked positions received the true item's genome vector, so the reported
                 # `masked_item` gradient norms described an easier objective than the spec's.
-                metadata = mask_metadata(metadata, mask_positions)
+                masked_metadata = mask_metadata(metadata, mask_positions)
             else:
-                masked_seq = seq
                 mask_positions = None
                 true_ids = None
 
@@ -201,28 +185,38 @@ def run_gradient_diagnostics(
             # autocast region (cache off); `torch.autograd.grad` and the cosine/norm
             # arithmetic below run outside it.
             with autocast_context(config, device_type=device.type):
-                all_hidden = model(masked_seq, metadata=metadata, return_all_hidden=True)
+                # As in `train_one_step`: only the masked-item objective sees the masked
+                # sequence; the others read the clean forward.
+                all_hidden = model(seq, metadata=metadata, return_all_hidden=True)
                 pooled = all_hidden[:, -1, :]
 
                 per_objective_losses = {}
                 moe_layer.clear_cache()
+                normalized_item_emb = normalize_item_table(
+                    model.item_emb_weight, config.normalize_embeddings,
+                )
 
-                Z_next, _ = moe_layer(all_hidden, pooled, 0)
-                user_emb = Z_next[:, -1, :]
+                Z_next, _ = moe_layer(all_hidden, all_hidden, 0)
                 per_objective_losses["next_item"] = loss_fns["next_item"](
-                    user_emb, targets, neg_ids, model.item_emb_weight,
+                    Z_next, targets, model.item_emb_weight,
+                    normalized_item_emb=normalized_item_emb,
                 )
 
                 if config.use_masked_lm and mask_positions is not None and "masked_item" in loss_fns:
-                    Z_mim, _ = moe_layer(all_hidden, pooled, 1)
+                    masked_hidden = model(
+                        masked_seq, metadata=masked_metadata, return_all_hidden=True,
+                    )
+                    Z_mim, _ = moe_layer(masked_hidden, masked_hidden[:, -1, :], 1)
                     per_objective_losses["masked_item"] = loss_fns["masked_item"](
                         Z_mim, mask_positions, true_ids, model.item_emb_weight,
+                        normalized_item_emb=normalized_item_emb,
                     )
 
-                if config.use_multi_step and targets_k is not None and "multi_step" in loss_fns:
-                    Z_ms, _ = moe_layer(all_hidden, pooled, 2)
+                if config.use_multi_step and "multi_step" in loss_fns:
+                    Z_ms, _ = moe_layer(all_hidden, all_hidden, 2)
                     per_objective_losses["multi_step"] = loss_fns["multi_step"](
-                        Z_ms, targets_k, model.item_emb_weight,
+                        Z_ms, targets, model.item_emb_weight,
+                        normalized_item_emb=normalized_item_emb,
                     )
 
                 # REV-009b: the contrastive objective participates in the (T, T) matrix.

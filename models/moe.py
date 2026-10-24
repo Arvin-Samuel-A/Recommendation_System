@@ -51,7 +51,7 @@ class ARVRouter(nn.Module):
             logits = self.linear(pooled_hidden)
         else:
             if objective_emb.dim() == 1:
-                objective_emb = objective_emb.unsqueeze(0).expand(pooled_hidden.shape[0], -1)
+                objective_emb = objective_emb.expand(*pooled_hidden.shape[:-1], -1)
             logits = self.linear(torch.cat([pooled_hidden, objective_emb], dim=-1))
         return F.softmax(logits, dim=-1)
 
@@ -76,9 +76,15 @@ def route_objective(
     router: nn.Module,
     objective_idx: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Compute the routing distribution, broadcast it across positions and sum experts.
+    """Compute the routing distribution and mix the experts with it.
 
-    Returns ``(Z_ut, r_ut)`` with shapes ``(B, S, D)`` and ``(B, K)``.
+    A ``(B, D)`` ``pooled_hidden`` gives one distribution per sequence, broadcast across
+    positions: returns ``(Z_ut, r_ut)`` of shapes ``(B, S, D)`` and ``(B, K)``. A
+    ``(B, S, D)`` one routes every position from its own (causal) hidden state:
+    ``r_ut`` is ``(B, S, K)``. The per-position form is what the objectives that predict
+    at every position use, since routing from the last position would hand earlier
+    positions information about the items after them; at the last position the two
+    forms agree exactly.
     ``router`` is either an :class:`ARVRouter` (then ``objective_emb`` is used) or a
     :class:`ConventionalMMoEGates` (then ``objective_idx`` selects the gate).
 
@@ -92,7 +98,10 @@ def route_objective(
     else:
         r_ut = router(pooled_hidden, objective_emb)
 
-    Z_ut = (r_ut[:, None, :, None] * all_expert_outputs).sum(dim=2)
+    if r_ut.dim() == 3:
+        Z_ut = (r_ut[..., None] * all_expert_outputs).sum(dim=2)
+    else:
+        Z_ut = (r_ut[:, None, :, None] * all_expert_outputs).sum(dim=2)
     return Z_ut, r_ut
 
 

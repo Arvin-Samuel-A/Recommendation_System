@@ -12,7 +12,9 @@ from data.preprocessing import (
     _validate_files,
     _compute_fingerprint,
     process_ratings,
-    compute_chronological_split,
+    compute_leave_one_out_split,
+    check_processed_dir,
+    SPLIT_STRATEGY,
     identify_cold_items,
     extract_metadata,
     EXPECTED_FILES,
@@ -177,6 +179,26 @@ class TestRatingsPipeline:
         seqs, stats = process_ratings(config)
         assert stats["num_items"] == 5
 
+    def test_default_keeps_every_rating(self, config):
+        """Owner decision 2026-10-25: all ratings are interactions (0.5 included)."""
+        assert Config().implicit_threshold == 0.0
+        df = pd.DataFrame({
+            "userId": [1] * 10,
+            "movieId": [100 + i for i in range(10)],
+            "rating": [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0],
+            "timestamp": [1000 + i for i in range(10)],
+        })
+        df.to_csv(os.path.join(config.raw_data_dir, "rating.csv"), index=False)
+        seqs, stats = process_ratings(config)
+        assert stats["num_items"] == 10
+        assert stats["total_interactions"] == 10
+
+    def test_negative_threshold_rejected(self):
+        cfg = Config()
+        cfg.implicit_threshold = -1.0
+        with pytest.raises(ValueError, match="implicit_threshold"):
+            cfg.validate()
+
     def test_dataset_stats_saved(self, config):
         self._make_ratings(config.raw_data_dir, config)
         process_ratings(config)
@@ -190,20 +212,24 @@ class TestRatingsPipeline:
         assert "VOCAB_SIZE" in stats
 
 
-class TestChronologicalSplit:
-    def test_split_ratios(self):
-        config = Config()
-        config.train_ratio = 0.8
-        config.val_ratio = 0.1
-        seqs = {0: list(range(1, 21))}
-        ts = {0: list(range(100, 120))}
-        train, val, test, cutoff = compute_chronological_split(seqs, ts, config)
-        assert len(train[0]) == 16
-        assert len(val[0]) == 2
-        assert len(test[0]) == 2
+class TestLeaveOneOutSplit:
+    def test_last_is_test_second_last_is_val(self):
+        seqs = {0: list(range(1, 21)), 1: [7, 8, 9]}
+        ts = {0: list(range(100, 120)), 1: [5, 6, 7]}
+        train, val, test, _ = compute_leave_one_out_split(seqs, ts)
+        assert train[0] == list(range(1, 19))
+        assert val[0] == [19] and test[0] == [20]
+        assert train[1] == [7] and val[1] == [8] and test[1] == [9]
+
+    def test_every_user_has_one_val_and_one_test_item(self):
+        seqs = {u: list(range(10 * u + 1, 10 * u + 4 + u)) for u in range(5)}
+        ts = {u: list(range(len(s))) for u, s in seqs.items()}
+        train, val, test, _ = compute_leave_one_out_split(seqs, ts)
+        for u, items in seqs.items():
+            assert len(val[u]) == len(test[u]) == 1
+            assert train[u] + val[u] + test[u] == items
 
     def test_cutoff_is_max_train_timestamp(self):
-        config = Config()
         seqs = {
             0: list(range(1, 11)),
             1: list(range(11, 21)),
@@ -212,8 +238,38 @@ class TestChronologicalSplit:
             0: list(range(100, 110)),
             1: list(range(200, 210)),
         }
-        _, _, _, cutoff = compute_chronological_split(seqs, ts, config)
+        _, _, _, cutoff = compute_leave_one_out_split(seqs, ts)
         assert cutoff == 207
+
+    def test_fewer_than_three_items_raises(self):
+        with pytest.raises(ValueError, match="at least 3"):
+            compute_leave_one_out_split({0: [1, 2]}, {0: [1, 2]})
+
+
+class TestProcessedDirSplitCheck:
+    def _write_manifest(self, config, **fields):
+        with open(os.path.join(config.processed_data_dir, "preprocessing_manifest.json"), "w") as f:
+            json.dump(fields, f)
+
+    def test_ratio_split_dir_is_refused(self, config):
+        self._write_manifest(config, user_sample_fraction=1.0)
+        with pytest.raises(ValueError, match="split_strategy"):
+            check_processed_dir(config)
+
+    def test_other_threshold_is_refused(self, config):
+        self._write_manifest(
+            config, split_strategy=SPLIT_STRATEGY, implicit_threshold=4.0,
+            user_sample_fraction=1.0,
+        )
+        with pytest.raises(ValueError, match="implicit_threshold"):
+            check_processed_dir(config)
+
+    def test_matching_dir_passes(self, config):
+        self._write_manifest(
+            config, split_strategy=SPLIT_STRATEGY, implicit_threshold=0.0,
+            user_sample_fraction=1.0,
+        )
+        check_processed_dir(config)
 
 
 class TestColdStartHoldout:
@@ -433,9 +489,17 @@ class TestMetadataExtraction:
 PROCESSED_DIR = os.path.join("data", "processed")
 
 #: The whole point of T9.1 -- a clean checkout must SKIP these, not error.
+def _processed_is_current() -> bool:
+    path = os.path.join(PROCESSED_DIR, "preprocessing_manifest.json")
+    if not os.path.exists(path):
+        return False
+    with open(path) as f:
+        return json.load(f).get("split_strategy") == SPLIT_STRATEGY
+
+
 requires_processed_data = pytest.mark.skipif(
-    not os.path.exists(os.path.join(PROCESSED_DIR, "dataset_stats.json")),
-    reason="data/processed/ not built; run `python main.py --stage preprocess`",
+    not _processed_is_current(),
+    reason="data/processed/ not built with leave-one-out; run `python main.py --stage preprocess`",
 )
 
 
@@ -459,7 +523,6 @@ class TestEndToEndPreprocessing:
         "warm_items.pkl",
         "dataset_stats.json",
         "dataset_manifest.json",
-        "train_tensorised.pt",
         "val_tensorised.pt",
         "test_tensorised.pt",
         "global_negative_pool.npy",
@@ -468,14 +531,8 @@ class TestEndToEndPreprocessing:
         "eval_user_history.pkl",
         "splits.pkl",
         # REV-002: consumed by cold_start.py, longtail.py, local_train.py, federated.py
-        "train_examples.pkl",
         "val_examples.pkl",
         "test_examples.pkl",
-        # REV-041: the fixed candidate sets every model must be scored against
-        "val_candidates.npy",
-        "val_candidates.npy.meta.json",
-        "test_candidates.npy",
-        "test_candidates.npy.meta.json",
         # REV-007: long-tail popularity buckets
         "popularity_buckets.pkl",
         "preprocessing_manifest.json",
@@ -511,38 +568,25 @@ class TestEndToEndPreprocessing:
             f"(e.g. {sorted(leaked)[:10]}) -- the holdout is not disjoint from training"
         )
 
-    def test_candidate_sets_match_their_splits_and_fingerprints(self):
-        """REV-041: the stored sets must be loadable, fingerprint-verified, and sized to
-        their split -- otherwise cross-model comparability is incidental."""
+    def test_one_val_and_one_test_row_per_user(self):
+        """Leave-one-out: every user contributes exactly one row to each eval split."""
         import torch
 
-        from data.sequence_generator import load_eval_candidates
-
+        with open(os.path.join(PROCESSED_DIR, "dataset_stats.json")) as f:
+            num_users = json.load(f)["num_users"]
         for split in ("val", "test"):
-            path = os.path.join(PROCESSED_DIR, f"{split}_candidates.npy")
-            matrix = load_eval_candidates(path)  # raises on fingerprint mismatch
-
             data = torch.load(
                 os.path.join(PROCESSED_DIR, f"{split}_tensorised.pt"),
                 weights_only=True, mmap=True,
             )
-            n_examples = data["sequences"].shape[0]
-            assert matrix.shape[0] == n_examples, (
-                f"{split}_candidates has {matrix.shape[0]} rows but the {split} split "
-                f"has {n_examples} examples"
-            )
-            # column 0 is the target, the rest are negatives
-            assert matrix.shape[1] > 1
-            targets = data["targets"].numpy()
-            assert (matrix[:, 0] == targets).all(), (
-                f"{split}_candidates column 0 is not the target column"
-            )
+            users = data["user_ids"].numpy()
+            assert len(users) == num_users == len(np.unique(users))
 
     def test_examples_pickles_align_with_tensorised_splits(self):
         """REV-002: these were never written at all, so every consumer crashed."""
         import torch
 
-        for split in ("train", "val", "test"):
+        for split in ("val", "test"):
             with open(os.path.join(PROCESSED_DIR, f"{split}_examples.pkl"), "rb") as f:
                 examples = pickle.load(f)
             for key in ("sequences", "targets", "user_ids"):
@@ -612,7 +656,7 @@ class TestEndToEndPreprocessing:
     def test_tensorised_datasets_loadable(self):
         import torch
         processed_dir = os.path.join("data", "processed")
-        for split in ["train", "val", "test"]:
+        for split in ["val", "test"]:
             path = os.path.join(processed_dir, f"{split}_tensorised.pt")
             data = torch.load(path, weights_only=True)
             assert "sequences" in data

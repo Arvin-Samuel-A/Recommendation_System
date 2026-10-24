@@ -6,6 +6,7 @@ import pytest
 from unittest.mock import patch, MagicMock
 
 from configs.config import Config
+from evaluation.metrics import build_full_ranking
 from main import parse_args, apply_cli_overrides, STAGE_MAP, run_all_pipeline
 from training.ablation_runner import resolve_study_configs, STUDY_CONFIGS
 from models.transformer import TransformerModel
@@ -942,6 +943,8 @@ class TestSharedBackboneReuse:
         class FakeDataset:
             def __init__(self):
                 self.sequences = torch.zeros(2, 50, dtype=torch.long)
+                self.targets = torch.tensor([1, 2])
+                self.user_ids = torch.tensor([0, 1])
                 self.metadata_matrix = None
 
             def __len__(self):
@@ -970,8 +973,8 @@ class TestSharedBackboneReuse:
                 patch("training.pretrain.load_checkpoint"), \
                 patch("data.sequence_generator.load_metadata_matrix", return_value=None), \
                 patch("data.sequence_generator.load_tensorised", return_value=FakeDataset()), \
-                patch("data.sequence_generator.load_eval_candidates",
-                      return_value=np.zeros((2, 11), dtype=np.int64)), \
+                patch("evaluation.metrics.load_full_ranking",
+                      return_value=build_full_ranking([1, 2], [0, 1], {})), \
                 patch("evaluation.metrics.load_item_popularity",
                       return_value=torch.zeros(102)), \
                 patch("evaluation.metrics.evaluate_model",
@@ -1046,6 +1049,8 @@ class TestBackboneStore:
 
         class FakeDataset:
             sequences = torch.zeros(2, 50, dtype=torch.long)
+            targets = torch.tensor([1, 2])
+            user_ids = torch.tensor([0, 1])
             metadata_matrix = None
 
             def __len__(self):
@@ -1060,8 +1065,8 @@ class TestBackboneStore:
                       side_effect=lambda path, *a, **k: loaded.append(path)), \
                 patch("data.sequence_generator.load_metadata_matrix", return_value=None), \
                 patch("data.sequence_generator.load_tensorised", return_value=FakeDataset()), \
-                patch("data.sequence_generator.load_eval_candidates",
-                      return_value=np.zeros((2, 11), dtype=np.int64)), \
+                patch("evaluation.metrics.load_full_ranking",
+                      return_value=build_full_ranking([1, 2], [0, 1], {})), \
                 patch("evaluation.metrics.load_item_popularity",
                       return_value=torch.zeros(102)), \
                 patch("evaluation.metrics.evaluate_model",

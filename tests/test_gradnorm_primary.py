@@ -121,9 +121,15 @@ class TestController:
 
 
 class TestConfig:
-    def test_defaults_off(self):
+    def test_defaults_are_next_item_primary_with_budget_3(self):
+        """Owner decision 2026-10-25."""
         cfg = Config()
-        assert cfg.gradnorm_primary_objective == "" and cfg.gradnorm_aux_budget is None
+        assert cfg.gradnorm_primary_objective == "next_item" and cfg.gradnorm_aux_budget == 3.0
+        cfg.validate()
+
+    def test_standard_gradnorm_still_selectable(self):
+        cfg = Config()
+        cfg.gradnorm_primary_objective, cfg.gradnorm_aux_budget = "", None
         cfg.validate()
 
     @pytest.mark.parametrize("primary,budget", [("nope", None), ("", 1.0), ("next_item", -1.0)])
@@ -143,18 +149,24 @@ class TestFingerprint:
         cfg.gradnorm_aux_budget = budget
         return cfg
 
-    def test_defaults_omitted(self):
+    @staticmethod
+    def _standard(cfg):
+        cfg = copy.deepcopy(cfg)
+        cfg.gradnorm_primary_objective, cfg.gradnorm_aux_budget = "", None
+        return cfg
+
+    def test_pre_feature_values_omitted(self):
         from training.ablation_runner import _training_fields
         from dataclasses import asdict
 
-        fields = _training_fields(asdict(Config()))
+        fields = _training_fields(asdict(self._standard(Config())))
         assert "gradnorm_primary_objective" not in fields
         assert "gradnorm_aux_budget" not in fields
 
     def test_gradnorm_arm_changes(self):
         from training.ablation_runner import _training_fingerprint
 
-        base = Config()
+        base = self._standard(Config())
         assert base.use_gradnorm
         fps = {_training_fingerprint(base), _training_fingerprint(self._primary(base, None)),
                _training_fingerprint(self._primary(base, 1.0)),
@@ -191,7 +203,7 @@ class TestCLIAndPackager:
 
         cfg = Config()
         cli.apply_cli_overrides(cfg, cli.parse_args(["--stage", "pretrain"]))
-        assert cfg.gradnorm_primary_objective == "" and cfg.gradnorm_aux_budget is None
+        assert cfg.gradnorm_primary_objective == "next_item" and cfg.gradnorm_aux_budget == 3.0
 
     def test_packager_passes_flags_through_only_when_given(self):
         import scripts.package_ablation_run as pkg

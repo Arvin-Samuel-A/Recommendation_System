@@ -1,4 +1,5 @@
 import os
+import pickle
 
 import numpy as np
 import torch
@@ -74,75 +75,24 @@ class TestCheckpointIntegrity:
         assert cksum_before == cksum_after
 
 
-def _build_federated_fixture(dest, n_users=6, n_val=32):
-    """A tiny but REAL processed dir plus a trained best.pt, so the federated and
-    personalization entry points can be called for real rather than reimplemented."""
-    import json
-    import pickle
-
-    import numpy as np
-
-    from configs.config import Config
-    from tests.test_training import _build_subset_processed_dir
+def _build_federated_fixture(dest, n_users=6):
+    """A tiny but REAL processed dir (the synthetic fixture run through the real
+    preprocessing) plus a trained best.pt, so the federated and personalization entry
+    points can be called for real rather than reimplemented."""
+    from tests.conftest import build_tiny_processed_dir, tiny_config
     from training.pretrain import run_pretrain
 
-    processed = os.path.join(dest, "processed")
-    _build_subset_processed_dir(processed, n_train=128, n_val=n_val)
-
-    # `test_examples.pkl` drives client/user selection in both stages.
-    src_test = os.path.join("data", "processed", "test_examples.pkl")
-    with open(src_test, "rb") as f:
-        test_examples = pickle.load(f)
-
-    keep_users, idx = [], []
-    seen = {}
-    for i, uid in enumerate(test_examples["user_ids"]):
-        seen.setdefault(uid, []).append(i)
-        if len(seen) > n_users:
-            break
-    for uid, rows in list(seen.items())[:n_users]:
-        keep_users.append(uid)
-        idx.extend(rows[:4])
-
-    # REV-086: the example splits are numpy arrays now (they were lists of Python
-    # ints). Subset either representation.
-    n_rows = len(test_examples["user_ids"])
-    subset = {}
-    for k, v in test_examples.items():
-        if v is None or len(v) != n_rows:
-            continue
-        subset[k] = v[idx] if isinstance(v, np.ndarray) else [v[i] for i in idx]
-    with open(os.path.join(processed, "test_examples.pkl"), "wb") as f:
-        pickle.dump(subset, f)
-
-    # REV-111: this rewrites `test_examples.pkl` with a SCATTERED set of original rows,
-    # while `_build_subset_processed_dir` wrote `test_candidates.npy` as the first
-    # n_test rows -- so example i and candidate row i no longer described the same
-    # example. Nothing cross-checked them while personalization built its own
-    # candidates; now that it scores the stored rows by index, the fixture has to be
-    # self-consistent the way a real `data/processed` is. Take the SAME rows from the
-    # source matrix and re-fingerprint.
-    from data.sequence_generator import save_eval_candidates
-
-    src_cand = np.load(os.path.join("data", "processed", "test_candidates.npy"), mmap_mode="r")
-    save_eval_candidates(
-        [np.asarray(src_cand[i]) for i in idx],
-        os.path.join(processed, "test_candidates.npy"),
+    processed = build_tiny_processed_dir(dest)
+    cfg = tiny_config(
+        processed, os.path.join(dest, "outputs"), pretrain_epochs=1, max_steps_per_epoch=2,
+        federated_eval_examples=32,
     )
-
-    cfg = Config()
-    cfg.apply_model_config("t-small")
-    cfg.pretrain_epochs = 1
-    cfg.batch_size = 64
-    cfg.max_steps_per_epoch = 2
-    cfg.num_workers = 0
-    cfg.processed_data_dir = processed
-    cfg.output_dir = os.path.join(dest, "outputs")
-    cfg.checkpoint_dir = os.path.join(dest, "outputs", "checkpoints")
-    cfg.log_dir = os.path.join(dest, "outputs", "logs")
-    cfg.plot_dir = os.path.join(dest, "outputs", "plots")
     run_pretrain(cfg, "t-small")
-    return cfg, keep_users
+    import pickle
+
+    with open(os.path.join(processed, "test_examples.pkl"), "rb") as f:
+        users = [int(u) for u in pickle.load(f)["user_ids"][:n_users]]
+    return cfg, users
 
 
 class TestMoEExclusionGuard:
@@ -271,16 +221,9 @@ class TestFederatedConvergence:
 
 
 class TestFederatedValidationProtocol:
-    """REV-112: the federated validation pass must reuse the STORED candidate sets and
+    """REV-112: the federated validation pass must score the same validation rows every
+    other stage scores (each user's val target ranked against the full catalogue) and
     must not score the whole validation split on every round.
-
-    (a) `run_federated` rebuilt the entire validation candidate matrix on each call via
-        `generate_eval_candidates` with no `seed=`, so it silently used that function's
-        default of 42 -- a `--seed 123` run evaluated against seed-42 candidates while
-        every other stage used 123 -- and did ~1M sequential `filter_negatives` calls to
-        reproduce a matrix `val_candidates.npy` already holds, fingerprinted.
-    (b) `evaluate_model` was called on the full split inside the round loop, i.e. once
-        per `federated_rounds`, which dominated the stage's cost.
     """
 
     @staticmethod
@@ -292,7 +235,7 @@ class TestFederatedValidationProtocol:
         real = fed_mod.evaluate_model
 
         def spy(model, sequences, candidates, config, **kwargs):
-            seen.append((sequences.detach().cpu().clone(), candidates.detach().cpu().clone()))
+            seen.append((sequences.detach().cpu().clone(), candidates))
             return real(model, sequences, candidates, config, **kwargs)
 
         monkeypatch.setattr(fed_mod, "evaluate_model", spy)
@@ -300,21 +243,22 @@ class TestFederatedValidationProtocol:
 
     @pytest.mark.slow
     def test_scores_stored_candidates_and_bounds_each_round(self, tmp_path, monkeypatch):
-        import numpy as np
-
-        from data.sequence_generator import load_eval_candidates
+        from data.sequence_generator import load_tensorised
+        from evaluation.metrics import load_full_ranking
         from training.federated import run_federated
 
-        cfg, _ = _build_federated_fixture(str(tmp_path), n_val=32)
+        cfg, _ = _build_federated_fixture(str(tmp_path))
         cfg.federated_rounds = 2
         cfg.clients_per_round = 2
         cfg.local_epochs = 1
         cfg.federated_eval_examples = 8
 
-        stored = load_eval_candidates(
-            os.path.join(cfg.processed_data_dir, "val_candidates.npy")
+        val = load_tensorised(
+            os.path.join(cfg.processed_data_dir, "val_tensorised.pt"),
+            max_seq_length=cfg.max_seq_length,
         )
-        assert cfg.federated_eval_examples < stored.shape[0], (
+        stored = load_full_ranking(cfg.processed_data_dir, "val", val.targets, val.user_ids)
+        assert cfg.federated_eval_examples < len(stored), (
             "fixture must have more validation examples than the per-round bound, "
             "or the bounding half of this test proves nothing"
         )
@@ -333,31 +277,35 @@ class TestFederatedValidationProtocol:
         # (b) EVERY round -- the last one included -- scores exactly the bounded prefix.
         # REV-117: the final round used to be exempted, so rounds 0..N-2 and round N-1
         # were computed over different user populations and plotted as one series.
+        def same_rows(got, want):
+            return (
+                torch.equal(got.targets, want.targets)
+                and torch.equal(got.exclude_ptr, want.exclude_ptr)
+                and torch.equal(got.exclude_items, want.exclude_items)
+            )
+
         per_round = seen[:-1]
         for round_idx, (_, cands) in enumerate(per_round):
             assert len(cands) == cfg.federated_eval_examples, (
                 f"round {round_idx} scored {len(cands)} examples, expected the bounded "
                 f"{cfg.federated_eval_examples}"
             )
-            assert np.array_equal(
-                cands.numpy(), stored[: cfg.federated_eval_examples]
-            ), (
-                f"round {round_idx} must score a PREFIX of the stored rows, so the "
+            assert same_rows(cands, stored.rows(0, cfg.federated_eval_examples)), (
+                f"round {round_idx} must score a PREFIX of the validation rows, so the "
                 f"round-over-round curve stays comparable"
             )
 
         # ... and the final round additionally scores the full split, once.
         full_seqs, full_cands = seen[-1]
-        assert len(full_cands) == stored.shape[0], (
+        assert len(full_cands) == len(stored), (
             f"the final full-split pass scored {len(full_cands)} examples, expected the "
-            f"full {stored.shape[0]}-example split"
+            f"full {len(stored)}-example split"
         )
 
-        # (a) the rows scored are the STORED rows, not a regenerated matrix.
-        assert np.array_equal(full_cands.numpy(), stored), (
-            "run_federated scored candidates that are not the stored val_candidates.npy "
-            "rows -- federated NDCG is on a different candidate protocol from every "
-            "other stage"
+        # (a) the rows scored are the validation rows every other stage scores.
+        assert same_rows(full_cands, stored), (
+            "run_federated scored rows that are not the validation split's full-ranking "
+            "rows -- federated NDCG is on a different protocol from every other stage"
         )
 
         # REV-117: every point the convergence figure plots comes from the same number of
@@ -370,7 +318,7 @@ class TestFederatedValidationProtocol:
         assert logs[-1]["is_final_round"] is True
 
         # The headline number is the final round's full-split score, reported separately.
-        assert logs[-1]["val_examples_scored_full"] == stored.shape[0]
+        assert logs[-1]["val_examples_scored_full"] == len(stored)
         assert "val_ndcg_full" in logs[-1]
         assert "val_ndcg_full" not in logs[0], (
             "only the final round runs the full split"
@@ -384,7 +332,7 @@ class TestFederatedValidationProtocol:
     def test_zero_means_full_split_every_round(self, tmp_path, monkeypatch):
         from training.federated import run_federated
 
-        cfg, _ = _build_federated_fixture(str(tmp_path), n_val=32)
+        cfg, _ = _build_federated_fixture(str(tmp_path))
         cfg.federated_rounds = 2
         cfg.clients_per_round = 2
         cfg.local_epochs = 1
@@ -429,7 +377,7 @@ class TestPersonalizationEntryPoint:
 
 class TestPersonalizationNegativeSampling:
     """REV-111: negatives must come from a run-scoped RNG, and the per-user evaluation
-    must score the stored candidate rows.
+    must score the same test rows as the headline metrics.
 
     Both `filter_negatives` call sites in `local_train.py` omitted `rng=`, so the
     function fell back to a RandomState seeded from the TARGET ITEM. In `train_user_lora`
@@ -446,15 +394,10 @@ class TestPersonalizationNegativeSampling:
         import numpy as np
 
         import training.local_train as lt
-        from data.sequence_generator import load_eval_candidates
 
         cfg, _ = _build_federated_fixture(str(tmp_path))
         cfg.personalization_eval_users = 3
         cfg.local_epochs = 3
-
-        stored = load_eval_candidates(
-            os.path.join(cfg.processed_data_dir, "test_candidates.npy")
-        )
 
         # --- record every training negative draw ---
         real_filter = lt.filter_negatives
@@ -472,7 +415,7 @@ class TestPersonalizationNegativeSampling:
         scored = []
 
         def eval_spy(model, moe, seqs, targets, candidate_sets, config, **kwargs):
-            scored.append([c.detach().cpu().numpy().copy() for c in candidate_sets])
+            scored.append((list(targets), candidate_sets))
             return real_eval_user(model, moe, seqs, targets, candidate_sets, config, **kwargs)
 
         monkeypatch.setattr(lt, "evaluate_user", eval_spy)
@@ -499,15 +442,21 @@ class TestPersonalizationNegativeSampling:
             "still a function of the target, not of the run RNG"
         )
 
-        # Every scored candidate row is one of the stored rows.
+        # Every scored row ranks that user's test target against the full catalogue
+        # minus the user's train + val history -- the headline protocol.
         assert scored, "no user was evaluated"
-        stored_rows = {tuple(int(x) for x in row) for row in stored}
-        for user_sets in scored:
-            for row in user_sets:
-                assert tuple(int(x) for x in row) in stored_rows, (
-                    "personalization scored a candidate row that is not in the stored "
-                    "test_candidates.npy -- its NDCG is on a different protocol from "
-                    "the headline test metrics"
+        with open(os.path.join(cfg.processed_data_dir, "eval_user_history.pkl"), "rb") as f:
+            eval_history = pickle.load(f)
+        history_sets = {frozenset(int(i) for i in v) for v in eval_history.values()}
+        for targets, ranking in scored:
+            assert [int(t) for t in ranking.targets] == [int(t) for t in targets]
+            for i in range(len(ranking)):
+                lo, hi = int(ranking.exclude_ptr[i]), int(ranking.exclude_ptr[i + 1])
+                excluded = frozenset(int(x) for x in ranking.exclude_items[lo:hi])
+                assert excluded in history_sets, (
+                    "personalization excluded something other than the user's own "
+                    "history -- its NDCG is on a different protocol from the headline "
+                    "test metrics"
                 )
 
 

@@ -2,7 +2,7 @@ import math
 import torch
 import pytest
 
-from evaluation.metrics import compute_metrics, aggregate_metrics
+from evaluation.metrics import compute_metrics, compute_metrics_batch, aggregate_metrics
 
 
 class TestComputeMetrics:
@@ -157,3 +157,61 @@ class TestTieAveraged:
         scores[2, 5] = float("nan")
         with pytest.raises(ValueError, match="NaN"):
             compute_metrics_batch(scores, target_idx=0, k=self.K)
+
+
+class TestFullCatalogueRanking:
+    """Leave-one-out targets ranked against every item minus the user's history."""
+
+    def _ranking(self):
+        from evaluation.metrics import build_full_ranking
+
+        # vocab 8: pad 0, items 1..6, MASK 7.
+        return build_full_ranking([3, 5], [10, 11], {10: [1, 2], 11: [6]})
+
+    def test_target_first_and_excluded_columns_are_neg_inf(self):
+        from evaluation.metrics import catalogue_ranking_scores
+
+        ranking = self._ranking()
+        scores = torch.arange(16, dtype=torch.float32).reshape(2, 8)
+        ranked = catalogue_ranking_scores(scores.clone(), ranking)
+        assert ranked.shape == (2, 9)
+        assert ranked[:, 0].tolist() == [3.0, 13.0]
+        inf = float("-inf")
+        # Row 0 (user 10): pad, items 1 and 2 (history), item 3 (target column), MASK.
+        assert ranked[0, 1:].tolist() == [inf, inf, inf, inf, 4.0, 5.0, 6.0, inf]
+        # Row 1 (user 11): pad, item 5 (target column), item 6 (history), MASK.
+        assert ranked[1, 1:].tolist() == [inf, 9.0, 10.0, 11.0, 12.0, inf, inf, inf]
+
+    def test_metrics_rank_only_unseen_items(self):
+        from evaluation.metrics import catalogue_ranking_scores
+
+        ranking = self._ranking()
+        # Each target outscores every unseen item but not its own history / pad / MASK.
+        scores = torch.tensor([[9, 9, 9, 5, 1, 1, 1, 9],
+                               [9, 1, 2, 3, 4, 5, 9, 9]], dtype=torch.float32)
+        m = compute_metrics_batch(catalogue_ranking_scores(scores, ranking), k=1)
+        assert m["recall"].tolist() == [1.0, 1.0]
+
+    def test_rows_and_select_agree_with_building_directly(self):
+        from evaluation.metrics import build_full_ranking
+
+        hist = {0: [1, 2, 3], 1: [], 2: [4], 3: [5, 6]}
+        full = build_full_ranking([7, 8, 9, 10], [0, 1, 2, 3], hist)
+        for got, users, targets in (
+            (full.rows(1, 4), [1, 2, 3], [8, 9, 10]),
+            (full.select([3, 0]), [3, 0], [10, 7]),
+        ):
+            want = build_full_ranking(targets, users, hist)
+            assert torch.equal(got.targets, want.targets)
+            assert torch.equal(got.exclude_ptr, want.exclude_ptr)
+            assert torch.equal(got.exclude_items, want.exclude_items)
+
+    def test_popularity_reference_on_full_ranking(self):
+        from evaluation.metrics import evaluate_popularity
+
+        ranking = self._ranking()
+        popularity = torch.tensor([0, 9, 8, 7, 1, 6, 5, 0], dtype=torch.float32)
+        result = evaluate_popularity(ranking, popularity, k=1, batch_size=1)
+        # Row 0: target 3 (7) beats unseen 4, 5, 6 -> rank 1. Row 1: target 5 (6) is
+        # beaten by unseen 1, 2, 3 -> rank 4.
+        assert result["recall"]["mean"] == 0.5

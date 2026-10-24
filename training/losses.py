@@ -3,6 +3,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from typing import List, Optional, Tuple
 
 from models.transformer import l2_normalize
@@ -152,7 +153,85 @@ def _scale_or_identity(logit_scale: Optional[LogitScale]) -> LogitScale:
     return logit_scale if logit_scale is not None else LogitScale()
 
 
+#: Most logits `full_softmax_cross_entropy` materialises at once. A full-catalogue softmax
+#: at every training position is `(B * S) x vocab` -- ~1.4G logits at batch 256, width
+#: 200 and ML-20M's ~26.7k items -- so rows are processed in chunks of
+#: `FULL_SOFTMAX_CHUNK_ELEMENTS // vocab` (~2.5k rows, ~270 MB of fp32 logits).
+FULL_SOFTMAX_CHUNK_ELEMENTS = 2 ** 26
+
+
+def _cross_entropy_chunk(
+    h: torch.Tensor, w: torch.Tensor, targets: torch.Tensor, logit_scale: "LogitScale",
+) -> torch.Tensor:
+    return F.cross_entropy(logit_scale(h @ w.T), targets)
+
+
+def full_softmax_cross_entropy(
+    h: torch.Tensor,
+    targets: torch.Tensor,
+    w: torch.Tensor,
+    logit_scale: "LogitScale",
+) -> torch.Tensor:
+    """Mean cross-entropy of `h @ w.T` (every row of `w` a class) against `targets`.
+
+    Above one chunk of rows, each chunk runs under activation checkpointing, so only one
+    chunk's logits are alive at a time in the forward AND the backward (which recomputes
+    them). The result is the mean over all rows, as a chunk-size-weighted sum of chunk
+    means -- per-chunk means keep a pure-bf16 run's accumulator at loss magnitude.
+    """
+    n = h.shape[0]
+    rows = max(1, FULL_SOFTMAX_CHUNK_ELEMENTS // max(1, w.shape[0]))
+    if n <= rows:
+        return _cross_entropy_chunk(h, w, targets, logit_scale)
+    total = None
+    for start in range(0, n, rows):
+        stop = min(start + rows, n)
+        part = checkpoint(
+            _cross_entropy_chunk, h[start:stop], w, targets[start:stop], logit_scale,
+            use_reentrant=False, preserve_rng_state=False,
+        ) * ((stop - start) / n)
+        total = part if total is None else total + part
+    return total
+
+
+class NextItemLoss(nn.Module):
+    """LLM-style next-item objective: a full-catalogue softmax at EVERY position.
+
+    `targets[b, t]` is the item following position `t` (0 at padding). Positions are
+    pooled into one mean, so every training interaction counts equally whatever chunk it
+    sits in. Hidden states must be routed per position (see `models.moe.route_objective`)
+    so no position sees the items after it.
+    """
+
+    def __init__(self, normalize_embeddings: bool = False,
+                 logit_scale: Optional[LogitScale] = None):
+        super().__init__()
+        self.normalize_embeddings = normalize_embeddings
+        self.logit_scale = _scale_or_identity(logit_scale)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        targets: torch.Tensor,
+        item_emb_weight: torch.Tensor,
+        normalized_item_emb: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        valid = targets != 0
+        h = hidden_states[valid]
+        if h.shape[0] == 0:
+            # REV-048: detached zero -- the caller must drop this objective for this step.
+            return torch.tensor(0.0, device=hidden_states.device, dtype=hidden_states.dtype)
+        h = _maybe_normalize(h, self.normalize_embeddings)
+        w = _shared_normalized_table(
+            item_emb_weight, normalized_item_emb, self.normalize_embeddings,
+        )
+        return full_softmax_cross_entropy(h, targets[valid], w, self.logit_scale)
+
+
 class SampledSoftmaxLoss(nn.Module):
+    """Last-position next-item loss over sampled negatives. Used by per-user LoRA
+    training (local and federated); pretraining uses `NextItemLoss`."""
+
     def __init__(self, normalize_embeddings: bool = False,
                  logit_scale: Optional[LogitScale] = None):
         # REV-049: the number of negatives is implied by `neg_ids.shape[-1]` and is not a
@@ -211,8 +290,7 @@ class MaskedItemLoss(nn.Module):
         w = _shared_normalized_table(
             item_emb_weight, normalized_item_emb, self.normalize_embeddings,
         )
-        logits = self.logit_scale(h @ w.T)
-        return F.cross_entropy(logits, masked_targets)
+        return full_softmax_cross_entropy(h, masked_targets, w, self.logit_scale)
 
 
 class MultiStepLoss(nn.Module):
@@ -233,10 +311,19 @@ class MultiStepLoss(nn.Module):
     def forward(
         self,
         all_hidden_states: torch.Tensor,
-        targets_k: torch.Tensor,
+        targets: torch.Tensor,
         item_emb_weight: torch.Tensor,
         normalized_item_emb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """Predict the items 2, 3, ..., k+1 steps ahead from EVERY position.
+
+        `targets` is the training batch's `(B, S)` next-item targets, so the item `h`
+        steps after position `t` is `targets[:, t + h - 1]`. Horizon 1 is the next-item
+        objective's and is deliberately not duplicated; step `s` (0-based) predicts
+        horizon `s + 2`. A position counts when it is real and its horizon target lies
+        inside the chunk -- every target is strictly in the future of its position, and
+        the per-position routing keeps the hidden state causal.
+        """
         B, S, D = all_hidden_states.shape
         total_loss = torch.tensor(0.0, device=all_hidden_states.device, dtype=all_hidden_states.dtype)
         valid_steps = 0
@@ -245,31 +332,23 @@ class MultiStepLoss(nn.Module):
             item_emb_weight, normalized_item_emb, self.normalize_embeddings,
         )
 
-        # REV-105 / amended FR-3: EVERY step reads position S-1. All k projections
-        # receive one fixed context representation, so the horizons are uniform at
-        # 2, 3, ..., k+1 (horizon 1 is the next-item objective's target and is
-        # deliberately not duplicated here).
-        # This was `pos = S - 1 - step`, which paired step s with context items[:i-s] and
-        # target items[i+1+s] -- horizons 2, 4, 6, each step simultaneously pushing the
-        # target further out AND shortening the context. Neither scheme leaks (every
-        # target is strictly in the future of the position it is predicted from); the
-        # owner settled which experiment runs on 2026-09-17.
-        pos = S - 1
         for step in range(self.multi_step_k):
-            hidden_at_pos = all_hidden_states[:, pos, :]
-            projected = self.step_projections[step](hidden_at_pos)
+            shift = step + 1
+            if shift >= S:
+                break
+            step_targets = targets[:, shift:]
+            valid = (targets[:, :S - shift] != 0) & (step_targets != 0)
 
-            step_targets = targets_k[:, step]
-            valid_mask = step_targets != 0
-
-            if valid_mask.sum() == 0:
+            hidden = all_hidden_states[:, :S - shift][valid]
+            if hidden.shape[0] == 0:
                 continue
 
-            valid_hidden = _maybe_normalize(projected[valid_mask], self.normalize_embeddings)
-            valid_targets = step_targets[valid_mask]
-
-            logits = self.logit_scale(valid_hidden @ w.T)
-            step_loss = F.cross_entropy(logits, valid_targets)
+            projected = _maybe_normalize(
+                self.step_projections[step](hidden), self.normalize_embeddings,
+            )
+            step_loss = full_softmax_cross_entropy(
+                projected, step_targets[valid], w, self.logit_scale,
+            )
             total_loss = total_loss + step_loss
             valid_steps += 1
 

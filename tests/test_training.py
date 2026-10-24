@@ -144,86 +144,62 @@ class TestCheckpointRoundtrip:
         assert gn2.initial_losses["next_item"] == 3.5
 
 
-def _build_subset_processed_dir(dest, n_train=512, n_val=128, seed=0, n_test=128):
+def _build_subset_processed_dir(dest, n_users=256):
     """Materialise a small, self-consistent copy of `data/processed` under `dest`.
 
-    REV-005: the T6.3 gate must run a FULL epoch. Subsetting the dataset is acceptable;
-    subsetting the epoch is not. Everything `run_pretrain` reads is written here --
-    tensorised splits, stats, negative pool, both user histories and the fixed validation
-    candidate sets -- so the orchestrator runs unmodified against real MovieLens rows.
+    Keeps the first `n_users` users: their val/test rows (one each, leave-one-out),
+    their training histories (which `load_train_dataset` chunks), the stats, metadata,
+    negative pool, item sets and the manifest -- everything `run_pretrain` and the
+    downstream stages read, so the orchestrator runs unmodified against real MovieLens
+    rows. Returns `(training chunks at the default width, n_users)`.
     """
-    import json
     import pickle
     import shutil
 
     import numpy as np
     import torch
 
+    from data.sequence_generator import chunk_training_histories
+
     src = os.path.join("data", "processed")
     os.makedirs(dest, exist_ok=True)
 
-    def _subset_split(name, n):
+    users = None
+    for name in ("val", "test"):
         data = torch.load(os.path.join(src, f"{name}_tensorised.pt"), weights_only=True, mmap=True)
-        n = min(n, data["sequences"].shape[0])
-        out = {k: v[:n].clone() for k, v in data.items() if v is not None}
+        n_users = min(n_users, data["sequences"].shape[0])
+        out = {k: v[:n_users].clone() for k, v in data.items() if v is not None}
         torch.save(out, os.path.join(dest, f"{name}_tensorised.pt"))
-        return out, n
-
-    train_out, n_train = _subset_split("train", n_train)
-    val_out, n_val = _subset_split("val", n_val)
-    test_out, n_test = _subset_split("test", n_test)
-
-    shutil.copy(os.path.join(src, "dataset_stats.json"), os.path.join(dest, "dataset_stats.json"))
-    shutil.copy(os.path.join(src, "item_metadata.npy"), os.path.join(dest, "item_metadata.npy"))
-    for fname in ("global_negative_pool.npy", "global_negative_pool.npy.meta.json"):
-        shutil.copy(os.path.join(src, fname), os.path.join(dest, fname))
+        if users is None:
+            users = set(int(u) for u in out["user_ids"])
+        with open(os.path.join(src, f"{name}_examples.pkl"), "rb") as f:
+            examples = pickle.load(f)
+        # `.copy()` so the pickle holds only the subset, not a view of the full array.
+        subset_ex = {
+            k: v[:n_users].copy() if isinstance(v, np.ndarray) else v
+            for k, v in examples.items()
+        }
+        del examples
+        with open(os.path.join(dest, f"{name}_examples.pkl"), "wb") as f:
+            pickle.dump(subset_ex, f)
 
     # Histories are kept as distinct objects, exactly as run_pretrain asserts.
     for fname in ("train_user_history.pkl", "eval_user_history.pkl"):
         with open(os.path.join(src, fname), "rb") as f:
-            hist = pickle.load(f)
+            hist = {u: v for u, v in pickle.load(f).items() if int(u) in users}
         with open(os.path.join(dest, fname), "wb") as f:
             pickle.dump(hist, f)
+        if fname == "train_user_history.pkl":
+            n_chunks = len(chunk_training_histories(hist, Config().max_seq_length)["targets"])
 
-    # The stored validation candidate sets, truncated to the validation subset and
-    # re-fingerprinted so load_eval_candidates' integrity check still passes.
-    from data.sequence_generator import save_eval_candidates
-    for split, count in (("val", n_val), ("test", n_test)):
-        cand = np.load(os.path.join(src, f"{split}_candidates.npy"), mmap_mode="r")
-        save_eval_candidates(
-            [np.asarray(row) for row in cand[:count]],
-            os.path.join(dest, f"{split}_candidates.npy"),
-        )
+    for fname in (
+        "dataset_stats.json", "item_metadata.npy", "preprocessing_manifest.json",
+        "global_negative_pool.npy", "global_negative_pool.npy.meta.json",
+        "cold_items.pkl", "warm_items.pkl", "popularity_buckets.pkl",
+    ):
+        shutil.copy(os.path.join(src, fname), os.path.join(dest, fname))
 
-    # The *_examples.pkl artifacts the cold-start / long-tail / personalization stages read.
-    for split, count in (("train", n_train), ("val", n_val), ("test", n_test)):
-        src_ex = os.path.join(src, f"{split}_examples.pkl")
-        if not os.path.exists(src_ex):
-            continue
-        with open(src_ex, "rb") as f:
-            examples = pickle.load(f)
-        # specs/ablation-run T0.2 (owner-approved): since REV-086 the example splits are
-        # int32 NumPy arrays, not lists. Subsetting only lists copied the FULL ~2 GB
-        # arrays into every temp dir -- the bulk of the suite's ~16 GB temp footprint.
-        # `.copy()` so the pickle holds only the subset, not a view of the full array.
-        subset_ex = {
-            k: (
-                v[:count].copy() if isinstance(v, np.ndarray)
-                else v[:count] if isinstance(v, list)
-                else v
-            )
-            for k, v in examples.items()
-        }
-        del examples
-        with open(os.path.join(dest, f"{split}_examples.pkl"), "wb") as f:
-            pickle.dump(subset_ex, f)
-
-    for fname in ("cold_items.pkl", "warm_items.pkl", "popularity_buckets.pkl"):
-        src_f = os.path.join(src, fname)
-        if os.path.exists(src_f):
-            shutil.copy(src_f, os.path.join(dest, fname))
-
-    return n_train, n_val
+    return n_chunks, n_users
 
 
 MAX_SMOKE_STEPS = 12
@@ -644,7 +620,7 @@ class TestFewStepsSmoke:
             build_model, _build_loss_fns, train_one_step, save_checkpoint,
         )
         from training.gradnorm import GradNormController
-        from data.sequence_generator import load_tensorised, build_dataloader, GlobalNegativePool
+        from data.sequence_generator import load_train_dataset, build_dataloader
         from utils import get_device, resolve_dtype
 
         cfg = Config()
@@ -668,7 +644,7 @@ class TestFewStepsSmoke:
         if metadata_matrix is not None:
             cfg.feature_dim = metadata_matrix.shape[-1]
 
-        train_dataset = load_tensorised(os.path.join(processed, "train_tensorised.pt"), metadata_matrix)
+        train_dataset = load_train_dataset(processed, cfg.max_seq_length, metadata_matrix)
 
         # Subset to first 256 examples to save memory
         from data.sequence_generator import RecDataset
@@ -678,7 +654,6 @@ class TestFewStepsSmoke:
             train_dataset.targets[:n],
             train_dataset.user_ids[:n],
             train_dataset.lengths[:n],
-            train_dataset.targets_k[:n] if train_dataset.targets_k is not None else None,
             train_dataset.metadata_matrix,
         )
         del train_dataset
@@ -703,23 +678,12 @@ class TestFewStepsSmoke:
 
         loss_fns = _build_loss_fns(cfg, device)
 
-        neg_pool = GlobalNegativePool.load(os.path.join(processed, "global_negative_pool.npy"), set())
-        neg_array = neg_pool.pool
-
         losses_over_steps = []
         num_steps = 4
         for batch_idx, batch in enumerate(loader):
             if batch_idx >= num_steps:
                 break
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-            B = batch["sequences"].shape[0]
-            neg_start = (batch_idx * cfg.num_sampled_negatives) % max(1, len(neg_array) - cfg.num_sampled_negatives)
-            neg_slice = neg_array[neg_start:neg_start + B * cfg.num_sampled_negatives]
-            if len(neg_slice) < B * cfg.num_sampled_negatives:
-                neg_slice = np.resize(neg_slice, B * cfg.num_sampled_negatives)
-            batch["neg_ids"] = torch.tensor(
-                neg_slice.reshape(B, cfg.num_sampled_negatives), dtype=torch.long, device=device,
-            )
 
             loss_values, snapshots = train_one_step(
                 model, moe, batch, cfg, loss_fns, gradnorm,
@@ -795,11 +759,18 @@ class TestNegativePoolReuse:
         with pytest.raises(RuntimeError, match="fingerprint mismatch"):
             GlobalNegativePool.load(path, warm)
 
-    def test_run_pretrain_never_calls_build_once(self, tmp_path, monkeypatch):
+    def test_run_pretrain_never_calls_build_once(self, tmp_path, monkeypatch, tiny_processed_dir):
         """AC-05 and the steering anti-pattern 'No per-epoch negative pool regeneration':
         run the real orchestrator for two epochs with `build_once` booby-trapped."""
         from data.sequence_generator import GlobalNegativePool
+        from tests.conftest import tiny_config
         from training.pretrain import run_pretrain
+
+        # Preprocessing builds the pool once; that happens before the trap is armed.
+        cfg = tiny_config(
+            tiny_processed_dir(), str(tmp_path / "outputs"),
+            pretrain_epochs=2, max_steps_per_epoch=2,
+        )
 
         def _boom(self, pool_size):
             raise AssertionError(
@@ -808,21 +779,6 @@ class TestNegativePoolReuse:
             )
 
         monkeypatch.setattr(GlobalNegativePool, "build_once", _boom)
-
-        processed = tmp_path / "processed"
-        _build_subset_processed_dir(str(processed), n_train=128, n_val=32)
-
-        cfg = Config()
-        cfg.apply_model_config("t-small")
-        cfg.pretrain_epochs = 2
-        cfg.batch_size = 64
-        cfg.max_steps_per_epoch = 2
-        cfg.num_workers = 0
-        cfg.processed_data_dir = str(processed)
-        cfg.output_dir = str(tmp_path / "outputs")
-        cfg.checkpoint_dir = str(tmp_path / "outputs" / "checkpoints")
-        cfg.log_dir = str(tmp_path / "outputs" / "logs")
-        cfg.plot_dir = str(tmp_path / "outputs" / "plots")
 
         result = run_pretrain(cfg, "t-small")
         assert len(result["epoch_loss_windows"]) == 2
@@ -876,11 +832,7 @@ class TestMoECacheLifetime:
         b = config.batch_size
         return {
             "sequences": torch.randint(1, config.num_items + 1, (b, config.max_seq_length)),
-            "targets": torch.randint(1, config.num_items + 1, (b,)),
-            "neg_ids": torch.randint(
-                1, config.num_items + 1, (b, config.num_sampled_negatives),
-            ),
-            "targets_k": torch.randint(1, config.num_items + 1, (b, config.multi_step_k)),
+            "targets": torch.randint(1, config.num_items + 1, (b, config.max_seq_length)),
         }
 
     def test_cache_is_released_when_the_step_returns(self):
@@ -915,10 +867,11 @@ class TestMoECacheLifetime:
     def test_cache_still_serves_the_objectives_within_one_step(self):
         """Releasing at the end must not break the within-step sharing FR-1 requires.
 
-        The three objectives that score the ORIGINAL sequence share one `all_hidden`, so
-        the experts must run once for all of them. The contrastive objective forwards an
-        augmented view, which is a genuinely different input and correctly misses the
-        cache, so it is disabled here to isolate the sharing being tested.
+        Next-item and multi-step score the clean sequence and share one `all_hidden`, so
+        the experts must run once for both; the masked-item objective forwards the masked
+        sequence, a genuinely different input, so it runs them exactly once more. The
+        contrastive objective's augmented view would add another input, so it is disabled
+        here to isolate the sharing being tested.
         """
         from training.pretrain import train_one_step
 
@@ -937,9 +890,9 @@ class TestMoECacheLifetime:
         finally:
             handle.remove()
 
-        assert len(calls) == 1, (
+        assert len(calls) == 2, (
             f"experts ran {len(calls)} times in one step; the shared-expert cache "
-            f"should compute them once for every objective scoring the same sequence"
+            f"should compute them once per distinct input (clean and masked)"
         )
 
 
@@ -1062,9 +1015,7 @@ class TestBatchedFiniteChecks:
         torch.manual_seed(1)
         batch = {
             "sequences": torch.randint(1, config.num_items + 1, (b, S)),
-            "targets": torch.randint(1, config.num_items + 1, (b,)),
-            "neg_ids": torch.randint(1, config.num_items + 1, (b, config.num_sampled_negatives)),
-            "targets_k": torch.randint(1, config.num_items + 1, (b, config.multi_step_k)),
+            "targets": torch.randint(1, config.num_items + 1, (b, S)),
         }
         return config, model, moe, loss_fns, gradnorm, optimizer, scheduler, batch, params, random.Random(0)
 
@@ -1135,3 +1086,79 @@ class TestBatchedFiniteChecks:
             assert isinstance(value, torch.Tensor) and value.dim() == 0, name
             assert math.isfinite(value)  # 0-d tensors still work with math/float/format
             assert f"{value:.4f}"
+
+
+class TestEveryParameterTrains:
+    """One real `train_one_step` with every objective on must give EVERY parameter of the
+    backbone, the MoE layer and the loss heads a non-zero gradient, and move it."""
+
+    @pytest.mark.parametrize("moe_variant", ["arv_mmoe", "mmoe", "none"])
+    def test_every_parameter_gets_a_gradient_and_moves(self, moe_variant):
+        import random
+
+        from torch.optim.lr_scheduler import LambdaLR
+
+        from training.gradnorm import GradNormController, enabled_objectives
+        from training.pretrain import (
+            _build_loss_fns, build_model, build_optimizer_param_groups,
+            collect_trainable_parameters, train_one_step,
+        )
+
+        config = Config()
+        config.apply_model_config("t-small")
+        config.num_items, config.vocab_size = 300, 302
+        config.use_metadata, config.feature_dim = True, 6
+        config.device, config.dtype, config.mixed_precision = "cpu", "bf16", True
+        config.batch_size, config.max_seq_length = 8, 12
+        config.moe_variant = moe_variant
+        config.contrastive_interval = 1
+        config.learnable_logit_scale = True
+        torch.manual_seed(0)
+        model, moe = build_model(config)
+        loss_fns = _build_loss_fns(config, torch.device("cpu"))
+        params = collect_trainable_parameters(model, moe, loss_fns)
+        optimizer = torch.optim.AdamW(build_optimizer_param_groups(params, loss_fns), lr=1e-3)
+        scheduler = LambdaLR(optimizer, lr_lambda=lambda step: 1.0)
+        gradnorm = GradNormController(
+            config.gradnorm_alpha, config.gradnorm_lr,
+            enabled_objectives=enabled_objectives(config),
+            primary_objective=config.gradnorm_primary_objective,
+            aux_budget=config.gradnorm_aux_budget,
+        )
+
+        gen = torch.Generator().manual_seed(1)
+        # Every position real, so every position embedding is used.
+        seqs = torch.randint(1, config.num_items + 1, (8, 12), generator=gen)
+        targets = torch.randint(1, config.num_items + 1, (8, 12), generator=gen)
+        metadata_matrix = torch.rand(config.vocab_size, config.feature_dim, generator=gen)
+        metadata_matrix[0] = 0
+        metadata_matrix[-1] = 0
+        batch = {"sequences": seqs, "targets": targets, "metadata": metadata_matrix[seqs]}
+
+        named = (
+            [(f"model.{n}", p) for n, p in model.named_parameters()]
+            + [(f"moe.{n}", p) for n, p in moe.named_parameters()]
+            + [(f"loss.{k}.{n}", p) for k, fn in loss_fns.items() for n, p in fn.named_parameters()]
+        )
+        before = {n: p.detach().clone() for n, p in named}
+
+        values, _ = train_one_step(
+            model, moe, batch, config, loss_fns, gradnorm, optimizer, scheduler, 0,
+            random.Random(0), mask_rng=torch.Generator().manual_seed(2),
+            metadata_matrix=metadata_matrix,
+        )
+        assert {"next_item", "masked_item", "multi_step", "contrastive"} <= set(values)
+
+        no_grad = [n for n, p in named if p.grad is None or not bool(p.grad.abs().sum() > 0)]
+        assert not no_grad, f"parameters with no gradient: {no_grad}"
+        frozen = [n for n, p in named if torch.equal(p.detach(), before[n])]
+        assert not frozen, f"parameters the optimizer step did not move: {frozen}"
+
+        # Row level for the tables: the full-catalogue softmax reaches every item row,
+        # all-real sequences reach every position, and all four objectives route.
+        tables = {"model.item_embedding.weight", "model.position_embedding.weight",
+                  "moe.objective_embeddings.weight"}
+        for n, p in named:
+            if n in tables:
+                dead = (p.grad.abs().sum(dim=1) == 0).nonzero().flatten().tolist()
+                assert not dead, f"{n}: rows with no gradient {dead[:10]}"

@@ -17,7 +17,7 @@ from models.transformer import TransformerModel
 from models.moe import MoELayer
 from training.losses import (
     mask_metadata,
-    SampledSoftmaxLoss,
+    NextItemLoss,
     MaskedItemLoss,
     MultiStepLoss,
     InfoNCELoss,
@@ -37,17 +37,14 @@ from training.grad_projection import project_conflicting_gradients, static_objec
 from data.augmentation import augment_sequence
 from data.sequence_generator import (
     load_tensorised,
+    load_train_dataset,
     load_metadata_matrix,
     build_dataloader,
-    GlobalNegativePool,
-    generate_eval_candidates,
-    load_eval_candidates,
-    sample_training_negatives,
 )
 from evaluation.routing_diagnostics import save_routing_diagnostics
 from evaluation.gradient_diagnostics import run_gradient_diagnostics
 from evaluation.metrics import (
-    EVAL_PROTOCOL, evaluate_model, evaluate_popularity, item_popularity,
+    EVAL_PROTOCOL, evaluate_model, evaluate_popularity, item_popularity, load_full_ranking,
 )
 from utils import (
     get_device, resolve_dtype, resolve_param_dtype, make_grad_scaler, get_source_revision,
@@ -192,9 +189,7 @@ def train_one_step(
     use_scaler = scaler is not None and scaler.is_enabled()
 
     seq = batch["sequences"]
-    targets = batch["targets"]
-    neg_ids = batch["neg_ids"]
-    targets_k = batch.get("targets_k")
+    targets = batch["targets"]          # (B, S): the next item at every position, 0 = pad
     metadata = batch.get("metadata")
 
     if config.use_masked_lm:
@@ -207,30 +202,44 @@ def train_one_step(
         # masked position still carried the true item's genome vector into the forward
         # pass -- the MIM objective was being handed the answer. Zeroing the masked rows
         # is what `metadata_matrix[masked_seq]` yields, since MASK_ID's row is all-zero.
-        metadata = mask_metadata(metadata, mask_positions)
+        masked_metadata = mask_metadata(metadata, mask_positions)
     else:
-        masked_seq = seq
         mask_positions = None
         true_ids = None
 
     # specs/eval-integrity FR-3.2 / FR-3.4: this step owns its autocast region (bf16
-    # under mixed precision), from the first forward through `L_total` -- both forwards,
+    # under mixed precision), from the first forward through `L_total` -- every forward,
     # every MoE call and every loss. Backward, GradNorm, clipping and the optimizer step
     # run OUTSIDE it. `autocast_context` has the weight cache off, so the forward always
     # sees the current weights, even when a caller has its own region open.
     with autocast_context(config, device_type=next(model.parameters()).device.type):
-        all_hidden = model(masked_seq, metadata=metadata, return_all_hidden=True)
+        # Owner decision 2026-10-25: only the masked-item objective sees the masked
+        # sequence. Next-item, multi-step and contrastive read this clean forward; MIM gets
+        # its own forward of `masked_seq` below.
+        all_hidden = model(seq, metadata=metadata, return_all_hidden=True)
         pooled = all_hidden[:, -1, :]
 
         moe.clear_cache()
         active_losses = {}
         routing_snapshots = {}
 
-        Z_next, r_next = moe(all_hidden, pooled, 0)
-        user_emb = Z_next[:, -1, :]
-        active_losses["next_item"] = loss_fns["next_item"](user_emb, targets, neg_ids, model.item_emb_weight)
+        # REV-077: both full-vocabulary objectives need the SAME normalized item table, and
+        # `l2_normalize` builds a (vocab, D) fp32 intermediate. Compute it once per step
+        # and share it, rather than once inside each objective.
+        normalized_item_emb = normalize_item_table(
+            model.item_emb_weight, config.normalize_embeddings,
+        )
+
+        # LLM-style: a full-catalogue next-item prediction at every position, each routed
+        # from its own causal hidden state (passing `all_hidden` as the routing input), so
+        # no position's routing has seen the items after it. The snapshot is the last
+        # position's routing -- what serving uses.
+        Z_next, r_next = moe(all_hidden, all_hidden, 0)
+        active_losses["next_item"] = loss_fns["next_item"](
+            Z_next, targets, model.item_emb_weight, normalized_item_emb=normalized_item_emb,
+        )
         if r_next is not None:
-            routing_snapshots["next_item"] = r_next.detach()
+            routing_snapshots["next_item"] = r_next[:, -1].detach()
 
         # REV-048: the spec's Edge Cases require an objective with no valid positions /
         # targets in this batch to be EXCLUDED from the GradNorm active set. Its loss is a
@@ -239,36 +248,17 @@ def train_one_step(
         # mid-training. `has_valid_signal` is the exclusion test.
         skipped_objectives = []
 
-        # REV-077: both full-vocabulary objectives need the SAME normalized item table, and
-        # `l2_normalize` builds a 26 MB fp32 intermediate at t-base dimensions. Compute it
-        # once per step and share it, rather than once inside each objective.
-        normalized_item_emb = normalize_item_table(
-            model.item_emb_weight, config.normalize_embeddings,
-        )
-
-        if config.use_masked_lm and mask_positions is not None:
-            Z_mim, r_mim = moe(all_hidden, pooled, 1)
-            mim_loss = loss_fns["masked_item"](
-                Z_mim, mask_positions, true_ids, model.item_emb_weight,
-                normalized_item_emb=normalized_item_emb,
-            )
-            if has_valid_signal(mim_loss):
-                active_losses["masked_item"] = mim_loss
-                if r_mim is not None:
-                    routing_snapshots["masked_item"] = r_mim.detach()
-            else:
-                skipped_objectives.append("masked_item")
-
-        if config.use_multi_step and targets_k is not None:
-            Z_ms, r_ms = moe(all_hidden, pooled, 2)
+        if config.use_multi_step:
+            # Predicts from every position too, so it is routed per position as well.
+            Z_ms, r_ms = moe(all_hidden, all_hidden, 2)
             ms_loss = loss_fns["multi_step"](
-                Z_ms, targets_k, model.item_emb_weight,
+                Z_ms, targets, model.item_emb_weight,
                 normalized_item_emb=normalized_item_emb,
             )
             if has_valid_signal(ms_loss):
                 active_losses["multi_step"] = ms_loss
                 if r_ms is not None:
-                    routing_snapshots["multi_step"] = r_ms.detach()
+                    routing_snapshots["multi_step"] = r_ms[:, -1].detach()
             else:
                 skipped_objectives.append("multi_step")
 
@@ -311,6 +301,28 @@ def train_one_step(
             active_losses["contrastive"] = loss_fns["contrastive"](z_orig, z_aug)
             if r_cl is not None:
                 routing_snapshots["contrastive"] = r_cl.detach()
+
+        # Last, so the MoE expert cache is computed once per input (clean, augmented,
+        # masked) rather than recomputed when objectives alternate between them.
+        if config.use_masked_lm and mask_positions is not None:
+            masked_hidden = model(masked_seq, metadata=masked_metadata, return_all_hidden=True)
+            Z_mim, r_mim = moe(masked_hidden, masked_hidden[:, -1, :], 1)
+            mim_loss = loss_fns["masked_item"](
+                Z_mim, mask_positions, true_ids, model.item_emb_weight,
+                normalized_item_emb=normalized_item_emb,
+            )
+            if has_valid_signal(mim_loss):
+                active_losses["masked_item"] = mim_loss
+                if r_mim is not None:
+                    routing_snapshots["masked_item"] = r_mim.detach()
+            else:
+                skipped_objectives.append("masked_item")
+
+        # Objective order (OBJECTIVE_ORDER) for everything downstream that iterates these.
+        active_losses = {k: active_losses[k] for k in OBJECTIVE_ORDER if k in active_losses}
+        routing_snapshots = {
+            k: routing_snapshots[k] for k in OBJECTIVE_ORDER if k in routing_snapshots
+        }
 
         if gradnorm is not None:
             L_total = gradnorm.weighted_sum(active_losses)
@@ -410,8 +422,8 @@ def train_one_step(
 
     # REV-071: release the cached expert outputs HERE, not only at the start of the next
     # step. `_cached_expert_outputs` is a (B, S, K, D) tensor still attached to this
-    # step's autograd graph -- ~131 MB of activations plus the graph at batch_size=256,
-    # S=50, K=4, D=320 in bf16 -- and the start-of-step call meant it survived from
+    # step's autograd graph -- ~525 MB of activations plus the graph at batch_size=256,
+    # S=200, K=4, D=320 in bf16 -- and the start-of-step call meant it survived from
     # `optimizer.step()` until the next step began, coexisting with the new forward's
     # allocation. The cache can never be hit across steps anyway: every step brings a
     # fresh `all_hidden`. The start-of-step `clear_cache()` is kept, so the invariant
@@ -485,8 +497,9 @@ def setup_epoch_logger(
     return epoch_logger
 
 
-#: Rows per batch for the popularity-only reference (a gather plus metrics, no model).
-POPULARITY_EVAL_BATCH = 65536
+#: Rows per batch for the popularity-only reference (no model). Each row ranks the full
+#: catalogue, so a batch is `rows x vocab` fp32 scores: ~110 MB at 1024 rows on ML-20M.
+POPULARITY_EVAL_BATCH = 1024
 
 
 def log_popularity_header(
@@ -611,7 +624,7 @@ def _build_loss_fns(config: Config, device: torch.device) -> dict:
     dtype = resolve_param_dtype(config)
     norm = config.normalize_embeddings
     loss_fns = {
-        "next_item": SampledSoftmaxLoss(
+        "next_item": NextItemLoss(
             normalize_embeddings=norm, logit_scale=build_logit_scale(config, device),
         ),
     }
@@ -749,47 +762,6 @@ def collect_validation_routing(
     return {name: torch.cat(v, dim=0) for name, v in collected.items() if v}
 
 
-def _host_numpy(t: torch.Tensor) -> np.ndarray:
-    """A NumPy view of a host tensor; a device tensor is copied back (one sync).
-
-    specs/ablation-run D4: the training loop now samples negatives on the CPU batch
-    BEFORE the host->device copy, so this is a zero-copy view there.
-    """
-    if t.device.type == "cpu":
-        return t.detach().numpy()
-    return t.detach().cpu().numpy()
-
-
-def attach_training_negatives(
-    batch: dict,
-    pool: np.ndarray,
-    history_arrays: Dict[int, np.ndarray],
-    config: Config,
-    rng: np.random.RandomState,
-    device: torch.device,
-    buffer: Optional[np.ndarray] = None,
-) -> dict:
-    """Attach filtered per-example negatives to a batch, in place.
-
-    REV-012 / REV-009a: this is the single definition of how training negatives are
-    drawn. The training loop and `run_gradient_diagnostics` both go through it, so the
-    diagnostic pass measures the same objective the optimizer sees, and a dataloader
-    batch (which carries no `neg_ids`) is usable at either site.
-    """
-    neg_ids = sample_training_negatives(
-        pool=pool,
-        targets=_host_numpy(batch["targets"]),
-        user_ids=_host_numpy(batch["user_ids"]),
-        history_arrays=history_arrays,
-        num_negatives=config.num_sampled_negatives,
-        num_items=config.num_items,
-        rng=rng,
-        _buffer=buffer,
-    )
-    batch["neg_ids"] = torch.from_numpy(neg_ids).to(device=device, dtype=torch.long)
-    return batch
-
-
 def collect_trainable_parameters(
     model: TransformerModel, moe: MoELayer, loss_fns: dict,
 ) -> List[torch.nn.Parameter]:
@@ -807,71 +779,23 @@ def collect_trainable_parameters(
     return params
 
 
-def _load_or_build_val_candidates(
-    config: Config,
-    processed: str,
-    val_dataset,
-    neg_array: np.ndarray,
-    eval_user_history: dict,
-    device: torch.device,
-) -> torch.Tensor:
-    """Load the pre-stored validation candidate sets, building them only as a fallback.
-
-    REV-041 / T8.3: the fixed candidate sets are generated once during preprocessing and
-    reused by every model evaluation. Regenerating them per run (which is what used to
-    happen, on every epoch of every run) made cross-model identity incidental rather
-    than structural.
-
-    REV-063: returns ONE `(N, C)` CPU tensor. This used to explode the matrix into N
-    individual device tensors -- 993,372 small accelerator allocations held for the whole
-    run. `evaluate_model` slices the batch it needs and moves only that across.
-    """
-    path = os.path.join(processed, "val_candidates.npy")
-    if os.path.exists(path):
-        matrix = load_eval_candidates(path)
-        if matrix.shape[0] != len(val_dataset):
-            raise RuntimeError(
-                f"Pre-stored val candidate sets have {matrix.shape[0]} rows but the "
-                f"validation split has {len(val_dataset)} examples. Re-run "
-                f"--stage preprocess."
-            )
-        return torch.as_tensor(matrix, dtype=torch.long)
-
-    logger.warning(
-        "%s not found -- regenerating validation candidate sets. Re-run "
-        "--stage preprocess so every model evaluates against the same stored sets.",
-        path,
-    )
-    val_examples = {
-        "targets": val_dataset.targets.numpy().tolist(),
-        "user_ids": val_dataset.user_ids.numpy().tolist(),
-    }
-    candidates = generate_eval_candidates(
-        val_examples, neg_array, eval_user_history,
-        config.num_sampled_negatives,
-        padding_id=0, mask_id=config.num_items + 1, seed=config.seed,
-    )
-    return torch.as_tensor(np.asarray(candidates), dtype=torch.long)
-
-
 # ---------------- epoch-granular exact resume (specs/ablation-run FR-8, design D8) ----------
 
 LAST_CHECKPOINT = "last.pt"
 #: GradNorm lambdas are appended to `gradnorm_{model}.jsonl` every this many global steps.
 GRADNORM_LOG_INTERVAL_STEPS = 100
-RESUME_FORMAT = 1
+#: 2 = no negative-sampling RNG (pretraining scores the full catalogue).
+RESUME_FORMAT = 2
 _REVISION_KEYS = ("commit", "source_hash", "dirty")
 
 
 def _capture_rng_state(
     rng: random.Random,
-    neg_rng: np.random.RandomState,
     mask_rng: torch.Generator,
     device: torch.device,
 ) -> dict:
     return {
         "python": rng.getstate(),
-        "numpy_neg": neg_rng.get_state(),
         "torch_mask": mask_rng.get_state(),
         "torch_cpu": torch.get_rng_state(),
         "torch_cuda": torch.cuda.get_rng_state_all() if device.type == "cuda" else None,
@@ -888,12 +812,10 @@ def _capture_rng_state(
 def _restore_rng_state(
     state: dict,
     rng: random.Random,
-    neg_rng: np.random.RandomState,
     mask_rng: torch.Generator,
     device: torch.device,
 ) -> None:
     rng.setstate(state["python"])
-    neg_rng.set_state(state["numpy_neg"])
     mask_rng.set_state(state["torch_mask"])
     torch.set_rng_state(state["torch_cpu"])
     saved_cuda = state.get("torch_cuda")
@@ -1018,10 +940,8 @@ def run_pretrain(config: Config, model_name: str) -> Dict[str, float]:
     if metadata_matrix is not None:
         config.feature_dim = metadata_matrix.shape[-1]
 
-    train_dataset = load_tensorised(
-        os.path.join(processed, "train_tensorised.pt"), metadata_matrix,
-        max_seq_length=config.max_seq_length,
-    )
+    # The training split is chunked at THIS run's width from the per-user histories.
+    train_dataset = load_train_dataset(processed, config.max_seq_length, metadata_matrix)
     val_dataset = load_tensorised(
         os.path.join(processed, "val_tensorised.pt"), metadata_matrix,
         max_seq_length=config.max_seq_length,
@@ -1070,11 +990,6 @@ def run_pretrain(config: Config, model_name: str) -> Dict[str, float]:
         gradnorm.log_lambdas = torch.nn.Parameter(gradnorm.log_lambdas.data.to(device=device))
         gradnorm.optimizer = torch.optim.Adam([gradnorm.log_lambdas], lr=config.gradnorm_lr)
 
-    # AC-05: loaded once, outside the epoch loop, never regenerated per epoch.
-    neg_pool_path = os.path.join(processed, "global_negative_pool.npy")
-    neg_pool = GlobalNegativePool.load(neg_pool_path, set())
-    neg_array = neg_pool.pool
-
     # REV-039: steering/testing.md lists this among the assertions that must be active
     # during all training/evaluation. Both histories are loaded so the guard is real.
     with open(os.path.join(processed, "train_user_history.pkl"), "rb") as f:
@@ -1084,19 +999,6 @@ def run_pretrain(config: Config, model_name: str) -> Dict[str, float]:
     assert train_user_history is not eval_user_history, (
         "train_user_history and eval_user_history must be distinct objects"
     )
-
-    # REV-012: training negatives are drawn per example, excluding the target, pad,
-    # mask and the user's TRAINING history. Arrays are prebuilt once for the bitmap
-    # membership test in `sample_training_negatives`.
-    train_history_arrays = {
-        int(u): np.asarray(items, dtype=np.int64)
-        for u, items in train_user_history.items()
-    }
-
-    # REV-012: a run-scoped RNG (seeded from config.seed) drives negative sampling, and
-    # the membership bitmap is allocated once and reused across steps.
-    neg_rng = np.random.RandomState(config.seed)
-    neg_buffer = np.zeros((config.batch_size, config.num_items + 2), dtype=bool)
 
     # REV-054: run-scoped generator for masking instead of the global torch RNG.
     mask_rng = torch.Generator(device="cpu")
@@ -1108,21 +1010,18 @@ def run_pretrain(config: Config, model_name: str) -> Dict[str, float]:
     if metadata_matrix is not None:
         metadata_matrix_t = metadata_matrix.to(dtype)
 
-    def attach_negatives(batch: dict) -> dict:
-        return attach_training_negatives(
-            batch, neg_array, train_history_arrays, config, neg_rng, device, neg_buffer,
-        )
-
     # REV-063: the stored `(N, S)` tensor IS the batch source; slicing it into N
     # per-example tensors up front cost ~1M allocations and bought nothing.
+    # Leave-one-out: one row per user, its target ranked against the full catalogue
+    # minus the user's training history.
     val_sequences = val_dataset.sequences
-    val_candidate_tensors = _load_or_build_val_candidates(
-        config, processed, val_dataset, neg_array, eval_user_history, device,
+    val_ranking = load_full_ranking(
+        processed, "val", val_dataset.targets, val_dataset.user_ids,
     )
-    # specs/eval-integrity FR-5.3 / FR-7: the popularity-only floor on the same val rows
-    # and candidates, computed once per run (no model involved).
+    # specs/eval-integrity FR-5.3 / FR-7: the popularity-only floor on the same val rows,
+    # computed once per run (no model involved).
     val_popularity_reference = evaluate_popularity(
-        val_candidate_tensors, item_popularity(train_user_history, config.vocab_size),
+        val_ranking, item_popularity(train_user_history, config.vocab_size),
         k=config.eval_k, batch_size=POPULARITY_EVAL_BATCH,
     )
 
@@ -1157,7 +1056,7 @@ def run_pretrain(config: Config, model_name: str) -> Dict[str, float]:
         )
         if state.get("scaler") is not None and scaler.is_enabled():
             scaler.load_state_dict(state["scaler"])
-        _restore_rng_state(state["rng"], rng, neg_rng, mask_rng, device)
+        _restore_rng_state(state["rng"], rng, mask_rng, device)
         train_loader.generator.set_state(state["loader_generators"]["train"])
         diag_loader.generator.set_state(state["loader_generators"]["diag"])
         start_epoch = int(state["epoch"]) + 1
@@ -1183,7 +1082,7 @@ def run_pretrain(config: Config, model_name: str) -> Dict[str, float]:
         # Written once, as a header: it carries no `epoch=N`, so `_truncate_epoch_log`
         # keeps it on resume (and a resumed run does not write it again).
         log_popularity_header(epoch_logger, val_popularity_reference, config.eval_k,
-                              int(val_candidate_tensors.shape[0]))
+                              len(val_ranking))
 
     non_blocking = device.type == "cuda" and config.pin_memory
 
@@ -1195,11 +1094,7 @@ def run_pretrain(config: Config, model_name: str) -> Dict[str, float]:
         for batch_idx, batch in enumerate(train_loader):
             if config.max_steps_per_epoch > 0 and batch_idx >= config.max_steps_per_epoch:
                 break
-            # specs/ablation-run D4: negatives are drawn from the CPU batch the loader
-            # yielded (same inputs, same `neg_rng` draws, same output), so the step no
-            # longer copies `targets`/`user_ids` device->host. Then one host->device move,
-            # asynchronous from pinned memory on CUDA.
-            batch = attach_negatives(batch)
+            # One host->device move, asynchronous from pinned memory on CUDA.
             batch = {
                 k: v.to(device, non_blocking=non_blocking) if isinstance(v, torch.Tensor) else v
                 for k, v in batch.items()
@@ -1231,7 +1126,6 @@ def run_pretrain(config: Config, model_name: str) -> Dict[str, float]:
                 run_gradient_diagnostics(
                     model, moe, diag_loader, loss_fns,
                     get_anchor_layer_params(model, config), config, model_name,
-                    negative_sampler=attach_negatives,
                     metadata_matrix=metadata_matrix_t,
                     augment_rng=rng,
                     source_revision=get_source_revision(),
@@ -1275,7 +1169,7 @@ def run_pretrain(config: Config, model_name: str) -> Dict[str, float]:
         moe.eval()
         with torch.no_grad():
             val_metrics = evaluate_model(
-                model, val_sequences, val_candidate_tensors, config,
+                model, val_sequences, val_ranking, config,
                 moe_layer=moe, metadata_matrix=val_dataset.metadata_matrix,
             )
 
@@ -1325,7 +1219,7 @@ def run_pretrain(config: Config, model_name: str) -> Dict[str, float]:
             "epoch_mean_losses": list(epoch_mean_losses),
             "epoch_loss_windows": list(epoch_loss_windows),
             "scaler": scaler.state_dict() if scaler.is_enabled() else None,
-            "rng": _capture_rng_state(rng, neg_rng, mask_rng, device),
+            "rng": _capture_rng_state(rng, mask_rng, device),
             "loader_generators": {
                 "train": train_loader.generator.get_state(),
                 "diag": diag_loader.generator.get_state(),

@@ -103,7 +103,7 @@ project_root/
 │   ├── raw/                        ← 6 MovieLens-20M CSV files (auto-downloaded)
 │   ├── processed/                  ← Tensorised datasets, mappings, pools
 │   ├── preprocessing.py            ← Kaggle acquisition, ratings pipeline, cold-start, metadata
-│   ├── sequence_generator.py       ← Chronological splitting, tensorisation, negative pool
+│   ├── sequence_generator.py       ← Training chunks, eval rows, tensorisation, negative pool
 │   └── augmentation.py             ← Random crop, mask, subsequence sampling
 │
 ├── models/
@@ -477,9 +477,9 @@ The federated setting personalizes a globally pretrained model using LoRA adapte
 | Recall@10 | `1` (= Hit Rate for single-target protocol) |
 | Precision@10 | `1 / 10` |
 
-### Fixed Candidate Protocol
+### Leave-One-Out, Full-Catalogue Protocol
 
-Every evaluation example uses a pre-stored candidate set containing the ground-truth target plus filtered negatives. Candidate sets are generated once and shared identically across all model evaluations. Negatives exclude the target, padding, mask, and history-filtered items.
+Each user's last interaction is the test target and the second-to-last the validation target. The target is ranked against every item in the catalogue except the user's earlier interactions (padding and mask are never candidates), so every model is scored on identical rows with no candidate sampling.
 
 ### Specialized Evaluations
 
@@ -696,9 +696,9 @@ This project uses a spec-driven development workflow. Implementation contracts l
 
 5. **GradNorm on shared Transformer anchor.** The anchor is the last shared Transformer block (before MoE), ensuring it exists in every model variant including `moe_variant="none"`. A separate optimizer with its own learning rate controls the loss weights.
 
-6. **Split-before-truncate.** Chronological train/val/test boundaries are determined on complete user histories. Per-example truncation to `max_seq_length` happens afterward — preventing information leakage through shifted split points.
+6. **Split-before-truncate.** Leave-one-out boundaries are determined on complete user histories. Truncation to `max_seq_length` happens afterward — preventing information leakage through shifted split points.
 
-7. **Fixed evaluation candidate sets.** Candidate sets are generated once and shared across all model evaluations. This guarantees identical comparison conditions — metric differences reflect model quality, not candidate sampling variance.
+7. **Full-catalogue evaluation.** Every target is ranked against the whole catalogue minus the user's history, so metric differences reflect model quality, not candidate sampling.
 
 ---
 

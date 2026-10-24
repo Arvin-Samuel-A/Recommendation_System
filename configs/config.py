@@ -21,7 +21,10 @@ class Config:
     force_download: bool = False
 
     # --- Preprocessing ---
-    implicit_threshold: float = 4.0
+    # Ratings below this are dropped before anything else. MovieLens ratings run from
+    # 0.5 to 5.0, so the default 0.0 keeps EVERY rating as an interaction (owner decision
+    # 2026-10-25; it was 4.0, which kept ~half of ML-20M).
+    implicit_threshold: float = 0.0
     min_interactions: int = 5
     # specs/ablation-run FR-6 (owner decision 5): keep a seeded random fraction of the
     # USERS that survive the rating/min-interactions filters (full histories). 1.0 = no
@@ -29,8 +32,9 @@ class Config:
     # training never changes which users are in the dataset.
     user_sample_fraction: float = 1.0
     user_sample_seed: int = 42
-    train_ratio: float = 0.80
-    val_ratio: float = 0.10
+    # Splits are leave-one-out (owner decision 2026-10-25): per user, the last
+    # interaction is the test target, the second-to-last the validation target, and
+    # everything before is training. This replaced an 80/10/10 per-user ratio split.
     # NOTE: `cold_start_ratio` applies ONLY to "first_appearance_rank" and
     # "timestamp_cutoff". Under the default "unseen_in_training" strategy the size of
     # the cold set is data-determined and this field is not consulted (FR-3).
@@ -55,8 +59,16 @@ class Config:
     cold_start_first_seen_after: Optional[float] = None
 
     # --- Sequence ---
-    max_seq_length: int = 50
-    multi_step_k: int = 3
+    # Training is LLM-style (owner decision 2026-10-25): each user's training history is
+    # fed whole, with a next-item target at every position. Histories longer than this
+    # are cut into consecutive chunks of `max_seq_length` predictions, so every training
+    # interaction is a target exactly once per epoch. 200 keeps 81% of ML-20M users in a
+    # single chunk; evaluation reads the most recent `max_seq_length` items.
+    max_seq_length: int = 200
+    # Multi-step horizons: step s predicts the item s + 2 ahead, so k = 9 covers
+    # horizons 2..10 (owner decision 2026-10-25; was 3). Each horizon is a full-catalogue
+    # softmax at every position, so the objective costs ~k next-item losses.
+    multi_step_k: int = 9
 
     # --- Model ---
     model_name: str = "t-base"
@@ -105,17 +117,17 @@ class Config:
     contrastive_weight: float = 1.0
 
     # --- Loss: logit scale (next_item, masked_item, multi_step) ---
-    # Those three objectives score L2-normalised cosines, so their logits lie in [-1, 1]
-    # and their cross-entropy cannot fall below log(1 + (C-1)e^-2): 2.68 for next_item
-    # (C = 101 candidates, chance 4.62) and ~7.5 for the full-catalogue objectives
-    # (C ~ 13.5k, chance ~9.5). Logits are multiplied by 1/logit_temperature. 1.0 is the
-    # previous behaviour exactly (no op is applied).
+    # Those three objectives score L2-normalised cosines over the full catalogue, so
+    # their logits lie in [-1, 1] and their cross-entropy cannot fall below
+    # log(1 + (C-1)e^-2): ~8.2 on ML-20M with every rating (C ~ 26.7k, chance ~10.2).
+    # Logits are multiplied by 1/logit_temperature. 1.0 is the previous behaviour exactly
+    # (no op is applied).
     logit_temperature: float = 1.0
     # CLIP-style learnable scale, stored as log(scale), initialised to log(1/
     # logit_temperature), and clamped to <= logit_scale_max (after every optimizer step
-    # and inside the forward). ONE SCALE PER OBJECTIVE, not one shared: the objectives
-    # rank different candidate sets (101 sampled, ~13.5k full catalogue, 2B-1 in-batch),
-    # whose CE-optimal scale differs, and a shared scalar would be pulled between them.
+    # and inside the forward). ONE SCALE PER OBJECTIVE, not one shared: the objectives'
+    # CE-optimal scales differ (the contrastive one ranks 2B-1 in-batch views, the
+    # others the full catalogue), and a shared scalar would be pulled between them.
     # Each scale lives in its loss module (so `loss_fns_state_dict` checkpoints it), is
     # excluded from weight decay, and is logged per epoch. Per-user LoRA training uses the
     # fixed 1/logit_temperature, not the learned value.
@@ -140,13 +152,14 @@ class Config:
     # it, so on its steps it can only take the remainder. "enabled": every enabled
     # objective, active this step or not, to sum to the number of enabled objectives.
     gradnorm_renorm_scope: str = "active"
-    # Primary-objective GradNorm. "" (the previous behaviour): GradNorm balances every
-    # active objective. An objective name (e.g. "next_item", the one ranking is evaluated
-    # on): that objective's lambda is fixed at 1 and left out of GradNorm, which balances
-    # only the auxiliary objectives; their lambdas are renormalised to sum to
-    # `gradnorm_aux_budget` (None = their count, i.e. the same total as before).
-    gradnorm_primary_objective: str = ""
-    gradnorm_aux_budget: Optional[float] = None
+    # Primary-objective GradNorm. "": GradNorm balances every active objective. An
+    # objective name (e.g. "next_item", the one ranking is evaluated on): that
+    # objective's lambda is fixed at 1 and left out of GradNorm, which balances only the
+    # auxiliary objectives; their lambdas are renormalised to sum to `gradnorm_aux_budget`
+    # (beta; None = their count). Defaults (owner decision 2026-10-25): next-item primary
+    # with beta = 3. Run12 passed beta = 0.3 on the command line.
+    gradnorm_primary_objective: str = "next_item"
+    gradnorm_aux_budget: Optional[float] = 3.0
     # Gradient projection instead of GradNorm. "" (default): off. "next_item": each
     # auxiliary gradient that conflicts with next-item's (negative dot product) loses its
     # component along it; next-item's gradient is never changed. Uses the static weights
@@ -193,15 +206,17 @@ class Config:
     personalization_eval_users: int = 1000
     use_weighted_fedavg: bool = True
 
-    # REV-112(b): examples scored in the per-round validation pass. The validation split
-    # is ~993k examples and the round loop runs `federated_rounds` times, so a full-split
-    # pass per round dominated the stage and made `--stage federated` intractable. Every
+    # REV-112(b): examples scored in the per-round validation pass. The round loop runs
+    # `federated_rounds` times, so a full-split pass per round (one row per user under
+    # leave-one-out, ~138k on ML-20M) would dominate the stage. Every
     # round scores the SAME prefix, so the round-over-round convergence curve stays
     # comparable; the final round additionally runs the full split, which is the number
     # AC-06 is judged on. Set to 0 to score the full split every round.
     federated_eval_examples: int = 5000
 
     # --- Negative Sampling ---
+    # Pretraining and evaluation use the full catalogue. Sampled negatives (drawn from
+    # the global pool) remain only in per-user LoRA training (local + federated).
     num_sampled_negatives: int = 100
     # REV-025: `pool_size` is the configured value; `resolve_pool_size()` applies the
     # `max(pool_size, num_items * pool_size_items_multiplier)` floor so the manifest and
@@ -246,10 +261,8 @@ class Config:
     personalization_mode: str = "none"
 
     # Test rows scored per ablation arm (specs/eval-integrity FR-6). 0 = every row of the
-    # stored test split -- the default: a full test pass costs ~5% of an arm's evaluation
-    # time. N > 0 = a seeded uniform random sample of N rows (`ablation_eval_seed`), for
-    # tests and quick checks only. It used to be the first 5000 rows, which the
-    # user-sorted split drew from only 637 of 13,582 users.
+    # stored test split (one per user) -- the default. N > 0 = a seeded uniform random
+    # sample of N rows (`ablation_eval_seed`), for tests and quick checks only.
     ablation_eval_examples: int = 0
     # Seed of the random test-row sample; independent of the training `seed`.
     ablation_eval_seed: int = 0
@@ -394,9 +407,10 @@ class Config:
                 "contrastive_interval=0 is invalid; "
                 "use use_contrastive=False to disable"
             )
-        if self.train_ratio + self.val_ratio > 1.0:
+        if self.implicit_threshold < 0:
             raise ValueError(
-                f"train_ratio ({self.train_ratio}) + val_ratio ({self.val_ratio}) > 1.0"
+                f"implicit_threshold must be >= 0 (0 keeps every rating), "
+                f"got {self.implicit_threshold}"
             )
         if self.moe_variant not in ("none", "mmoe", "arv_mmoe"):
             raise ValueError(

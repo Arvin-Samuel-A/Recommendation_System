@@ -7,8 +7,11 @@ from configs.config import Config, OBJECTIVE_ORDER
 from training.losses import (
     mask_metadata,
     SampledSoftmaxLoss,
+    NextItemLoss,
     MaskedItemLoss,
     MultiStepLoss,
+    LogitScale,
+    full_softmax_cross_entropy,
     InfoNCELoss,
     apply_masking,
     static_weighted_sum,
@@ -88,15 +91,67 @@ class TestMaskedItemLoss:
         assert torch.isfinite(loss_some)
 
 
+class TestFullSoftmaxCrossEntropy:
+    def test_chunked_matches_unchunked_value_and_gradients(self, monkeypatch):
+        import training.losses as losses
+
+        torch.manual_seed(0)
+        h = torch.randn(300, 16, requires_grad=True)
+        w = torch.randn(40, 16, requires_grad=True)
+        t = torch.randint(0, 40, (300,))
+        scale = LogitScale(0.5, learnable=True)
+
+        ref = torch.nn.functional.cross_entropy(scale(h @ w.T), t)
+        ref_grads = torch.autograd.grad(ref, [h, w, scale.log_scale])
+
+        # 40 classes x 32 rows per chunk -> 10 chunks, the last one short.
+        monkeypatch.setattr(losses, "FULL_SOFTMAX_CHUNK_ELEMENTS", 40 * 32)
+        chunked = full_softmax_cross_entropy(h, t, w, scale)
+        assert torch.allclose(chunked, ref, atol=1e-6)
+        # GradNorm differentiates the same loss more than once (retain_graph).
+        first = torch.autograd.grad(chunked, [h, w, scale.log_scale], retain_graph=True)
+        second = torch.autograd.grad(chunked, [h, w, scale.log_scale])
+        for got, again, want in zip(first, second, ref_grads):
+            assert torch.allclose(got, want, atol=1e-6)
+            assert torch.equal(got, again)
+
+
+class TestNextItemLoss:
+    def test_every_real_position_is_a_target_and_padding_is_ignored(self):
+        torch.manual_seed(0)
+        B, S, D, V = 3, 5, 8, 30
+        hidden = torch.randn(B, S, D)
+        item_emb = torch.randn(V, D)
+        targets = torch.randint(1, V, (B, S))
+        targets[0, :2] = 0      # left padding
+        loss_fn = NextItemLoss(normalize_embeddings=True)
+
+        valid = targets != 0
+        h = torch.nn.functional.normalize(hidden[valid], dim=-1)
+        w = torch.nn.functional.normalize(item_emb, dim=-1)
+        expected = torch.nn.functional.cross_entropy(h @ w.T, targets[valid])
+        assert torch.allclose(loss_fn(hidden, targets, item_emb), expected, atol=1e-6)
+
+        # Padded positions do not matter, whatever their hidden state.
+        moved = hidden.clone()
+        moved[0, :2] += 5.0
+        assert torch.allclose(loss_fn(moved, targets, item_emb), expected, atol=1e-6)
+
+    def test_no_targets_returns_detached_zero(self):
+        loss = NextItemLoss()(torch.randn(2, 4, 8), torch.zeros(2, 4, dtype=torch.long),
+                              torch.randn(10, 8))
+        assert loss.item() == 0.0 and not loss.requires_grad
+
+
 class TestMultiStepLoss:
     def test_valid_targets(self, device, dtype):
         B, S, D, V, K = 4, 10, 16, 50, 3
         loss_fn = MultiStepLoss(D, K).to(device=device, dtype=dtype)
         hidden = torch.randn(B, S, D, device=device, dtype=dtype)
-        targets_k = torch.randint(1, V, (B, K), device=device)
+        targets = torch.randint(1, V, (B, S), device=device)
         item_emb = torch.randn(V, D, device=device, dtype=dtype)
 
-        loss = loss_fn(hidden, targets_k, item_emb)
+        loss = loss_fn(hidden, targets, item_emb)
         assert torch.isfinite(loss)
         assert loss.item() > 0
 
@@ -104,67 +159,45 @@ class TestMultiStepLoss:
         B, S, D, V, K = 4, 10, 16, 50, 3
         loss_fn = MultiStepLoss(D, K).to(device=device, dtype=dtype)
         hidden = torch.randn(B, S, D, device=device, dtype=dtype)
-        targets_k = torch.zeros(B, K, dtype=torch.long, device=device)
+        targets = torch.zeros(B, S, dtype=torch.long, device=device)
         item_emb = torch.randn(V, D, device=device, dtype=dtype)
 
-        loss = loss_fn(hidden, targets_k, item_emb)
+        loss = loss_fn(hidden, targets, item_emb)
         assert loss.item() == 0.0
 
-    def test_every_step_reads_position_S_minus_1(self, device, dtype):
-        """REV-105 / amended FR-3 + AC-03: all k projections read the SAME position.
-
-        The test this replaces asserted only that the loss was finite, so it held under
-        either position rule and could not distinguish them. Assert the property that is
-        true of `pos = S-1` and false of `pos = S-1-step`: the loss depends on position
-        S-1 alone, so arbitrarily changing every EARLIER position must leave it exactly
-        unchanged.
-        """
+    def test_step_s_predicts_horizon_s_plus_2_from_every_position(self):
+        """Position t, step s targets the item s + 2 steps ahead: `targets[:, t + s + 1]`."""
+        torch.manual_seed(0)
         B, S, D, V, K = 2, 6, 8, 20, 3
+        loss_fn = MultiStepLoss(D, K)
+        hidden = torch.randn(B, S, D)
+        targets = torch.randint(1, V, (B, S))
+        targets[1, :2] = 0      # left padding on row 1
+        item_emb = torch.randn(V, D)
+
+        per_step = []
+        for step in range(K):
+            shift = step + 1
+            valid = (targets[:, :S - shift] != 0) & (targets[:, shift:] != 0)
+            logits = loss_fn.step_projections[step](hidden[:, :S - shift][valid]) @ item_emb.T
+            per_step.append(torch.nn.functional.cross_entropy(logits, targets[:, shift:][valid]))
+        expected = torch.stack(per_step).mean()
+        assert torch.allclose(loss_fn(hidden, targets, item_emb), expected, atol=1e-6)
+
+    def test_never_reads_a_position_after_its_horizon_targets(self):
+        """The last position has no horizon target inside the chunk, so it is unused."""
         torch.manual_seed(0)
-        loss_fn = MultiStepLoss(D, K).to(device=device, dtype=dtype)
-        loss_fn.eval()
-        hidden = torch.randn(B, S, D, device=device, dtype=dtype)
-        targets_k = torch.randint(1, V, (B, K), device=device)
-        item_emb = torch.randn(V, D, device=device, dtype=dtype)
-
-        baseline = loss_fn(hidden, targets_k, item_emb)
-
-        scrambled = hidden.clone()
-        scrambled[:, : S - 1, :] = torch.randn(
-            B, S - 1, D, device=device, dtype=dtype,
-        )
-        rewritten = loss_fn(scrambled, targets_k, item_emb)
-
-        assert rewritten.item() == baseline.item(), (
-            "multi-step loss moved when only positions < S-1 changed, so at least one "
-            "step is reading a position other than S-1 (the superseded S-1-step rule)"
-        )
-
-        # Non-vacuity: changing position S-1 -- the one position every step reads --
-        # must change the loss, otherwise the equality above is trivially true.
+        B, S, D, V, K = 2, 6, 8, 20, 3
+        loss_fn = MultiStepLoss(D, K)
+        hidden = torch.randn(B, S, D)
+        targets = torch.randint(1, V, (B, S))
+        item_emb = torch.randn(V, D)
+        baseline = loss_fn(hidden, targets, item_emb)
         moved = hidden.clone()
-        moved[:, S - 1, :] += 1.0
-        assert loss_fn(moved, targets_k, item_emb).item() != baseline.item()
-
-    def test_all_k_steps_contribute_distinct_projections(self, device, dtype):
-        """Reading one position must not collapse the k steps into one prediction.
-
-        Each step keeps its own bias-free projection (unchanged by REV-105), so the k
-        steps still produce different logits from the shared input vector.
-        """
-        B, S, D, V, K = 1, 6, 8, 20, 3
-        torch.manual_seed(0)
-        loss_fn = MultiStepLoss(D, K).to(device=device, dtype=dtype)
-        loss_fn.eval()
-        hidden = torch.randn(B, S, D, device=device, dtype=dtype)
-        shared = hidden[:, S - 1, :]
-
-        outs = [loss_fn.step_projections[i](shared) for i in range(K)]
-        for i in range(1, K):
-            assert not torch.allclose(outs[0], outs[i]), (
-                f"step 0 and step {i} produced identical projections of the shared "
-                f"position-S-1 vector"
-            )
+        moved[:, S - 1] += 3.0
+        assert loss_fn(moved, targets, item_emb).item() == baseline.item()
+        moved[:, 0] += 3.0
+        assert loss_fn(moved, targets, item_emb).item() != baseline.item()
 
 
 class TestInfoNCE:
@@ -546,9 +579,7 @@ class TestFiniteAssertionsActuallyFire:
         b, S = config.batch_size, config.max_seq_length
         batch = {
             "sequences": torch.randint(1, config.num_items + 1, (b, S)),
-            "targets": torch.randint(1, config.num_items + 1, (b,)),
-            "neg_ids": torch.randint(1, config.num_items + 1, (b, config.num_sampled_negatives)),
-            "targets_k": torch.randint(1, config.num_items + 1, (b, config.multi_step_k)),
+            "targets": torch.randint(1, config.num_items + 1, (b, S)),
         }
 
         with pytest.raises(AssertionError, match="not finite"):
@@ -739,3 +770,47 @@ class TestVectorisedRenormalisation:
                 gn.log_lambdas.copy_(start)
             gn._renormalize(active)
             assert torch.equal(gn.log_lambdas.detach(), expected), (trial, active)
+
+
+class TestMaskedSequenceOnlyFeedsMaskedItem:
+    """Owner decision 2026-10-25: masking corrupts only the masked-item objective's input."""
+
+    def _step(self, use_masked_lm):
+        import random
+
+        from torch.optim.lr_scheduler import LambdaLR
+
+        from training.pretrain import _build_loss_fns, build_model, train_one_step
+
+        config = Config()
+        config.apply_model_config("t-small")
+        config.num_items, config.vocab_size = 200, 202
+        config.use_metadata, config.feature_dim = False, 0
+        config.device, config.dropout = "cpu", 0.0
+        config.batch_size, config.max_seq_length = 4, 12
+        config.use_masked_lm, config.mask_prob = use_masked_lm, 0.5
+        config.use_gradnorm = False
+        torch.manual_seed(0)
+        model, moe = build_model(config)
+        loss_fns = _build_loss_fns(config, torch.device("cpu"))
+        params = list(model.parameters()) + list(moe.parameters())
+        for fn in loss_fns.values():
+            params += list(fn.parameters())
+        optimizer = torch.optim.SGD(params, lr=0.0)
+        scheduler = LambdaLR(optimizer, lr_lambda=lambda step: 1.0)
+        gen = torch.Generator().manual_seed(1)
+        batch = {
+            "sequences": torch.randint(1, 201, (4, 12), generator=gen),
+            "targets": torch.randint(1, 201, (4, 12), generator=gen),
+        }
+        values, _ = train_one_step(
+            model, moe, batch, config, loss_fns, None, optimizer, scheduler, 0,
+            random.Random(0), mask_rng=torch.Generator().manual_seed(2),
+        )
+        return values
+
+    def test_clean_objectives_are_unchanged_by_masking(self):
+        with_mim, without_mim = self._step(True), self._step(False)
+        assert "masked_item" in with_mim and "masked_item" not in without_mim
+        for name in ("next_item", "multi_step", "contrastive"):
+            assert torch.equal(with_mim[name], without_mim[name]), name

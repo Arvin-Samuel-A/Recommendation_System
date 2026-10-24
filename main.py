@@ -388,11 +388,8 @@ def run_federated_stage(config, args):
 
 def run_evaluate_stage(config, args):
     from training.pretrain import build_model, load_checkpoint
-    from evaluation.metrics import evaluate_model
-    from data.sequence_generator import (
-        load_tensorised, generate_eval_candidates, load_eval_candidates,
-        load_metadata_matrix,
-    )
+    from evaluation.metrics import evaluate_model, load_full_ranking
+    from data.sequence_generator import load_tensorised, load_metadata_matrix
     from utils import get_device, artifact_source_revision
     import pickle
 
@@ -429,43 +426,16 @@ def run_evaluate_stage(config, args):
     with open(os.path.join(processed, "eval_user_history.pkl"), "rb") as f:
         eval_user_history = pickle.load(f)
 
-    # REV-041: prefer the candidate sets stored at preprocessing time so every model is
-    # scored against structurally identical sets, not incidentally identical ones.
-    cand_path = os.path.join(processed, "test_candidates.npy")
-    if os.path.exists(cand_path):
-        matrix = load_eval_candidates(cand_path)
-        if matrix.shape[0] != len(test_dataset):
-            raise RuntimeError(
-                f"Pre-stored test candidate sets have {matrix.shape[0]} rows but the "
-                f"test split has {len(test_dataset)} examples. Re-run --stage preprocess."
-            )
-        candidates = torch.as_tensor(matrix, dtype=torch.long)
-    else:
-        logger.warning(
-            "%s not found -- regenerating test candidate sets. Re-run --stage preprocess "
-            "so every model evaluates against the same stored sets.", cand_path,
-        )
-        neg_pool = np.load(os.path.join(processed, "global_negative_pool.npy"))
-        test_examples = {
-            "targets": test_dataset.targets.numpy().tolist(),
-            "user_ids": test_dataset.user_ids.numpy().tolist(),
-        }
-        candidates = torch.as_tensor(
-            np.asarray(generate_eval_candidates(
-                test_examples, neg_pool, eval_user_history,
-                config.num_sampled_negatives, padding_id=0,
-                mask_id=config.num_items + 1, seed=config.seed,
-            )), dtype=torch.long,
-        )
-    # REV-063: the stored `(N, S)` / `(N, C)` tensors are handed to `evaluate_model`
-    # whole; it batches them. Exploding them into ~1M per-example device tensors was
-    # the dominant allocation cost of the evaluate stage.
+    # Leave-one-out, full catalogue: each user's test item is ranked against every item
+    # except their training and validation history.
     test_sequences = test_dataset.sequences
-    candidate_tensors = candidates
+    candidate_tensors = load_full_ranking(
+        processed, "test", test_dataset.targets, test_dataset.user_ids,
+    )
 
     # FR-2 / REV-064: the retrieval-then-rerank path. `use_ann` and `ann_candidates` were
     # declared in the config and read by nothing, so this requirement had no code behind
-    # it at all. Off by default, so the sampled-negatives protocol remains the headline.
+    # it at all. Off by default, so full-catalogue ranking remains the headline.
     ann_report = None
     if config.use_ann:
         from models.ann_retrieval import retrieve_candidates
@@ -715,18 +685,12 @@ def run_routing_diagnostics_stage(config, args):
 def run_gradient_diagnostics_stage(config, args):
     """Standalone gradient conflict/dominance pass on fresh training batches.
 
-    REV-009: `run_gradient_diagnostics` previously had no call site, and required a
-    `neg_ids` key that `build_dataloader` does not produce. Negatives are now attached
-    through the same helper the training loop uses.
+    REV-009: `run_gradient_diagnostics` previously had no call site. It reads the same
+    chunked training split, at the same width, that `run_pretrain` trains on.
     """
-    import pickle
-
-    from training.pretrain import attach_training_negatives
     from training.gradnorm import get_anchor_layer_params
     from evaluation.gradient_diagnostics import run_gradient_diagnostics
-    from data.sequence_generator import (
-        load_tensorised, build_dataloader, GlobalNegativePool, load_metadata_matrix,
-    )
+    from data.sequence_generator import load_train_dataset, build_dataloader
     from utils import resolve_param_dtype
 
     loaded = _load_trained_model(config, args)
@@ -734,27 +698,8 @@ def run_gradient_diagnostics_stage(config, args):
         return
     model, moe, loss_fns, metadata_matrix, device, processed, source_revision = loaded
 
-    train_dataset = load_tensorised(
-        os.path.join(processed, "train_tensorised.pt"), metadata_matrix,
-        max_seq_length=config.max_seq_length,
-    )
+    train_dataset = load_train_dataset(processed, config.max_seq_length, metadata_matrix)
     loader = build_dataloader(train_dataset, config, shuffle=True)
-
-    neg_array = GlobalNegativePool.load(
-        os.path.join(processed, "global_negative_pool.npy"), set(),
-    ).pool
-    with open(os.path.join(processed, "train_user_history.pkl"), "rb") as f:
-        train_user_history = pickle.load(f)
-    history_arrays = {
-        int(u): np.asarray(items, dtype=np.int64)
-        for u, items in train_user_history.items()
-    }
-    neg_rng = np.random.RandomState(config.seed)
-
-    def attach_negatives(batch):
-        return attach_training_negatives(
-            batch, neg_array, history_arrays, config, neg_rng, device,
-        )
 
     metadata_matrix_t = (
         metadata_matrix.to(resolve_param_dtype(config)) if metadata_matrix is not None else None
@@ -763,7 +708,6 @@ def run_gradient_diagnostics_stage(config, args):
     report = run_gradient_diagnostics(
         model, moe, loader, loss_fns,
         get_anchor_layer_params(model, config), config, args.model,
-        negative_sampler=attach_negatives,
         metadata_matrix=metadata_matrix_t,
         augment_rng=random.Random(config.seed),
         source_revision=source_revision,

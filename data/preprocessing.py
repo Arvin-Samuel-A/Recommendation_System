@@ -197,10 +197,11 @@ def _read_ratings(config: Config, sampling_info: Optional[dict] = None) -> "pd.D
         pd.to_datetime(df["timestamp"], errors="coerce").astype("int64") // 10**9
     )
 
+    # MovieLens ratings are 0.5..5.0, so the default threshold of 0.0 keeps every rating.
     original_count = len(df)
     df = df[df["rating"] >= config.implicit_threshold]
     logger.info(
-        "Implicit filter (>= %.1f): %d -> %d rows",
+        "Rating filter (>= %.1f): %d -> %d rows",
         config.implicit_threshold, original_count, len(df),
     )
 
@@ -335,36 +336,37 @@ def process_ratings(
     return user_sequences, stats
 
 
-def compute_chronological_split(
+#: Recorded in the preprocessing manifest; `check_processed_dir` refuses any other value,
+#: since the evaluation code assumes one validation and one test row per user.
+SPLIT_STRATEGY = "leave_one_out"
+
+
+def compute_leave_one_out_split(
     user_sequences: Dict[int, List[int]],
     timestamps_per_user: Dict[int, List[float]],
-    config: Config,
 ) -> Tuple[Dict[int, List[int]], Dict[int, List[int]], Dict[int, List[int]], float]:
+    """Leave-one-out: per user, last item -> test, second-to-last -> val, rest -> train.
+
+    Sequences are chronological, and `process_ratings` keeps only users with >= 3 items,
+    so every user has a non-empty training prefix and exactly one val and one test item.
+    """
     train_seqs: Dict[int, List[int]] = {}
     val_seqs: Dict[int, List[int]] = {}
     test_seqs: Dict[int, List[int]] = {}
-    all_train_timestamps: List[float] = []
+    global_training_cutoff = float("-inf")
 
     for user_id, items in user_sequences.items():
-        ts = timestamps_per_user[user_id]
-        n = len(items)
-        train_end = max(1, int(n * config.train_ratio))
-        val_end = max(train_end + 1, int(n * (config.train_ratio + config.val_ratio)))
-        val_end = min(val_end, n)
+        if len(items) < 3:
+            raise ValueError(
+                f"user {user_id} has {len(items)} items; leave-one-out needs at least 3"
+            )
+        train_seqs[user_id] = items[:-2]
+        val_seqs[user_id] = [items[-2]]
+        test_seqs[user_id] = [items[-1]]
+        global_training_cutoff = max(
+            global_training_cutoff, timestamps_per_user[user_id][-3],
+        )
 
-        train_items = items[:train_end]
-        val_items = items[train_end:val_end]
-        test_items = items[val_end:]
-
-        train_seqs[user_id] = train_items
-        if val_items:
-            val_seqs[user_id] = val_items
-        if test_items:
-            test_seqs[user_id] = test_items
-
-        all_train_timestamps.extend(ts[:train_end])
-
-    global_training_cutoff = max(all_train_timestamps)
     logger.info("Global training cutoff timestamp: %.0f", global_training_cutoff)
     return train_seqs, val_seqs, test_seqs, global_training_cutoff
 
@@ -616,8 +618,7 @@ def extract_metadata(
 def run_preprocessing(config: Config) -> None:
     from data.sequence_generator import (
         generate_sequences, tensorise_examples, save_tensorised,
-        GlobalNegativePool, generate_eval_candidates, save_eval_candidates,
-        stored_seq_length,
+        GlobalNegativePool, stored_seq_length,
     )
 
     # specs/ablation-run D6: an out-of-range sample fraction must fail before any work.
@@ -637,9 +638,9 @@ def run_preprocessing(config: Config) -> None:
 
     logger.info("=== Step 3/7: Timestamps taken from step 2 ===")
 
-    logger.info("=== Step 4/7: Chronological split ===")
-    train_seqs, val_seqs, test_seqs, global_cutoff = compute_chronological_split(
-        user_sequences, timestamps_per_user, config,
+    logger.info("=== Step 4/7: Leave-one-out split ===")
+    train_seqs, val_seqs, test_seqs, global_cutoff = compute_leave_one_out_split(
+        user_sequences, timestamps_per_user,
     )
 
     logger.info("=== Step 5/7: Identify cold items ===")
@@ -670,19 +671,17 @@ def run_preprocessing(config: Config) -> None:
         "Storing sequences at width %d (max_seq_length=%d, sequence_length_grid=%s)",
         stored_width, config.max_seq_length, list(config.sequence_length_grid),
     )
-    train_examples, val_examples, test_examples, train_user_history, eval_user_history = (
-        generate_sequences(
-            user_sequences, filtered_train, val_seqs, test_seqs, config,
-            width=stored_width,
-        )
+    # The training split is stored as per-user histories (`train_user_history.pkl`) and
+    # chunked by `load_train_dataset` at the reader's own `max_seq_length`, so a narrower
+    # H2 arm gets its own chunks instead of a truncated slice of wider ones.
+    val_examples, test_examples, train_user_history, eval_user_history = generate_sequences(
+        user_sequences, filtered_train, val_seqs, test_seqs, config, width=stored_width,
     )
 
-    train_dataset = tensorise_examples(train_examples, metadata_matrix)
     val_dataset = tensorise_examples(val_examples, metadata_matrix)
     test_dataset = tensorise_examples(test_examples, metadata_matrix)
 
     processed = config.processed_data_dir
-    save_tensorised(train_dataset, os.path.join(processed, "train_tensorised.pt"))
     save_tensorised(val_dataset, os.path.join(processed, "val_tensorised.pt"))
     save_tensorised(test_dataset, os.path.join(processed, "test_tensorised.pt"))
 
@@ -696,7 +695,6 @@ def run_preprocessing(config: Config) -> None:
     # `test_examples.pkl` unconditionally, so all four raised FileNotFoundError on
     # their first line of work and `--stage all` aborted at the personalize stage.
     for name, examples in (
-        ("train_examples.pkl", train_examples),
         ("val_examples.pkl", val_examples),
         ("test_examples.pkl", test_examples),
     ):
@@ -710,33 +708,8 @@ def run_preprocessing(config: Config) -> None:
     neg_pool.build_once(pool_size)
     neg_pool.save(os.path.join(processed, "global_negative_pool.npy"))
 
-    # REV-041 / T8.3: generate the fixed evaluation candidate sets ONCE and persist
-    # them. Previously every evaluation site rebuilt them, so cross-model identity held
-    # only because the procedure happened to be deterministic.
-    logger.info("Generating fixed evaluation candidate sets...")
-    # REV-087: each split is generated directly into its own on-disk `.npy` memmap and
-    # fingerprinted in row blocks, so neither the list-of-arrays form nor the contiguous
-    # copy `np.asarray` used to build is ever resident.
-    val_cand_path = os.path.join(processed, "val_candidates.npy")
-    val_fp = save_eval_candidates(
-        generate_eval_candidates(
-            val_examples, neg_pool.pool, eval_user_history,
-            config.num_sampled_negatives,
-            padding_id=0, mask_id=stats["MASK_ID"], seed=config.seed,
-            out_path=val_cand_path,
-        ),
-        val_cand_path,
-    )
-    test_cand_path = os.path.join(processed, "test_candidates.npy")
-    test_fp = save_eval_candidates(
-        generate_eval_candidates(
-            test_examples, neg_pool.pool, eval_user_history,
-            config.num_sampled_negatives,
-            padding_id=0, mask_id=stats["MASK_ID"], seed=config.seed,
-            out_path=test_cand_path,
-        ),
-        test_cand_path,
-    )
+    # Evaluation ranks every item of the catalogue (leave-one-out, full ranking), so no
+    # candidate sets are stored; the per-user histories above are what it excludes.
 
     # Popularity buckets are a pure function of the training history; computing them
     # here means long-tail evaluation loads rather than derives them.
@@ -768,8 +741,8 @@ def run_preprocessing(config: Config) -> None:
         "train_interactions_before_holdout": int(train_interactions_before),
         "train_interactions_removed_by_holdout": int(train_interactions_removed),
         "num_sampled_negatives": config.num_sampled_negatives,
-        "val_candidates_fingerprint": val_fp,
-        "test_candidates_fingerprint": test_fp,
+        "split_strategy": SPLIT_STRATEGY,
+        "implicit_threshold": float(config.implicit_threshold),
         "seed": config.seed,
         "stored_seq_length": int(stored_width),
     }
@@ -788,11 +761,13 @@ def run_preprocessing(config: Config) -> None:
 
 
 def check_processed_dir(config: Config) -> None:
-    """Refuse a processed directory built from a different user sample (FR-7, D6).
+    """Refuse a processed directory built from a different user sample (FR-7, D6), a
+    different rating threshold, or a split other than leave-one-out.
 
-    Reads `preprocessing_manifest.json`; a field the manifest lacks is read as the
-    pre-feature default (fraction 1.0). The seed is compared only for a real sample.
-    A directory with no manifest is warned about, not refused.
+    Reads `preprocessing_manifest.json`; a sampling field the manifest lacks is read as
+    the pre-feature default (fraction 1.0). The seed is compared only for a real sample.
+    A manifest without `split_strategy` predates leave-one-out and is refused. A
+    directory with no manifest is warned about, not refused.
     """
     path = os.path.join(config.processed_data_dir, "preprocessing_manifest.json")
     if not os.path.exists(path):
@@ -805,6 +780,25 @@ def check_processed_dir(config: Config) -> None:
         return
     with open(path) as f:
         manifest = json.load(f)
+    rebuild = (
+        f"Re-run `python main.py --stage preprocess` into {config.processed_data_dir}."
+    )
+    stored_split = manifest.get("split_strategy")
+    if stored_split != SPLIT_STRATEGY:
+        raise ValueError(
+            f"{config.processed_data_dir} was preprocessed with split_strategy="
+            f"{stored_split!r} (absent = the former 80/10/10 ratio split); training and "
+            f"evaluation now expect {SPLIT_STRATEGY!r}. " + rebuild
+        )
+    stored_threshold = manifest.get("implicit_threshold")
+    if stored_threshold is not None and (
+        abs(float(stored_threshold) - float(config.implicit_threshold)) > 1e-12
+    ):
+        raise ValueError(
+            f"{config.processed_data_dir} was preprocessed with implicit_threshold="
+            f"{float(stored_threshold):g} but this run asks for "
+            f"{float(config.implicit_threshold):g}. " + rebuild
+        )
     stored_fraction = float(manifest.get("user_sample_fraction", 1.0))
     stored_seed = manifest.get("user_sample_seed")
     remedy = (

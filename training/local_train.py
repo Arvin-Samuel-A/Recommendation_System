@@ -21,10 +21,9 @@ from models.lora import (
 )
 from training.losses import LogitScale, SampledSoftmaxLoss
 from training.pretrain import build_model, load_checkpoint
-from evaluation.metrics import evaluate_model, score_candidates, compute_metrics
+from evaluation.metrics import FullRanking, evaluate_model, load_full_ranking
 from data.sequence_generator import (
-    filter_negatives, generate_sliding_window_examples, load_metadata_matrix,
-    load_or_build_eval_candidates, load_examples,
+    _left_pad, filter_negatives, load_metadata_matrix, load_examples,
 )
 from utils import (
     autocast_context, get_device, resolve_dtype, make_grad_scaler, artifact_source_revision,
@@ -68,9 +67,9 @@ def build_local_training_examples(
     unrelated to personalization quality. `local_train_source` existed, validated, and
     was read nowhere; it is the switch this function implements.
 
-    The test split is never a source. `"train"` builds sliding-window examples from the
-    user's training interactions; `"val"` uses their validation examples. Either way the
-    most recent `config.local_train_max_examples` are kept, since recency is what a
+    The test split is never a source. `"train"` builds one (prefix, next item) example per
+    training interaction; `"val"` uses their validation examples. Either way the most
+    recent `config.local_train_max_examples` are kept, since recency is what a
     personalization adapter should be fit to.
     """
     cap = max(1, config.local_train_max_examples)
@@ -88,8 +87,9 @@ def build_local_training_examples(
         items = list(train_user_history.get(user_id, []))
         if len(items) < 2:
             return [], []
-        seqs, tgts, _ = generate_sliding_window_examples(items, config.max_seq_length)
-        seqs, tgts = seqs[-cap:], [int(t) for t in tgts[-cap:]]
+        first = max(1, len(items) - cap)
+        seqs = [_left_pad(items[:i], config.max_seq_length) for i in range(first, len(items))]
+        tgts = [int(items[i]) for i in range(first, len(items))]
 
     tensors = [
         s if isinstance(s, torch.Tensor) else torch.as_tensor(s, dtype=torch.long)
@@ -183,7 +183,7 @@ def evaluate_user(
     moe: MoELayer,
     user_sequences: List[torch.Tensor],
     user_targets: List[int],
-    candidate_sets: List[torch.Tensor],
+    candidate_sets: FullRanking,
     config: Config,
     metadata_matrix: Optional[torch.Tensor] = None,
 ) -> Dict[str, Dict[str, float]]:
@@ -230,8 +230,6 @@ def run_local_personalization(
 
     with open(os.path.join(processed, "train_user_history.pkl"), "rb") as f:
         train_user_history = pickle.load(f)
-    with open(os.path.join(processed, "eval_user_history.pkl"), "rb") as f:
-        eval_user_history = pickle.load(f)
 
     cold_items_path = os.path.join(processed, "cold_items.pkl")
     cold_items = set()
@@ -261,20 +259,11 @@ def run_local_personalization(
     # draws vary per call and the whole run still reproduces from `config.seed`.
     neg_rng = np.random.RandomState(config.seed)
 
-    # REV-111: the per-user evaluation built its own candidate sets, which put the
-    # personalization NDCG on a different candidate protocol from the headline
-    # `test_metrics_{model}.json` -- so `with_lora`/`without_lora` could not be quoted
-    # alongside it. Score the SAME stored rows every other stage scores; `user_test_map`
-    # indexes `test_examples`, so a test-example index addresses its candidate row
-    # directly.
-    # REV-119: memory-mapped. This stage addresses a few thousand ROWS (the test examples
-    # of `personalization_eval_users` sampled users), so materialising the whole 856 MB
-    # matrix to reach them is not proportionate. The rows scored are identical either way.
-    cand_matrix = load_or_build_eval_candidates(
-        os.path.join(processed, "test_candidates.npy"),
-        test_examples, neg_pool, eval_user_history, config,
-        expected_rows=len(test_examples["targets"]),
-        mmap=True,
+    # REV-111: score the SAME rows every other stage scores -- each test target ranked
+    # against the full catalogue minus the user's history. `user_test_map` indexes
+    # `test_examples`, so a test-example index addresses its ranking row directly.
+    test_ranking = load_full_ranking(
+        processed, "test", test_examples["targets"], test_examples["user_ids"],
     )
 
     all_user_ids = sorted(set(test_examples["user_ids"]))
@@ -313,19 +302,7 @@ def run_local_personalization(
         test_targets = [test_examples["targets"][i] for i in test_indices]
         history_set = set(train_user_history.get(user_id, []))
 
-        candidate_sets = []
-        for row_idx, target in zip(test_indices, test_targets):
-            row = cand_matrix[row_idx]
-            assert int(row[0]) == int(target), (
-                f"stored candidate row {row_idx} has target {int(row[0])} but the test "
-                f"example has {int(target)}; test_candidates.npy is not aligned with "
-                f"test_examples.pkl -- re-run --stage preprocess"
-            )
-            # REV-119: `np.array` (a copy), not `np.asarray`. The candidate matrix is now
-            # memory-mapped read-only, and `torch.as_tensor` over a non-writable buffer
-            # produces a tensor that aliases it -- undefined behaviour if anything writes,
-            # and a UserWarning every run. One 101-element row; the copy is free.
-            candidate_sets.append(torch.as_tensor(np.array(row), dtype=torch.long, device=device))
+        candidate_sets = test_ranking.select(test_indices)
 
         test_seq_tensors = [torch.tensor(s, dtype=torch.long) if not isinstance(s, torch.Tensor) else s for s in test_seqs]
 

@@ -7,7 +7,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Sampler
 
 from configs.config import Config
 from utils import seed_worker
@@ -71,14 +71,14 @@ class RecDataset(Dataset):
         targets: torch.Tensor,
         user_ids: torch.Tensor,
         lengths: torch.Tensor,
-        targets_k: Optional[torch.Tensor] = None,
         metadata_matrix=None,
     ):
+        # `targets` is `(N,)` for an evaluation split (the held-out item) and `(N, S)` for
+        # the training split (the next item at every position, 0 at padding).
         self.sequences = sequences
         self.targets = targets
         self.user_ids = user_ids
         self.lengths = lengths
-        self.targets_k = targets_k
         # REV-090b: align unconditionally. A caller handing in a raw `(num_items + 1, F)`
         # artifact -- which is what pre-REV-072 preprocessing runs wrote to disk -- would
         # otherwise IndexError on the first MASK_ID position. The vocabulary implied by
@@ -116,8 +116,6 @@ class RecDataset(Dataset):
             "user_ids": self.user_ids[idx],
             "lengths": self.lengths[idx],
         }
-        if self.targets_k is not None:
-            item["targets_k"] = self.targets_k[idx]
         if self.metadata_matrix is not None:
             item["metadata"] = self.metadata_matrix[self.sequences[idx]]
         return item
@@ -129,38 +127,54 @@ def _left_pad(seq: List[int], max_len: int, pad_id: int = 0) -> List[int]:
     return [pad_id] * (max_len - len(seq)) + seq
 
 
-def generate_sliding_window_examples(
-    items: List[int],
-    max_seq_length: int,
-    multi_step_k: int = 0,
-    split_end_idx: Optional[int] = None,
-) -> Tuple[List[List[int]], List[int], List[List[int]]]:
-    sequences = []
-    targets = []
-    targets_k_list = []
+def chunk_user_history(items: List[int], max_seq_length: int) -> List[Tuple[List[int], List[int]]]:
+    """Cut one training history into LLM-style `(inputs, targets)` chunks.
 
-    for i in range(1, len(items)):
-        context = items[:i]
-        target = items[i]
+    Every item after the first is a next-item target exactly once: a chunk of `m <= S`
+    predictions has inputs `items[a:a+m]` and targets `items[a+1:a+m+1]`. Chunks are cut
+    from the END, so the most recent `S` predictions share one chunk and only the oldest
+    chunk is short. Returned oldest first. A history of fewer than 2 items yields none.
+    """
+    S = int(max_seq_length)
+    chunks = []
+    end = len(items) - 1          # index of the last target
+    while end >= 1:
+        start = max(0, end - S)   # first input index
+        chunks.append((list(items[start:end]), list(items[start + 1:end + 1])))
+        end = start
+    chunks.reverse()
+    return chunks
 
-        padded = _left_pad(context, max_seq_length)
-        sequences.append(padded)
-        targets.append(target)
 
-        multi_targets = []
-        if multi_step_k > 0:
-            for k in range(1, multi_step_k + 1):
-                future_idx = i + k
-                if future_idx < len(items):
-                    if split_end_idx is not None and future_idx >= split_end_idx:
-                        multi_targets.append(0)
-                    else:
-                        multi_targets.append(items[future_idx])
-                else:
-                    multi_targets.append(0)
-        targets_k_list.append(multi_targets)
+def chunk_training_histories(
+    train_user_history: Dict[int, List[int]], max_seq_length: int,
+) -> dict:
+    """Left-padded `(N, S)` inputs and per-position targets for every training chunk.
 
-    return sequences, targets, targets_k_list
+    `targets[i, t]` is the item following `sequences[i, t]`; padded positions hold 0 in
+    both. Users are visited in sorted order, so the arrays are a pure function of the
+    histories and the width.
+    """
+    S = int(max_seq_length)
+    users = sorted(train_user_history)
+    n = sum(max(0, -(-(len(train_user_history[u]) - 1) // S)) for u in users)
+    out = {
+        "sequences": np.zeros((n, S), dtype=np.int32),
+        "targets": np.zeros((n, S), dtype=np.int32),
+        "user_ids": np.zeros(n, dtype=np.int32),
+        "lengths": np.zeros(n, dtype=np.int32),
+    }
+    i = 0
+    for user_id in users:
+        for inputs, targets in chunk_user_history(train_user_history[user_id], S):
+            m = len(inputs)
+            out["sequences"][i, S - m:] = inputs
+            out["targets"][i, S - m:] = targets
+            out["user_ids"][i] = user_id
+            out["lengths"][i] = m
+            i += 1
+    assert i == n, f"chunk count disagrees with the preallocation: filled {i}, allocated {n}"
+    return out
 
 
 def _fill_left_padded(row: np.ndarray, context: List[int], max_len: int) -> None:
@@ -171,38 +185,19 @@ def _fill_left_padded(row: np.ndarray, context: List[int], max_len: int) -> None
         row[max_len - len(tail):] = tail
 
 
-def _alloc_split(n: int, max_seq_length: int, multi_step_k: int) -> dict:
-    """Preallocated int32 arrays for one split.
+def _alloc_split(n: int, max_seq_length: int) -> dict:
+    """Preallocated int32 arrays for one evaluation split.
 
-    REV-086: every example used to be a Python `list` of 50 Python `int` objects -- 482
-    bytes per padded sequence against 200 for the equivalent int32 row -- with all three
-    splits' dicts held simultaneously until they were pickled (4.7 + 0.6 + 0.6 = 5.9 GB
-    on MovieLens-20M). int32 is sufficient: the largest id is MASK_ID = 20,721.
+    REV-086: every example used to be a Python `list` of Python `int` objects -- 482
+    bytes per padded 50-item sequence against 200 for the equivalent int32 row. int32 is
+    sufficient for any item id here.
     """
     return {
         "sequences": np.zeros((n, max_seq_length), dtype=np.int32),
         "targets": np.zeros(n, dtype=np.int32),
         "user_ids": np.zeros(n, dtype=np.int32),
         "lengths": np.zeros(n, dtype=np.int32),
-        "targets_k": np.zeros((n, multi_step_k), dtype=np.int32),
     }
-
-
-def _count_examples(
-    user_sequences: Dict[int, List[int]],
-    train_seqs: Dict[int, List[int]],
-    val_seqs: Dict[int, List[int]],
-    test_seqs: Dict[int, List[int]],
-) -> Tuple[int, int, int]:
-    """Per-split example counts. Cheap -- each is a length arithmetic per user."""
-    n_train = n_val = n_test = 0
-    for user_id in user_sequences:
-        train_items = train_seqs.get(user_id, [])
-        if len(train_items) >= 2:
-            n_train += len(train_items) - 1
-        n_val += len(val_seqs.get(user_id, []))
-        n_test += len(test_seqs.get(user_id, []))
-    return n_train, n_val, n_test
 
 
 def generate_sequences(
@@ -212,27 +207,30 @@ def generate_sequences(
     test_seqs: Dict[int, List[int]],
     config: Config,
     width: Optional[int] = None,
-) -> Tuple[dict, dict, dict, Dict[int, List[int]], Dict[int, List[int]]]:
-    """Build the three splits' examples as preallocated int32 arrays (REV-086).
+) -> Tuple[dict, dict, Dict[int, List[int]], Dict[int, List[int]]]:
+    """Build the validation and test examples and the two per-user histories.
+
+    One example per held-out item: its context is everything the user did before it
+    (train for val; train + val for test), left-padded to the most recent `width`
+    positions. Under leave-one-out that is one val and one test example per user.
+    Training examples are not built here: `load_train_dataset` chunks
+    `train_user_history` at the consumer's own width.
 
     `width` is the stored sequence width (specs/ablation-run D7); it defaults to
     `config.max_seq_length`. Preprocessing passes `stored_seq_length(config)` so every
     Ablation H2 arm can narrow to its own `max_seq_length`.
     """
-    n_train, n_val, n_test = _count_examples(
-        user_sequences, train_seqs, val_seqs, test_seqs,
-    )
+    n_val = sum(len(val_seqs.get(u, [])) for u in user_sequences)
+    n_test = sum(len(test_seqs.get(u, [])) for u in user_sequences)
     S = config.max_seq_length if width is None else int(width)
-    K = config.multi_step_k
 
-    train_examples = _alloc_split(n_train, S, K)
-    val_examples = _alloc_split(n_val, S, K)
-    test_examples = _alloc_split(n_test, S, K)
+    val_examples = _alloc_split(n_val, S)
+    test_examples = _alloc_split(n_test, S)
 
     train_user_history: Dict[int, List[int]] = {}
     eval_user_history: Dict[int, List[int]] = {}
 
-    ti = vi = si = 0
+    vi = si = 0
 
     for user_id in user_sequences:
         train_items = train_seqs.get(user_id, [])
@@ -241,22 +239,6 @@ def generate_sequences(
 
         train_user_history[user_id] = list(train_items)
         eval_user_history[user_id] = list(train_items) + list(val_items)
-
-        if len(train_items) >= 2:
-            seqs, tgts, tgts_k = generate_sliding_window_examples(
-                train_items, S, K, split_end_idx=len(train_items),
-            )
-            # REV-088: the sliding window emits one example per context prefix
-            # items[:i] for i in 1..len(train_items)-1, so example j carries a context of
-            # j + 1 items. A single per-user length is correct only for the last example.
-            for j, (seq, t, tk) in enumerate(zip(seqs, tgts, tgts_k)):
-                train_examples["sequences"][ti] = seq
-                train_examples["targets"][ti] = t
-                train_examples["user_ids"][ti] = user_id
-                train_examples["lengths"][ti] = min(j + 1, S)
-                if K:
-                    train_examples["targets_k"][ti, :len(tk)] = tk
-                ti += 1
 
         if val_items:
             val_context = list(train_items)
@@ -278,9 +260,9 @@ def generate_sequences(
                 si += 1
                 test_context.append(item)
 
-    assert (ti, vi, si) == (n_train, n_val, n_test), (
-        f"example counts disagree with the preallocation: filled {(ti, vi, si)}, "
-        f"allocated {(n_train, n_val, n_test)}"
+    assert (vi, si) == (n_val, n_test), (
+        f"example counts disagree with the preallocation: filled {(vi, si)}, "
+        f"allocated {(n_val, n_test)}"
     )
 
     assert train_user_history is not eval_user_history, (
@@ -288,10 +270,10 @@ def generate_sequences(
     )
 
     logger.info(
-        "Generated sequences: train=%d, val=%d, test=%d",
-        n_train, n_val, n_test,
+        "Generated sequences: %d training interactions, val=%d, test=%d",
+        sum(len(v) for v in train_user_history.values()), n_val, n_test,
     )
-    return train_examples, val_examples, test_examples, train_user_history, eval_user_history
+    return val_examples, test_examples, train_user_history, eval_user_history
 
 
 def tensorise_examples(
@@ -311,18 +293,11 @@ def tensorise_examples(
     user_ids = _as_long(examples["user_ids"])
     lengths = _as_long(examples["lengths"])
 
-    tk = examples.get("targets_k")
-    targets_k = None
-    if tk is not None and len(tk) > 0:
-        has_targets = tk.shape[1] > 0 if isinstance(tk, np.ndarray) else any(len(x) > 0 for x in tk)
-        if has_targets:
-            targets_k = _as_long(tk)
-
     # REV-058: the dense `(N, S, F)` block that used to be built here was never
     # persisted by `save_tensorised` -- all 76.8 GB of it across the three splits was
     # computed and discarded. `RecDataset` now keeps the `(vocab, F)` matrix and
     # gathers per item, so tensorisation only has to hand it the matrix.
-    return RecDataset(sequences, targets, user_ids, lengths, targets_k, metadata_matrix)
+    return RecDataset(sequences, targets, user_ids, lengths, metadata_matrix)
 
 
 def save_tensorised(dataset: RecDataset, path: str) -> None:
@@ -331,7 +306,6 @@ def save_tensorised(dataset: RecDataset, path: str) -> None:
         "targets": dataset.targets,
         "user_ids": dataset.user_ids,
         "lengths": dataset.lengths,
-        "targets_k": dataset.targets_k,
     }
     torch.save(data, path)
 
@@ -430,24 +404,63 @@ def load_tensorised(
         targets=data["targets"],
         user_ids=data["user_ids"],
         lengths=data["lengths"],
-        targets_k=data.get("targets_k"),
         metadata_matrix=metadata_matrix,
     )
+
+
+def load_train_dataset(
+    processed_dir: str,
+    max_seq_length: int,
+    metadata_matrix: Optional[np.ndarray] = None,
+) -> RecDataset:
+    """The training split, chunked at `max_seq_length` from `train_user_history.pkl`.
+
+    Each row is one chunk of a user's chronological training history with a next-item
+    target at every real position (`targets` is `(N, S)`, 0 at padding). Built at load
+    time, so every reader gets chunks of exactly its own width.
+    """
+    with open(os.path.join(processed_dir, "train_user_history.pkl"), "rb") as f:
+        train_user_history = pickle.load(f)
+    examples = chunk_training_histories(train_user_history, max_seq_length)
+    return tensorise_examples(examples, metadata_matrix)
+
+
+class EpochPermutationSampler(Sampler):
+    """One `randperm` of the dataset per epoch, drawn from `generator`.
+
+    `RandomSampler` draws a second (empty) permutation once its iterator is EXHAUSTED.
+    An epoch cut short by `max_steps_per_epoch` exhausts it only when worker prefetch
+    happens to reach the end of the epoch, so the generator -- and every later epoch's
+    order -- depended on `num_workers`. This sampler consumes exactly one draw per epoch
+    whether or not the epoch is read to the end. The first permutation is the one
+    `RandomSampler` would have drawn.
+    """
+
+    def __init__(self, n: int, generator: torch.Generator):
+        self.n = int(n)
+        self.generator = generator
+
+    def __len__(self) -> int:
+        return self.n
+
+    def __iter__(self):
+        yield from torch.randperm(self.n, generator=self.generator).tolist()
 
 
 def build_dataloader(dataset: RecDataset, config: Config, shuffle: bool = True) -> DataLoader:
     worker_init = seed_worker if config.num_workers > 0 else None
     persistent = config.persistent_workers and config.num_workers > 0
+    generator = torch.Generator().manual_seed(config.seed)
 
     return DataLoader(
         dataset,
         batch_size=config.batch_size,
-        shuffle=shuffle,
+        sampler=EpochPermutationSampler(len(dataset), generator) if shuffle else None,
         num_workers=config.num_workers,
         pin_memory=config.pin_memory,
         persistent_workers=persistent,
         worker_init_fn=worker_init,
-        generator=torch.Generator().manual_seed(config.seed),
+        generator=generator,
     )
 
 
@@ -595,227 +608,3 @@ def filter_negatives(
             f"found only {len(selected)}. Increase pool_size or reduce constraints."
         )
     return np.array(selected[:num_negatives], dtype=np.int64)
-
-
-def sample_training_negatives(
-    pool: np.ndarray,
-    targets: np.ndarray,
-    user_ids: np.ndarray,
-    history_arrays: Dict[int, np.ndarray],
-    num_negatives: int,
-    num_items: int,
-    rng: np.random.RandomState,
-    max_rounds: int = 8,
-    _buffer: Optional[np.ndarray] = None,
-) -> np.ndarray:
-    """Vectorised per-example negative sampling for a training batch.
-
-    REV-012: the training loop used a raw contiguous slice of the global pool, so an
-    example's own target could be sampled as its own negative and `np.resize` tiled
-    duplicates near the end of the pool. This excludes, per example, the target, the
-    padding and mask IDs, and that user's training history -- the same constraints
-    `filter_negatives` applies at evaluation time -- while staying fast enough for the
-    hot path by using a membership bitmap instead of Python set lookups.
-
-    Returns an ``(B, num_negatives)`` int64 array.
-    """
-    B = len(targets)
-    width = num_items + 2
-
-    if _buffer is not None and _buffer.shape == (B, width):
-        forbidden = _buffer
-        forbidden.fill(False)
-    else:
-        forbidden = np.zeros((B, width), dtype=bool)
-
-    forbidden[:, 0] = True                 # padding ID
-    forbidden[:, num_items + 1] = True     # mask ID
-
-    hists = [history_arrays.get(int(u)) for u in user_ids]
-    lengths = [0 if h is None else len(h) for h in hists]
-    total = sum(lengths)
-    if total:
-        rows = np.repeat(np.arange(B), lengths)
-        cols = np.concatenate([h for h in hists if h is not None and len(h)])
-        np.clip(cols, 0, width - 1, out=cols)
-        forbidden[rows, cols] = True
-
-    tgt = np.asarray(targets, dtype=np.int64)
-    forbidden[np.arange(B), np.clip(tgt, 0, width - 1)] = True
-
-    n_pool = len(pool)
-    neg = pool[rng.randint(0, n_pool, size=(B, num_negatives))].astype(np.int64)
-
-    row_idx = np.arange(B)[:, None]
-    for _ in range(max_rounds):
-        bad = forbidden[row_idx, neg]
-        n_bad = int(bad.sum())
-        if n_bad == 0:
-            break
-        neg[bad] = pool[rng.randint(0, n_pool, size=n_bad)]
-
-    # Any residual collisions after max_rounds are replaced deterministically by a
-    # scan, so no example ever trains against its own target.
-    bad = forbidden[row_idx, neg]
-    if bad.any():
-        for r, c in zip(*np.nonzero(bad)):
-            for item in pool:
-                if not forbidden[r, int(item)]:
-                    neg[r, c] = int(item)
-                    break
-    return neg
-
-
-def generate_eval_candidates(
-    examples: dict,
-    pool: np.ndarray,
-    user_history: Dict[int, List[int]],
-    num_negatives: int,
-    padding_id: int = 0,
-    mask_id: int = -1,
-    seed: int = 42,
-    out_path: Optional[str] = None,
-) -> np.ndarray:
-    """Build `[target] + negatives` candidate sets, one per example.
-
-    Deterministic given `seed` and the example order. REV-041: callers should persist
-    the result with `save_eval_candidates` and load it at every evaluation site rather
-    than regenerating, so cross-model identity is structural rather than incidental.
-
-    REV-087: rows are written into ONE preallocated `(N, 1 + num_negatives)` array
-    instead of being accumulated as N separate `(101,)` arrays. The list-of-arrays form
-    cost ~0.9 GB for the test split in per-array overhead alone, and `save_eval_candidates`
-    then copied it again into a contiguous matrix. Passing `out_path` allocates that
-    destination as an on-disk `.npy` memmap, so the resident set is bounded by the OS
-    page cache rather than by the split size; `save_eval_candidates` recognises such a
-    memmap and fingerprints it in place without re-writing.
-    """
-    rng = np.random.RandomState(seed)
-    n = len(examples["targets"])
-    width = 1 + num_negatives
-    if out_path is not None:
-        out = np.lib.format.open_memmap(
-            out_path, mode="w+", dtype=np.int64, shape=(n, width),
-        )
-    else:
-        out = np.empty((n, width), dtype=np.int64)
-
-    for i in range(n):
-        target = examples["targets"][i]
-        user_id = examples["user_ids"][i]
-        history = set(user_history.get(user_id, []))
-        negs = filter_negatives(
-            pool, target, history, num_negatives, padding_id, mask_id, rng=rng,
-        )
-        out[i, 0] = target
-        out[i, 1:] = negs
-    return out
-
-
-def _fingerprint_rows(matrix: np.ndarray, block_rows: int = 8192) -> str:
-    """SHA-256 over the matrix, consumed in row blocks.
-
-    REV-087: hashing `matrix.tobytes()` materialises a full second copy of the array --
-    0.86 GB for the test split, at the same point in the pipeline as the other peaks.
-    Blocks keep the transient bounded while producing the same digest, since the blocks
-    concatenate to exactly the C-contiguous byte stream `tobytes()` would have built.
-    """
-    digest = hashlib.sha256()
-    for start in range(0, matrix.shape[0], block_rows):
-        digest.update(np.ascontiguousarray(matrix[start:start + block_rows]).tobytes())
-    return digest.hexdigest()[:16]
-
-
-def save_eval_candidates(candidates, path: str) -> str:
-    """Persist candidate sets as one (N, 1 + num_negatives) matrix plus a fingerprint.
-
-    Accepts either a `(N, C)` array -- including the memmap `generate_eval_candidates`
-    writes when given `out_path`, which is already backed by `path` and so is only
-    flushed rather than copied and re-written -- or the legacy list of per-example arrays.
-    """
-    if isinstance(candidates, np.memmap) and candidates.filename is not None and (
-        os.path.realpath(candidates.filename) == os.path.realpath(path)
-    ):
-        candidates.flush()
-        matrix = candidates
-    else:
-        matrix = np.asarray(candidates, dtype=np.int64)
-        np.save(path, matrix)
-
-    fingerprint = _fingerprint_rows(matrix)
-    meta = {"fingerprint": fingerprint, "shape": list(matrix.shape)}
-    with open(path + ".meta.json", "w") as f:
-        json.dump(meta, f)
-    return fingerprint
-
-
-def load_eval_candidates(
-    path: str, verify: bool = True, mmap: bool = False,
-) -> np.ndarray:
-    """Load a stored candidate matrix, optionally without materialising it.
-
-    REV-119: `test_candidates.npy` is (1,059,494 x 101) int64 = 856 MB. Consumers that
-    iterate the whole split (`--stage evaluate`, long-tail) should keep the eager path.
-    Consumers that address a few thousand ROWS (`run_local_personalization` scores
-    `personalization_eval_users` users) should pass `mmap=True` and let the OS page in
-    only what they index -- the fingerprint pass below is already block-wise (REV-087) and
-    reads a memmap without materialising it either.
-    """
-    matrix = np.load(path, mmap_mode="r" if mmap else None)
-    meta_path = path + ".meta.json"
-    if verify and os.path.exists(meta_path):
-        with open(meta_path) as f:
-            meta = json.load(f)
-        # REV-087: block-wise, so verification does not double the resident set.
-        actual = _fingerprint_rows(matrix)
-        if actual != meta["fingerprint"]:
-            raise RuntimeError(
-                f"Candidate set fingerprint mismatch for {path}: recorded "
-                f"{meta['fingerprint']}, recomputed {actual}."
-            )
-    return matrix
-
-
-def load_or_build_eval_candidates(
-    path: str,
-    examples: dict,
-    pool: np.ndarray,
-    user_history: Dict[int, List[int]],
-    config: Config,
-    expected_rows: Optional[int] = None,
-    mmap: bool = False,
-) -> np.ndarray:
-    """Return the stored candidate matrix for a split, regenerating only as a fallback.
-
-    REV-093 / REV-111 / REV-112: the Constraints say fixed evaluation candidate sets are
-    "generated once and reused -- never regenerated per model", and preprocessing writes
-    `val_candidates.npy` / `test_candidates.npy` for exactly that. Several evaluation
-    entry points rebuilt them per call instead, and most did so without passing `rng=`,
-    so `filter_negatives` fell back to a RandomState seeded from the TARGET ITEM: two
-    examples sharing a target received byte-identical negatives regardless of user or
-    history, and none of them matched the stored sets. Every such site now routes through
-    here, so the stored matrix is used when it exists and the fallback is seeded from
-    `config.seed` rather than silently from 42.
-    """
-    if os.path.exists(path):
-        # REV-119: `mmap` only affects HOW the stored matrix is read; the rows are the
-        # same fingerprinted rows either way, so the FR-1 "one candidate protocol"
-        # guarantee is untouched. The regeneration fallback below is in-memory by
-        # construction.
-        matrix = load_eval_candidates(path, mmap=mmap)
-        if expected_rows is not None and matrix.shape[0] != expected_rows:
-            raise RuntimeError(
-                f"Pre-stored candidate sets at {path} have {matrix.shape[0]} rows but "
-                f"the split has {expected_rows} examples. Re-run --stage preprocess."
-            )
-        return matrix
-
-    logger.warning(
-        "%s not found -- regenerating evaluation candidate sets from seed %d. Re-run "
-        "--stage preprocess so every model evaluates against the same stored sets.",
-        path, config.seed,
-    )
-    return generate_eval_candidates(
-        examples, pool, user_history, config.num_sampled_negatives,
-        padding_id=0, mask_id=config.num_items + 1, seed=config.seed,
-    )

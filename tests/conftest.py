@@ -51,8 +51,8 @@ def write_tiny_raw_csvs(raw_dir: str, seed: int = 0) -> None:
         n = rnd.randint(12, 30)
         items = rnd.sample(range(1, TINY_WARM_ITEMS + 1), n)
         if user % 3 == 0:
-            # The two final interactions are cold items: with n >= 12 and the default
-            # 0.8 / 0.1 split they land in val/test, never in training.
+            # The two final interactions are cold items: under leave-one-out they are
+            # this user's val and test targets, never in training.
             k = (user // 3) % len(cold_items)
             items[-2:] = [cold_items[k], cold_items[(k + 1) % len(cold_items)]]
         base = start + timedelta(days=user)

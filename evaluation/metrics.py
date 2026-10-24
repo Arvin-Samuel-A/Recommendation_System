@@ -1,6 +1,7 @@
 import math
 import os
 import pickle
+from dataclasses import dataclass
 from typing import Dict, List, Mapping, Optional, Sequence, Union
 
 import numpy as np
@@ -12,9 +13,105 @@ from models.transformer import l2_normalize
 from utils import autocast_context, autocast_disabled
 
 #: Stamped into every result file that reports ranking metrics (specs/eval-integrity
-#: FR-1.5): fp32 scores, tie-averaged metrics. Files without it are protocol version 1
-#: (bf16 scores under mixed precision, ties to the target) and are not comparable.
-EVAL_PROTOCOL = {"version": 2, "scoring": "fp32", "ties": "tie_averaged"}
+#: FR-1.5): fp32 scores, tie-averaged metrics. Version 1 files used bf16 scores under
+#: mixed precision with ties to the target; version 2 ranked each target against 100
+#: sampled negatives on an 80/10/10 split. Version 3 is leave-one-out, ranked against the
+#: full catalogue minus the user's earlier interactions. No two versions are comparable.
+EVAL_PROTOCOL = {
+    "version": 3, "scoring": "fp32", "ties": "tie_averaged",
+    "split": "leave_one_out", "candidates": "full_catalogue",
+}
+
+
+@dataclass(frozen=True)
+class FullRanking:
+    """Evaluation rows ranked against the whole catalogue (owner decision 2026-10-25).
+
+    Row `i` ranks `targets[i]` against every item `1..num_items` except the user's
+    earlier interactions, `exclude_items[exclude_ptr[i]:exclude_ptr[i + 1]]`. Padding and
+    MASK are never candidates. Takes the place of a `(N, C)` candidate matrix wherever
+    `evaluate_model` / `evaluate_popularity` accept one.
+    """
+
+    targets: torch.Tensor        # (N,) int64
+    exclude_ptr: torch.Tensor    # (N + 1,) int64, CSR offsets into exclude_items
+    exclude_items: torch.Tensor  # (E,) int64
+
+    def __len__(self) -> int:
+        return int(self.targets.shape[0])
+
+    def rows(self, start: int, stop: int) -> "FullRanking":
+        """Rows `start:stop`, with offsets rebased to 0 (a view of the item array)."""
+        lo, hi = int(self.exclude_ptr[start]), int(self.exclude_ptr[stop])
+        return FullRanking(
+            self.targets[start:stop],
+            self.exclude_ptr[start:stop + 1] - lo,
+            self.exclude_items[lo:hi],
+        )
+
+    def select(self, indices) -> "FullRanking":
+        """The rows at `indices`, in that order."""
+        idx = torch.as_tensor(np.asarray(indices), dtype=torch.long)
+        starts = self.exclude_ptr[idx]
+        counts = self.exclude_ptr[idx + 1] - starts
+        ptr = torch.zeros(len(idx) + 1, dtype=torch.long)
+        torch.cumsum(counts, 0, out=ptr[1:])
+        offsets = torch.repeat_interleave(starts - ptr[:-1], counts) + torch.arange(
+            int(ptr[-1]), dtype=torch.long,
+        )
+        return FullRanking(self.targets[idx], ptr, self.exclude_items[offsets])
+
+
+def build_full_ranking(
+    targets, user_ids, histories: Mapping[int, Sequence[int]],
+) -> FullRanking:
+    """One row per example: its target, excluding `histories[user]`."""
+    arrays = [np.asarray(histories.get(int(u), ()), dtype=np.int64).ravel() for u in user_ids]
+    counts = np.fromiter((len(a) for a in arrays), dtype=np.int64, count=len(arrays))
+    ptr = np.zeros(len(arrays) + 1, dtype=np.int64)
+    np.cumsum(counts, out=ptr[1:])
+    items = np.concatenate(arrays) if arrays else np.zeros(0, dtype=np.int64)
+    return FullRanking(
+        torch.as_tensor(np.asarray(targets), dtype=torch.long).reshape(-1),
+        torch.from_numpy(ptr),
+        torch.from_numpy(items),
+    )
+
+
+#: The history each split's rows exclude: validation targets follow the training
+#: history; test targets follow training + validation (`eval_user_history.pkl`).
+_EXCLUDED_HISTORY = {"val": "train_user_history.pkl", "test": "eval_user_history.pkl"}
+
+
+def load_full_ranking(processed_dir: str, split: str, targets, user_ids) -> FullRanking:
+    """`build_full_ranking` over the stored history for `split` ("val" or "test")."""
+    if split not in _EXCLUDED_HISTORY:
+        raise ValueError(f"split must be one of {sorted(_EXCLUDED_HISTORY)}, got {split!r}")
+    with open(os.path.join(processed_dir, _EXCLUDED_HISTORY[split]), "rb") as f:
+        histories = pickle.load(f)
+    return build_full_ranking(targets, user_ids, histories)
+
+
+def catalogue_ranking_scores(item_scores: torch.Tensor, ranking: FullRanking) -> torch.Tensor:
+    """`(B, vocab)` per-item scores -> `(B, vocab + 1)` with the target in column 0.
+
+    Column 0 holds each row's target score; every excluded item, padding (0), MASK
+    (`vocab - 1`) and the target's own column are `-inf`, so they rank below every real
+    candidate and never tie the target. Ready for `compute_metrics_batch(target_idx=0)`.
+    Modifies `item_scores` in place.
+    """
+    B, V = item_scores.shape
+    device = item_scores.device
+    targets = ranking.targets.to(device)
+    target_scores = item_scores.gather(1, targets[:, None])
+    counts = ranking.exclude_ptr[1:] - ranking.exclude_ptr[:-1]
+    rows = torch.repeat_interleave(torch.arange(B), counts).to(device)
+    neg_inf = float("-inf")
+    item_scores[rows, ranking.exclude_items.to(device)] = neg_inf
+    item_scores[:, 0] = neg_inf
+    item_scores[:, V - 1] = neg_inf
+    item_scores.scatter_(1, targets[:, None], neg_inf)
+    return torch.cat([target_scores, item_scores], dim=1)
 
 
 def compute_metrics_batch(
@@ -119,38 +216,32 @@ def aggregate_metrics(
     return result
 
 
-def score_candidates_batch(
+def _user_embeddings(
     model: torch.nn.Module,
     seqs: torch.Tensor,
-    candidate_ids: torch.Tensor,
     config: Config,
     moe_layer: Optional[torch.nn.Module] = None,
     metadata: Optional[torch.Tensor] = None,
-    temperature: float = 1.0,
 ) -> torch.Tensor:
-    """Score `(B, C)` candidates for `(B, S)` sequences in ONE forward pass.
+    """`(B, D)` fp32 user embeddings (L2-normalised when configured), eval mode, no grad.
 
-    REV-063: evaluation used to forward a batch of exactly 1 per example. At 2.26 ms per
-    example the 993,372-example validation split cost ~37 minutes per pass, so a 20-epoch
-    run spent ~12 hours in validation alone and the full-scale gates could not be
-    demonstrated. Everything here is the same arithmetic as the single-example path, run
-    over a batch dimension.
-
-    specs/eval-integrity FR-1: this is the single scoring choke point. The forward (and
-    MoE) run in their own autocast region -- bf16 under mixed precision -- but the L2
-    normalisation, the dot products and the temperature run in fp32 with autocast OFF,
-    even when the caller has a region open. The returned scores are always float32: bf16
-    cosines tied the target in 41-52% of examples.
+    specs/eval-integrity FR-1: the forward (and MoE) run in their own autocast region --
+    bf16 under mixed precision -- but the upcast and normalisation run in fp32 with
+    autocast OFF, even when the caller has a region open.
     """
     model.eval()
+    # The MoE layer is a separate module, so `model.eval()` doesn't reach it. Callers
+    # that never switched it (per-user personalization) scored with expert dropout on,
+    # so the with/without-LoRA NDCG of the same frozen model differed run to run.
+    if moe_layer is not None:
+        moe_layer.eval()
     with torch.no_grad():
         # The eval datasets are held on CPU while the model lives on the accelerator, so
         # move each batch across here. CUDA rejects a cross-device index outright, and
-        # MPS rejects it as "Passed CPU tensor to MPS op" -- this is the single place
-        # every scoring caller (validation, test, cold-start, long-tail) funnels through.
+        # MPS rejects it as "Passed CPU tensor to MPS op" -- every scoring caller
+        # (validation, test, cold-start, long-tail) funnels through here.
         param_device = next(model.parameters()).device
         seqs = seqs.to(param_device)
-        candidate_ids = candidate_ids.to(param_device)
         if metadata is not None:
             metadata = metadata.to(device=param_device, dtype=model.item_emb_weight.dtype)
 
@@ -172,27 +263,74 @@ def score_candidates_batch(
             # Upcast BEFORE normalising: `l2_normalize` returns its input dtype, so a bf16
             # input would come back bf16.
             user_emb = user_emb.float()
-            item_embs = model.item_emb_weight[candidate_ids].float()  # (B, C, D)
-
-            # REV-044: FR-8 / AC-07 -- L2-normalize both sides before the dot product so
-            # scores are bounded to [-1, 1]. This is the production scoring path, and
-            # (eval-integrity FR-1) it is fp32 end to end.
             if config.normalize_embeddings:
                 user_emb = l2_normalize(user_emb)
-                item_embs = l2_normalize(item_embs)
+    return user_emb
 
-            scores = torch.einsum("bd,bcd->bc", user_emb, item_embs)
-            # The training logit scale (`logit_temperature` / `learnable_logit_scale`,
-            # training/losses.LogitScale) is deliberately NOT applied: every metric here
-            # depends only on the rank of the target among the candidates, and ranks are
-            # invariant to multiplying all scores by a positive scalar (ties included).
-            # Validation, test, cold-start, long-tail, federated and personalisation
-            # scoring all go through this function; the ANN path
-            # (models/ann_retrieval.py) takes a top-k over the same cosines.
 
-            if temperature != 1.0:
-                scores = scores / temperature
+def score_candidates_batch(
+    model: torch.nn.Module,
+    seqs: torch.Tensor,
+    candidate_ids: torch.Tensor,
+    config: Config,
+    moe_layer: Optional[torch.nn.Module] = None,
+    metadata: Optional[torch.Tensor] = None,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    """Score `(B, C)` candidates for `(B, S)` sequences in ONE forward pass.
 
+    REV-063: evaluation used to forward a batch of exactly 1 per example. Everything
+    here is the same arithmetic as the single-example path, run over a batch dimension.
+
+    specs/eval-integrity FR-1: one of the two scoring choke points (with
+    `score_catalogue_batch`). The L2 normalisation, the dot products and the temperature
+    run in fp32 with autocast OFF. The returned scores are always float32: bf16 cosines
+    tied the target in 41-52% of examples.
+    """
+    user_emb = _user_embeddings(model, seqs, config, moe_layer, metadata)
+    device = user_emb.device
+    with torch.no_grad(), autocast_disabled(device.type):
+        item_embs = model.item_emb_weight[candidate_ids.to(device)].float()  # (B, C, D)
+        # REV-044: FR-8 / AC-07 -- L2-normalize both sides before the dot product so
+        # scores are bounded to [-1, 1].
+        if config.normalize_embeddings:
+            item_embs = l2_normalize(item_embs)
+
+        scores = torch.einsum("bd,bcd->bc", user_emb, item_embs)
+        # The training logit scale (`logit_temperature` / `learnable_logit_scale`,
+        # training/losses.LogitScale) is deliberately NOT applied: every metric here
+        # depends only on the rank of the target among the candidates, and ranks are
+        # invariant to multiplying all scores by a positive scalar (ties included).
+        if temperature != 1.0:
+            scores = scores / temperature
+
+    assert scores.dtype == torch.float32, f"scores must be float32, got {scores.dtype}"
+    return scores
+
+
+def score_catalogue_batch(
+    model: torch.nn.Module,
+    seqs: torch.Tensor,
+    config: Config,
+    moe_layer: Optional[torch.nn.Module] = None,
+    metadata: Optional[torch.Tensor] = None,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    """`(B, vocab)` fp32 scores of every embedding row for `(B, S)` sequences.
+
+    Columns are item ids, padding (0) and MASK (last) included -- `catalogue_ranking_scores`
+    takes them out. Same arithmetic as `score_candidates_batch` with every item as a
+    candidate: fp32, autocast off, no logit scale.
+    """
+    user_emb = _user_embeddings(model, seqs, config, moe_layer, metadata)
+    device = user_emb.device
+    with torch.no_grad(), autocast_disabled(device.type):
+        item_embs = model.item_emb_weight.float()
+        if config.normalize_embeddings:
+            item_embs = l2_normalize(item_embs)
+        scores = user_emb @ item_embs.T
+        if temperature != 1.0:
+            scores = scores / temperature
     assert scores.dtype == torch.float32, f"scores must be float32, got {scores.dtype}"
     return scores
 
@@ -237,7 +375,7 @@ def _stack_candidates(candidate_sets, indices) -> torch.Tensor:
 def evaluate_model(
     model: torch.nn.Module,
     eval_sequences: Union[torch.Tensor, Sequence[torch.Tensor]],
-    candidate_sets: Union[torch.Tensor, Sequence[torch.Tensor]],
+    candidate_sets: Union[FullRanking, torch.Tensor, Sequence[torch.Tensor]],
     config: Config,
     moe_layer: Optional[torch.nn.Module] = None,
     metadata_per_example: Optional[Sequence[torch.Tensor]] = None,
@@ -246,9 +384,11 @@ def evaluate_model(
 ) -> Dict[str, Dict[str, float]]:
     """Batched evaluation over an aligned set of sequences and candidate sets.
 
-    `eval_sequences` and `candidate_sets` may each be a single stacked `(N, S)` / `(N, C)`
-    tensor -- which is what `load_eval_candidates` and `RecDataset` already hold -- or a
-    sequence of per-example tensors.
+    `candidate_sets` is normally a `FullRanking` (the protocol: each target ranked
+    against the whole catalogue minus the user's history). A stacked `(N, C)` tensor or a
+    sequence of per-example tensors, target in column 0, ranks within those candidates
+    instead -- the ANN retrieval path. `eval_sequences` is a stacked `(N, S)` tensor (what
+    `RecDataset` holds) or a sequence of per-example tensors.
 
     REV-058 / REV-063: prefer `metadata_matrix`, the `(vocab, F)` matrix, over
     `metadata_per_example`. Passing the matrix lets each batch gather only its own
@@ -265,7 +405,6 @@ def evaluate_model(
     for start in range(0, n, bs):
         indices = list(range(start, min(start + bs, n)))
         seqs = _stack_sequences(eval_sequences, indices)
-        cands = _stack_candidates(candidate_sets, indices)
 
         meta = None
         if metadata_matrix is not None:
@@ -275,10 +414,19 @@ def evaluate_model(
                 torch.as_tensor(metadata_per_example[i]) for i in indices
             ])
 
-        scores = score_candidates_batch(
-            model, seqs, cands, config, moe_layer=moe_layer,
-            metadata=meta, temperature=temperature,
-        )
+        if isinstance(candidate_sets, FullRanking):
+            scores = catalogue_ranking_scores(
+                score_catalogue_batch(
+                    model, seqs, config, moe_layer=moe_layer,
+                    metadata=meta, temperature=temperature,
+                ),
+                candidate_sets.rows(indices[0], indices[-1] + 1),
+            )
+        else:
+            scores = score_candidates_batch(
+                model, seqs, _stack_candidates(candidate_sets, indices), config,
+                moe_layer=moe_layer, metadata=meta, temperature=temperature,
+            )
         for name, val in compute_metrics_batch(scores, target_idx=0, k=config.eval_k).items():
             collected.setdefault(name, []).append(val.detach().cpu())
 
@@ -326,27 +474,40 @@ def popularity_scores(candidates: torch.Tensor, popularity: torch.Tensor) -> tor
     return popularity[candidates.long().to(popularity.device)]
 
 
+def popularity_ranking_scores(ranking: FullRanking, popularity: torch.Tensor) -> torch.Tensor:
+    """The popularity-only ranker's `catalogue_ranking_scores` for these rows."""
+    item_scores = popularity.reshape(1, -1).expand(len(ranking), -1).clone()
+    return catalogue_ranking_scores(item_scores, ranking)
+
+
 def evaluate_popularity(
-    candidates: Union[torch.Tensor, np.ndarray],
+    candidates: Union[FullRanking, torch.Tensor, np.ndarray],
     popularity: torch.Tensor,
     k: int,
     batch_size: Optional[int] = None,
 ) -> Dict[str, Dict[str, float]]:
-    """The popularity-only ranker's metrics on these candidate rows (target in column 0).
+    """The popularity-only ranker's metrics on these rows: a `FullRanking`, or candidate
+    rows with the target in column 0.
 
     Ranked with `compute_metrics_batch`, so tied counts are tie-averaged exactly as the
     model's scores are. Same `{metric: {mean, std}}` shape as `evaluate_model`.
     """
-    n = int(candidates.shape[0])
+    full = isinstance(candidates, FullRanking)
+    n = len(candidates) if full else int(candidates.shape[0])
     if n == 0:
         return {}
     bs = batch_size or n
     collected: Dict[str, List[torch.Tensor]] = {}
     for start in range(0, n, bs):
-        rows = candidates[start : start + bs]
-        if not isinstance(rows, torch.Tensor):
-            rows = torch.as_tensor(np.asarray(rows))   # e.g. a memory-mapped matrix
-        scores = popularity_scores(rows, popularity)
+        if full:
+            scores = popularity_ranking_scores(
+                candidates.rows(start, min(start + bs, n)), popularity,
+            )
+        else:
+            rows = candidates[start : start + bs]
+            if not isinstance(rows, torch.Tensor):
+                rows = torch.as_tensor(np.asarray(rows))   # e.g. a memory-mapped matrix
+            scores = popularity_scores(rows, popularity)
         for name, val in compute_metrics_batch(scores, target_idx=0, k=k).items():
             collected.setdefault(name, []).append(val.detach().cpu())
     return aggregate_metrics({name: torch.cat(vals) for name, vals in collected.items()})

@@ -1,10 +1,12 @@
-"""Package the 10%-user ablation run for the H100 and AWS machines and emit its launch commands.
+"""Package the ablation run for the H100 and AWS machines and emit its launch commands.
 
-specs/ablation-run FR-12 / design D12. Run on the Mac after
-`python main.py --stage preprocess --user_sample_fraction 0.1`:
+specs/ablation-run FR-12 / design D12. Run on the Mac after `python main.py --stage
+preprocess` (the full dataset by default; pass --user-sample-fraction for a user sample,
+and preprocess with the same `--user_sample_fraction`):
 
-  1. refuse unless the sampled processed directory exists and its manifest matches the
-     requested fraction/seed with stored_seq_length >= max(sequence_length_grid);
+  1. refuse unless the processed directory exists and its manifest matches the
+     requested fraction/seed, is leave-one-out, and has
+     stored_seq_length >= max(sequence_length_grid);
   2. render launch/run_h100.sh, launch/run_aws.sh and launch/LAUNCH.md from ONE command
      builder (scripts and docs cannot drift) and `bash -n` both scripts;
   3. write <out>/code.tar.gz: every git-tracked file (working-tree contents) + launch/;
@@ -33,6 +35,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 from configs.config import Config  # noqa: E402
+from data.preprocessing import SPLIT_STRATEGY  # noqa: E402
 
 #: Files the generated launch scripts execute; they must be in the code tarball.
 REQUIRED_TRACKED = (
@@ -45,7 +48,7 @@ REQUIRED_TRACKED = (
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    p.add_argument("--user-sample-fraction", type=float, default=0.1)
+    p.add_argument("--user-sample-fraction", type=float, default=1.0)
     p.add_argument("--user-sample-seed", type=int, default=42)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--model", default="t-base", choices=["t-small", "t-base", "t-large"])
@@ -134,6 +137,11 @@ def validate_manifest(processed: str, cfg: Config) -> Dict:
     with open(path) as f:
         manifest = json.load(f)
     problems = []
+    if manifest.get("split_strategy") != SPLIT_STRATEGY:
+        problems.append(
+            f"split_strategy {manifest.get('split_strategy')!r} != {SPLIT_STRATEGY!r}; "
+            "re-run --stage preprocess with this code"
+        )
     fraction = float(manifest.get("user_sample_fraction", 1.0))
     if abs(fraction - cfg.user_sample_fraction) > 1e-12:
         problems.append(f"user_sample_fraction {fraction:g} != {cfg.user_sample_fraction:g}")

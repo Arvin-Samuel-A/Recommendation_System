@@ -264,7 +264,12 @@ _RUNTIME_ONLY_FIELDS = frozenset({"num_workers", "pin_memory", "resume_training"
 #: backbones trained before the fix are never reused (specs/eval-integrity FR-4).
 #: 1 = implicit (<= c094b2c). 2 = eval-integrity FR-3: per-forward autocast regions with
 #: the weight cache off (mixed-precision runs before it forwarded stale bf16 casts).
-TRAINING_SEMANTICS_VERSION = 2
+#: 3 = LLM-style training (owner decision 2026-10-25): whole chunked histories, a
+#: full-catalogue next-item and multi-step loss at every position, per-position routing,
+#: on leave-one-out splits of every rating.
+#: 4 = the masked sequence feeds only the masked-item objective; next-item, multi-step
+#: and contrastive read a clean forward (owner decision 2026-10-25).
+TRAINING_SEMANTICS_VERSION = 4
 
 
 #: Training fields added after TRAINING_SEMANTICS_VERSION 2, with the value that
@@ -575,15 +580,14 @@ def _run_single_config(
     """
     from training.pretrain import run_pretrain, build_model, load_checkpoint, _build_loss_fns
     from evaluation.metrics import (
-        EVAL_PROTOCOL, evaluate_model, evaluate_popularity, load_item_popularity,
+        EVAL_PROTOCOL, evaluate_model, evaluate_popularity, load_full_ranking,
+        load_item_popularity,
     )
     from training.pretrain import POPULARITY_EVAL_BATCH
     from evaluation.flops import (
         benchmark_latency, count_parameters, estimate_flops_per_inference,
     )
-    from data.sequence_generator import (
-        load_tensorised, load_eval_candidates, load_metadata_matrix,
-    )
+    from data.sequence_generator import load_tensorised, load_metadata_matrix
     from utils import get_device, artifact_source_revision, set_seed
 
     # Every arm starts from the configured seed, so its result does not depend on which
@@ -691,23 +695,17 @@ def _run_single_config(
     # checkpoint IT was evaluated from, alongside `resolved_config` and `config_diff`.
     result["source_revision"] = artifact_source_revision(arm_ckpt)
 
-    # Evaluate on the FIXED stored candidate sets, so every ablation arm is scored
-    # against identical candidates (data-pipeline REV-041).
+    # Every arm ranks each user's test item against the full catalogue minus that user's
+    # history, so all arms are scored on identical rows.
     test_dataset = load_tensorised(
         os.path.join(processed, "test_tensorised.pt"), metadata_matrix,
         max_seq_length=cfg.max_seq_length,
     )
-    cand_matrix = load_eval_candidates(
-        os.path.join(processed, "test_candidates.npy"), mmap=True,
+    ranking = load_full_ranking(
+        processed, "test", test_dataset.targets, test_dataset.user_ids,
     )
-    if cand_matrix.shape[0] != len(test_dataset):
-        raise RuntimeError(
-            f"test candidate sets have {cand_matrix.shape[0]} rows but the test split has "
-            f"{len(test_dataset)}; re-run --stage preprocess"
-        )
     # specs/eval-integrity FR-6: the FULL test split by default; a seeded random sample
-    # only when `ablation_eval_examples > 0`. Only the selected candidate rows are read
-    # from the memory-mapped matrix.
+    # only when `ablation_eval_examples > 0`.
     idx, test_eval = select_eval_rows(
         len(test_dataset), cfg.ablation_eval_examples, cfg.ablation_eval_seed,
     )
@@ -715,10 +713,10 @@ def _run_single_config(
     # building n per-example device tensors and forwarding a batch of 1 each.
     if idx is None:
         sequences = test_dataset.sequences
-        candidates = torch.as_tensor(np.array(cand_matrix), dtype=torch.long)
+        candidates = ranking
     else:
         sequences = test_dataset.sequences[torch.from_numpy(idx)]
-        candidates = torch.as_tensor(np.array(cand_matrix[idx]), dtype=torch.long)
+        candidates = ranking.select(idx)
 
     model.eval()
     moe.eval()
@@ -732,7 +730,7 @@ def _run_single_config(
     }
     result["num_eval_examples"] = test_eval["num_examples"]
     result["test_eval"] = test_eval
-    # FR-7: the popularity-only floor on exactly these rows and candidates.
+    # FR-7: the popularity-only floor on exactly these rows.
     result["popularity_reference"] = evaluate_popularity(
         candidates, load_item_popularity(processed, cfg.vocab_size), k=cfg.eval_k,
         batch_size=POPULARITY_EVAL_BATCH,
@@ -834,32 +832,17 @@ def _run_single_config(
             logger.warning("  %s: communication study skipped (%s)", label, exc)
 
     if "gradient" in extras:
-        from training.pretrain import attach_training_negatives
         from training.gradnorm import get_anchor_layer_params
         from evaluation.gradient_diagnostics import run_gradient_diagnostics
-        from data.sequence_generator import build_dataloader, GlobalNegativePool
-        import pickle
+        from data.sequence_generator import build_dataloader, load_train_dataset
         import random as _random
 
-        train_dataset = load_tensorised(
-            os.path.join(processed, "train_tensorised.pt"), metadata_matrix,
-            max_seq_length=cfg.max_seq_length,
-        )
+        train_dataset = load_train_dataset(processed, cfg.max_seq_length, metadata_matrix)
         loader = build_dataloader(train_dataset, cfg, shuffle=True)
-        neg_array = GlobalNegativePool.load(
-            os.path.join(processed, "global_negative_pool.npy"), set(),
-        ).pool
-        with open(os.path.join(processed, "train_user_history.pkl"), "rb") as f:
-            hist = pickle.load(f)
-        hist_arrays = {int(u): np.asarray(v, dtype=np.int64) for u, v in hist.items()}
-        neg_rng = np.random.RandomState(cfg.seed)
 
         grad_report = run_gradient_diagnostics(
             model, moe, loader, loss_fns,
             get_anchor_layer_params(model, cfg), cfg, f"{run_tag}",
-            negative_sampler=lambda b: attach_training_negatives(
-                b, neg_array, hist_arrays, cfg, neg_rng, device,
-            ),
             metadata_matrix=metadata_matrix,
             augment_rng=_random.Random(cfg.seed),
             write_report=False,

@@ -5,7 +5,7 @@ from configs.config import Config, OBJECTIVE_ORDER
 from models.transformer import TransformerModel
 from models.moe import MoELayer
 from training.losses import (
-    SampledSoftmaxLoss,
+    NextItemLoss,
     MaskedItemLoss,
     MultiStepLoss,
     InfoNCELoss,
@@ -48,7 +48,7 @@ class TestOneBatchEndToEnd:
         moe = MoELayer(cfg).to(device=device, dtype=dtype)
         moe.train()
 
-        next_loss_fn = SampledSoftmaxLoss()
+        next_loss_fn = NextItemLoss()
         mim_loss_fn = MaskedItemLoss()
         ms_loss_fn = MultiStepLoss(D, cfg.multi_step_k).to(device=device, dtype=dtype)
         cl_loss_fn = InfoNCELoss(temperature=cfg.contrastive_temperature)
@@ -58,9 +58,8 @@ class TestOneBatchEndToEnd:
         B, S = 8, cfg.max_seq_length
         seq = torch.randint(1, cfg.num_items + 1, (B, S), device=device)
         seq[:, :3] = 0
-        targets = torch.randint(1, cfg.num_items + 1, (B,), device=device)
-        neg_ids = torch.randint(1, cfg.num_items + 1, (B, 10), device=device)
-        targets_k = torch.randint(1, cfg.num_items + 1, (B, cfg.multi_step_k), device=device)
+        targets = torch.randint(1, cfg.num_items + 1, (B, S), device=device)
+        targets[:, :3] = 0
         metadata = torch.randn(B, S, cfg.feature_dim, device=device, dtype=dtype)
 
         masked_seq, mask_positions, true_ids = apply_masking(seq, cfg.mask_prob, mask_id)
@@ -71,15 +70,14 @@ class TestOneBatchEndToEnd:
         active_losses = {}
 
         moe.clear_cache()
-        Z_next, r_next = moe(all_hidden, pooled, 0)
-        user_emb = Z_next[:, -1, :]
-        active_losses["next_item"] = next_loss_fn(user_emb, targets, neg_ids, model.item_emb_weight)
+        Z_next, r_next = moe(all_hidden, all_hidden, 0)
+        active_losses["next_item"] = next_loss_fn(Z_next, targets, model.item_emb_weight)
 
         Z_mim, r_mim = moe(all_hidden, pooled, 1)
         active_losses["masked_item"] = mim_loss_fn(Z_mim, mask_positions, true_ids, model.item_emb_weight)
 
-        Z_ms, r_ms = moe(all_hidden, pooled, 2)
-        active_losses["multi_step"] = ms_loss_fn(Z_ms, targets_k, model.item_emb_weight)
+        Z_ms, r_ms = moe(all_hidden, all_hidden, 2)
+        active_losses["multi_step"] = ms_loss_fn(Z_ms, targets, model.item_emb_weight)
 
         Z_cl, r_cl = moe(all_hidden, pooled, 3)
         z_orig = torch.nn.functional.normalize(Z_cl[:, -1, :].float(), p=2, dim=-1)
@@ -126,7 +124,7 @@ class TestOneBatchEndToEnd:
 
         assert r_next is not None
         assert r_mim is not None
-        assert not torch.allclose(r_next, r_mim, atol=1e-5)
+        assert not torch.allclose(r_next[:, -1], r_mim, atol=1e-5)
 
     def test_none_variant_pipeline(self):
         cfg = Config()
@@ -148,8 +146,7 @@ class TestOneBatchEndToEnd:
 
         B, S = 4, cfg.max_seq_length
         seq = torch.randint(1, cfg.num_items + 1, (B, S), device=device)
-        targets = torch.randint(1, cfg.num_items + 1, (B,), device=device)
-        neg_ids = torch.randint(1, cfg.num_items + 1, (B, 10), device=device)
+        targets = torch.randint(1, cfg.num_items + 1, (B, S), device=device)
 
         all_hidden = model(seq, return_all_hidden=True)
         pooled = all_hidden[:, -1, :]
@@ -158,9 +155,7 @@ class TestOneBatchEndToEnd:
         assert r is None
         assert torch.equal(Z, all_hidden)
 
-        user_emb = Z[:, -1, :]
-        loss_fn = SampledSoftmaxLoss()
-        loss = loss_fn(user_emb, targets, neg_ids, model.item_emb_weight)
+        loss = NextItemLoss()(Z, targets, model.item_emb_weight)
         assert torch.isfinite(loss)
 
         loss.backward()

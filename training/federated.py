@@ -25,12 +25,11 @@ from training.local_train import (
     evaluate_user,
     build_local_training_examples,
 )
-from evaluation.metrics import evaluate_model
+from evaluation.metrics import evaluate_model, load_full_ranking
 from data.sequence_generator import (
     load_tensorised,
     load_examples,
     build_dataloader,
-    load_or_build_eval_candidates,
     filter_negatives,
     load_metadata_matrix,
 )
@@ -129,48 +128,34 @@ def run_federated(
 
     with open(os.path.join(processed, "train_user_history.pkl"), "rb") as f:
         train_user_history = pickle.load(f)
-    with open(os.path.join(processed, "eval_user_history.pkl"), "rb") as f:
-        eval_user_history = pickle.load(f)
 
     # specs/ablation-run FR-7: splits are stored wider than the model; narrow on read.
     val_dataset = load_tensorised(
         os.path.join(processed, "val_tensorised.pt"), metadata_matrix,
         max_seq_length=config.max_seq_length,
     )
-    val_examples = {
-        "targets": val_dataset.targets.numpy().tolist(),
-        "user_ids": val_dataset.user_ids.numpy().tolist(),
-    }
-    # REV-112(a): `val_candidates.npy` already holds exactly this matrix, fingerprinted
-    # and written once by preprocessing, and `pretrain._load_or_build_val_candidates`
-    # loads it. Rebuilding it here ran ~1M sequential `filter_negatives` calls on every
-    # invocation, and -- passing no `seed=` -- built them from `generate_eval_candidates`'s
-    # default of 42, so a `--seed 123` run evaluated against seed-42 candidates while
-    # every other stage used 123. Route through the shared loader like every other site.
-    val_candidates = load_or_build_eval_candidates(
-        os.path.join(processed, "val_candidates.npy"),
-        val_examples, neg_pool, eval_user_history, config,
-        expected_rows=len(val_dataset),
+    # The same validation rows pretraining selects on: each user's val target ranked
+    # against the full catalogue minus their training history.
+    val_ranking = load_full_ranking(
+        processed, "val", val_dataset.targets, val_dataset.user_ids,
     )
     # REV-063: stacked tensors, batched by `evaluate_model`.
     val_sequences = val_dataset.sequences
-    val_candidate_tensors = torch.as_tensor(np.asarray(val_candidates), dtype=torch.long)
 
     # REV-112(b): bound the per-round pass to a fixed prefix. `evaluate_model` used to
-    # run over all 993,372 validation examples inside the round loop, i.e. once per
+    # run over the whole validation split inside the round loop, i.e. once per
     # `federated_rounds`, which dominated the stage's cost.
     # REV-117: the prefix must be scored on EVERY round including the last. Exempting the
-    # final round made rounds 0..N-2 a 5,000-example prefix covering 700 of the split's
-    # 136,677 users and round N-1 the full split -- two different populations plotted as
-    # one series, with the discontinuity landing exactly on the endpoint that decides
-    # whether AC-06's curve reads as improving. The final round now runs the full split
+    # final round plotted two different populations as one series, with the
+    # discontinuity landing exactly on the endpoint that decides whether AC-06's curve
+    # reads as improving. The final round now runs the full split
     # ADDITIONALLY, into `val_ndcg_full`, which is the headline number; `val_ndcg` stays
     # the prefix everywhere and is what the convergence figure plots.
     n_round_eval = len(val_dataset)
     if config.federated_eval_examples > 0:
         n_round_eval = min(config.federated_eval_examples, n_round_eval)
     round_val_sequences = val_sequences[:n_round_eval]
-    round_val_candidates = val_candidate_tensors[:n_round_eval]
+    round_val_ranking = val_ranking.rows(0, n_round_eval)
     if n_round_eval < len(val_dataset):
         logger.info(
             "Federated per-round validation is bounded to the first %d of %d examples "
@@ -275,7 +260,7 @@ def run_federated(
         # prefix, so the series the figure draws is internally comparable end to end.
         is_final_round = round_idx == config.federated_rounds - 1
         eval_sequences = round_val_sequences
-        eval_candidates = round_val_candidates
+        eval_candidates = round_val_ranking
         with torch.no_grad():
             val_metrics = evaluate_model(
                 model, eval_sequences, eval_candidates, config,
@@ -293,7 +278,7 @@ def run_federated(
             else:
                 with torch.no_grad():
                     full_metrics = evaluate_model(
-                        model, val_sequences, val_candidate_tensors, config,
+                        model, val_sequences, val_ranking, config,
                         moe_layer=moe, metadata_matrix=val_dataset.metadata_matrix,
                     )
 

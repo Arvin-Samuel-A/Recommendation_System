@@ -2,6 +2,16 @@
 
 How the system is built, as of commit `542135c` (master, 2026-10-18). Every number below is a value from the code or the config, or a measurement from the 10%-user experiments. Results are in docs/ablation-results-run12.md; the bugs found and fixed along the way are in docs/ablation-run-errors-and-fixes.md.
 
+> **Changed since this was written (2026-10-25).** Sections 1, 3 and 6 describe the run12 protocol. The code now:
+> - keeps **every rating** (`implicit_threshold = 0.0`) and defaults to the **full dataset**;
+> - splits **leave-one-out** (last item test, second-to-last validation, one row per user per split);
+> - trains **LLM-style**: each user's training history is cut into chunks of up to `max_seq_length = 200` predictions, with a full-catalogue next-item and multi-step loss at every position and per-position routing for those two objectives; no sampled training negatives;
+> - evaluates against the **full catalogue** minus the user's earlier interactions (eval protocol v3); the stored 101-item candidate sets are gone;
+> - defaults to next-item-primary GradNorm with **β = 3** and **multi_step_k = 9**;
+> - feeds the **masked sequence only to the masked-item objective**; the other three objectives read a separate clean forward (so §3's "one forward pass" no longer holds).
+>
+> Run12's numbers are not comparable with runs under the new protocol. See `steering/architecture.md`.
+
 **ARV-MMoE** is a sequential recommender for MovieLens-20M with five parts:
 - a causal Transformer backbone;
 - **four training objectives**: next-item, masked-item, multi-step and contrastive;

@@ -32,7 +32,10 @@ import numpy as np
 import torch
 
 from configs.config import Config
-from evaluation.metrics import EVAL_PROTOCOL, evaluate_model, evaluate_popularity, load_item_popularity
+from evaluation.metrics import (
+    EVAL_PROTOCOL, FullRanking, evaluate_model, evaluate_popularity, load_full_ranking,
+    load_item_popularity,
+)
 from training.ablation_runner import (
     STUDY_CONFIGS,
     _arm_path,
@@ -84,8 +87,8 @@ WEIGHT_DEPENDENT_EXTRAS = (
 
 _EPOCH_FILE = re.compile(r"^epoch_(\d{3})\.pt$")
 
-#: Rows per batch for the popularity reference (a gather plus metrics, no model).
-_POPULARITY_BATCH = 65536
+#: Rows per batch for the popularity reference (no model); each row ranks the catalogue.
+_POPULARITY_BATCH = 1024
 
 
 # ---------------------------------------------------------------------------------------
@@ -132,8 +135,8 @@ class EvalData:
     """Val/test data shared by every fingerprint a process rescores, loaded lazily once.
 
     Splits are keyed by `(max_seq_length, use_metadata)` -- study H's sequence-length arms
-    use other widths. Candidate matrices, item popularity and the popularity references do
-    not depend on the model and are computed once. Test rows follow FR-6 with the CLI
+    use other widths. The full-ranking rows, item popularity and the popularity references
+    do not depend on the model and are computed once. Test rows follow FR-6 with the CLI
     config's `ablation_eval_examples` / `ablation_eval_seed`.
     """
 
@@ -141,68 +144,54 @@ class EvalData:
         self.config = config
         self.processed = config.processed_data_dir
         self._splits: Dict[Tuple, Dict] = {}
-        self._val_cands: Optional[torch.Tensor] = None
-        self._test_cands_mmap = None
+        self._rankings: Dict[str, FullRanking] = {}
         self._test_rows: Optional[Tuple[Optional[np.ndarray], Dict]] = None
-        self._test_cands: Optional[torch.Tensor] = None
+        self._test_ranking: Optional[FullRanking] = None
         self._popularity: Dict[int, torch.Tensor] = {}
         self._val_pop: Dict[Tuple, Dict] = {}
         self._test_pop: Dict[Tuple, Dict] = {}
 
-    # -- candidates and rows ------------------------------------------------------------
+    # -- rankings and rows --------------------------------------------------------------
 
     def _path(self, name: str) -> str:
         return os.path.join(self.processed, name)
 
-    def val_candidates(self) -> torch.Tensor:
-        if self._val_cands is None:
-            from data.sequence_generator import load_eval_candidates
-
-            matrix = load_eval_candidates(self._path("val_candidates.npy"))
-            self._val_cands = torch.as_tensor(matrix, dtype=torch.long)
-        return self._val_cands
-
-    def _test_matrix(self):
-        if self._test_cands_mmap is None:
-            from data.sequence_generator import load_eval_candidates
-
-            self._test_cands_mmap = load_eval_candidates(
-                self._path("test_candidates.npy"), mmap=True,
+    def _ranking(self, split_name: str) -> FullRanking:
+        """Every row of a split; targets and users read from the stored split, which do
+        not depend on the width the model narrows it to."""
+        if split_name not in self._rankings:
+            data = torch.load(self._path(f"{split_name}_tensorised.pt"), weights_only=True)
+            self._rankings[split_name] = load_full_ranking(
+                self.processed, split_name, data["targets"], data["user_ids"],
             )
-        return self._test_cands_mmap
+        return self._rankings[split_name]
+
+    def val_ranking(self) -> FullRanking:
+        return self._ranking("val")
 
     def test_rows(self) -> Tuple[Optional[np.ndarray], Dict]:
         if self._test_rows is None:
-            total = int(self._test_matrix().shape[0])
             self._test_rows = select_eval_rows(
-                total, self.config.ablation_eval_examples, self.config.ablation_eval_seed,
+                len(self._ranking("test")),
+                self.config.ablation_eval_examples, self.config.ablation_eval_seed,
             )
         return self._test_rows
 
-    def test_candidates(self) -> torch.Tensor:
-        if self._test_cands is None:
+    def test_ranking(self) -> FullRanking:
+        if self._test_ranking is None:
             idx, _ = self.test_rows()
-            matrix = self._test_matrix()
-            rows = np.array(matrix) if idx is None else np.array(matrix[idx])
-            self._test_cands = torch.as_tensor(rows, dtype=torch.long)
-        return self._test_cands
+            full = self._ranking("test")
+            self._test_ranking = full if idx is None else full.select(idx)
+        return self._test_ranking
 
     def protocol(self, eval_k: int) -> Dict:
         """What a rescore result depends on besides the weights and the code (D9)."""
-        val_rows = int(self._val_rows())
         return {
             **EVAL_PROTOCOL,
             "eval_k": int(eval_k),
-            "val_rows": val_rows,
+            "val_rows": len(self.val_ranking()),
             "test_eval": self.test_rows()[1],
         }
-
-    def _val_rows(self) -> int:
-        if self._val_cands is not None:
-            return self._val_cands.shape[0]
-        from data.sequence_generator import load_eval_candidates
-
-        return load_eval_candidates(self._path("val_candidates.npy"), mmap=True).shape[0]
 
     # -- splits -------------------------------------------------------------------------
 
@@ -219,18 +208,12 @@ class EvalData:
                     self._path(f"{split_name}_tensorised.pt"), meta,
                     max_seq_length=eval_cfg.max_seq_length,
                 )
+                if len(ds) != len(self._ranking(split_name)):
+                    raise RuntimeError(
+                        f"{split_name} split has {len(ds)} rows but its ranking has "
+                        f"{len(self._ranking(split_name))}; re-run --stage preprocess"
+                    )
                 entry[split_name] = ds
-            n_val = len(entry["val"])
-            if self.val_candidates().shape[0] != n_val:
-                raise RuntimeError(
-                    f"val candidate sets have {self.val_candidates().shape[0]} rows but the "
-                    f"val split has {n_val}; re-run --stage preprocess"
-                )
-            if self._test_matrix().shape[0] != len(entry["test"]):
-                raise RuntimeError(
-                    f"test candidate sets have {self._test_matrix().shape[0]} rows but the "
-                    f"test split has {len(entry['test'])}; re-run --stage preprocess"
-                )
             self._splits[key] = entry
         ds = self._splits[key][name]
         if name == "val":
@@ -250,7 +233,7 @@ class EvalData:
         key = (vocab_size, eval_k)
         if key not in self._val_pop:
             self._val_pop[key] = evaluate_popularity(
-                self.val_candidates(), self._item_popularity(vocab_size), k=eval_k,
+                self.val_ranking(), self._item_popularity(vocab_size), k=eval_k,
                 batch_size=_POPULARITY_BATCH,
             )
         return self._val_pop[key]
@@ -259,7 +242,7 @@ class EvalData:
         key = (vocab_size, eval_k)
         if key not in self._test_pop:
             self._test_pop[key] = evaluate_popularity(
-                self.test_candidates(), self._item_popularity(vocab_size), k=eval_k,
+                self.test_ranking(), self._item_popularity(vocab_size), k=eval_k,
                 batch_size=_POPULARITY_BATCH,
             )
         return self._test_pop[key]
@@ -430,14 +413,14 @@ def rescore_fingerprint(
         # would catch a regression (every epoch would score the same).
         model, moe = build_model(eval_cfg)
         val_seqs, val_meta = shared.split(eval_cfg, "val")
-        val_cands = shared.val_candidates()
+        val_ranking = shared.val_ranking()
         for e, path in todo.items():
             ck = _load(path)
             load_checkpoint(path, model, moe, checkpoint=ck)
             model.eval()
             moe.eval()
             with torch.no_grad():
-                val = evaluate_model(model, val_seqs, val_cands, eval_cfg, moe_layer=moe,
+                val = evaluate_model(model, val_seqs, val_ranking, eval_cfg, moe_layer=moe,
                                      metadata_matrix=val_meta)
             rec["epochs"][str(e)] = {
                 "val": val,
@@ -458,7 +441,7 @@ def rescore_fingerprint(
         test_seqs, test_meta = shared.split(eval_cfg, "test")
         with torch.no_grad():
             test_metrics = evaluate_model(
-                model, test_seqs, shared.test_candidates(), eval_cfg, moe_layer=moe,
+                model, test_seqs, shared.test_ranking(), eval_cfg, moe_layer=moe,
                 metadata_matrix=test_meta,
             )
         rec.update({

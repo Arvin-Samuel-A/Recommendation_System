@@ -12,7 +12,7 @@ RESUME_KEYS = {
     "best_val_ndcg", "best_epoch", "epoch_mean_losses", "epoch_loss_windows", "scaler",
     "rng", "loader_generators",
 }
-RNG_KEYS = {"python", "numpy_neg", "torch_mask", "torch_cpu", "torch_cuda", "torch_mps"}
+RNG_KEYS = {"python", "torch_mask", "torch_cpu", "torch_cuda", "torch_mps"}
 
 
 def _resume_config(processed, out_dir, **overrides):
@@ -372,8 +372,7 @@ class TestCudaRngDeviceCount:
         from training.pretrain import _capture_rng_state
 
         state = _capture_rng_state(
-            random.Random(0), np.random.RandomState(0), torch.Generator().manual_seed(0),
-            torch.device("cpu"),
+            random.Random(0), torch.Generator().manual_seed(0), torch.device("cpu"),
         )
         state["torch_cuda"] = [torch.full((8,), i, dtype=torch.uint8) for i in range(4)]
         state["torch_cuda_index"] = 2
@@ -391,8 +390,7 @@ class TestCudaRngDeviceCount:
         monkeypatch.setattr(torch.cuda, "set_rng_state_all", lambda states: calls["all"].append(states))
         monkeypatch.setattr(torch.cuda, "set_rng_state", lambda st, *a, **k: calls["one"].append(st))
         _restore_rng_state(
-            self._state(), random.Random(1), np.random.RandomState(1),
-            torch.Generator(), torch.device("cuda"),
+            self._state(), random.Random(1), torch.Generator(), torch.device("cuda"),
         )
         return calls
 
