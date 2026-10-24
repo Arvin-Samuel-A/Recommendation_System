@@ -156,8 +156,15 @@ def _scale_or_identity(logit_scale: Optional[LogitScale]) -> LogitScale:
 #: Most logits `full_softmax_cross_entropy` materialises at once. A full-catalogue softmax
 #: at every training position is `(B * S) x vocab` -- ~1.4G logits at batch 256, width
 #: 200 and ML-20M's ~26.7k items -- so rows are processed in chunks of
-#: `FULL_SOFTMAX_CHUNK_ELEMENTS // vocab` (~2.5k rows, ~270 MB of fp32 logits).
-FULL_SOFTMAX_CHUNK_ELEMENTS = 2 ** 26
+#: `FULL_SOFTMAX_CHUNK_ELEMENTS // vocab` (~630 rows, ~67 MB of fp32 logits). Measured on
+#: MPS, t-base, one step with every objective: 2**24 instead of 2**26 took batch 16 from
+#: 6.5 to 3.3 GB and batch 64 from 11.1 to 7.2 GB.
+FULL_SOFTMAX_CHUNK_ELEMENTS = 2 ** 24
+#: Below this many logits a call skips checkpointing. Above it, even one chunk is
+#: checkpointed: up to 11 objectives (next-item, masked-item, nine multi-step horizons)
+#: each keep an un-checkpointed call's logits alive until backward, which at batch 16
+#: was ~2.8 GB -- more than the large-batch, chunked path holds.
+FULL_SOFTMAX_UNCHECKPOINTED_ELEMENTS = 2 ** 22
 
 
 def _cross_entropy_chunk(
@@ -174,15 +181,15 @@ def full_softmax_cross_entropy(
 ) -> torch.Tensor:
     """Mean cross-entropy of `h @ w.T` (every row of `w` a class) against `targets`.
 
-    Above one chunk of rows, each chunk runs under activation checkpointing, so only one
-    chunk's logits are alive at a time in the forward AND the backward (which recomputes
-    them). The result is the mean over all rows, as a chunk-size-weighted sum of chunk
+    Above `FULL_SOFTMAX_UNCHECKPOINTED_ELEMENTS` logits, rows are processed in chunks
+    under activation checkpointing, so only one chunk's logits are alive at a time in the
+    forward AND the backward (which recomputes them), and none are kept between the two. The result is the mean over all rows, as a chunk-size-weighted sum of chunk
     means -- per-chunk means keep a pure-bf16 run's accumulator at loss magnitude.
     """
     n = h.shape[0]
-    rows = max(1, FULL_SOFTMAX_CHUNK_ELEMENTS // max(1, w.shape[0]))
-    if n <= rows:
+    if n * w.shape[0] <= FULL_SOFTMAX_UNCHECKPOINTED_ELEMENTS:
         return _cross_entropy_chunk(h, w, targets, logit_scale)
+    rows = max(1, FULL_SOFTMAX_CHUNK_ELEMENTS // max(1, w.shape[0]))
     total = None
     for start in range(0, n, rows):
         stop = min(start + rows, n)

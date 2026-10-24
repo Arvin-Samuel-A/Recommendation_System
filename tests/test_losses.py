@@ -106,6 +106,7 @@ class TestFullSoftmaxCrossEntropy:
 
         # 40 classes x 32 rows per chunk -> 10 chunks, the last one short.
         monkeypatch.setattr(losses, "FULL_SOFTMAX_CHUNK_ELEMENTS", 40 * 32)
+        monkeypatch.setattr(losses, "FULL_SOFTMAX_UNCHECKPOINTED_ELEMENTS", 0)
         chunked = full_softmax_cross_entropy(h, t, w, scale)
         assert torch.allclose(chunked, ref, atol=1e-6)
         # GradNorm differentiates the same loss more than once (retain_graph).
@@ -114,6 +115,22 @@ class TestFullSoftmaxCrossEntropy:
         for got, again, want in zip(first, second, ref_grads):
             assert torch.allclose(got, want, atol=1e-6)
             assert torch.equal(got, again)
+
+
+    def test_small_calls_are_not_checkpointed_large_ones_are(self, monkeypatch):
+        """A call above the threshold must not keep its logits for backward."""
+        import training.losses as losses
+
+        calls = []
+        real = losses.checkpoint
+        monkeypatch.setattr(losses, "checkpoint", lambda *a, **k: calls.append(1) or real(*a, **k))
+        h, w = torch.randn(10, 8), torch.randn(30, 8)
+        t = torch.randint(0, 30, (10,))
+        full_softmax_cross_entropy(h, t, w, LogitScale())
+        assert not calls
+        monkeypatch.setattr(losses, "FULL_SOFTMAX_UNCHECKPOINTED_ELEMENTS", 100)
+        full_softmax_cross_entropy(h, t, w, LogitScale())
+        assert len(calls) == 1
 
 
 class TestNextItemLoss:
