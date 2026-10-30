@@ -127,7 +127,9 @@ def run_gradient_diagnostics(
     """
     import random as _random
 
-    from training.losses import apply_masking, mask_metadata, normalize_item_table
+    from training.losses import (
+        apply_masking, mask_metadata, mean_pool_real, normalize_item_table,
+    )
     from data.augmentation import augment_sequence
     from configs.config import OBJECTIVE_ORDER
 
@@ -188,7 +190,6 @@ def run_gradient_diagnostics(
                 # As in `train_one_step`: only the masked-item objective sees the masked
                 # sequence; the others read the clean forward.
                 all_hidden = model(seq, metadata=metadata, return_all_hidden=True)
-                pooled = all_hidden[:, -1, :]
 
                 per_objective_losses = {}
                 moe_layer.clear_cache()
@@ -221,8 +222,10 @@ def run_gradient_diagnostics(
 
                 # REV-009b: the contrastive objective participates in the (T, T) matrix.
                 if config.use_contrastive and "contrastive" in loss_fns:
-                    Z_cl, _ = moe_layer(all_hidden, pooled, 3)
-                    z_orig = torch.nn.functional.normalize(Z_cl[:, -1, :].float(), p=2, dim=-1)
+                    Z_cl, _ = moe_layer(all_hidden, mean_pool_real(all_hidden, seq), 3)
+                    z_orig = torch.nn.functional.normalize(
+                        mean_pool_real(Z_cl, seq).float(), p=2, dim=-1,
+                    )
 
                     B, S = seq.shape
                     aug_seqs = []
@@ -246,8 +249,10 @@ def run_gradient_diagnostics(
                         aug_meta = metadata_matrix[aug_seq_t.to(metadata_matrix.device)].to(device=device)
 
                     aug_hidden = model(aug_seq_t, metadata=aug_meta, return_all_hidden=True)
-                    Z_aug, _ = moe_layer(aug_hidden, aug_hidden[:, -1, :], 3)
-                    z_aug = torch.nn.functional.normalize(Z_aug[:, -1, :].float(), p=2, dim=-1)
+                    Z_aug, _ = moe_layer(aug_hidden, mean_pool_real(aug_hidden, aug_seq_t), 3)
+                    z_aug = torch.nn.functional.normalize(
+                        mean_pool_real(Z_aug, aug_seq_t).float(), p=2, dim=-1,
+                    )
                     per_objective_losses["contrastive"] = loss_fns["contrastive"](z_orig, z_aug)
 
             if objective_names is None:

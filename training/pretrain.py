@@ -17,6 +17,7 @@ from models.transformer import TransformerModel
 from models.moe import MoELayer
 from training.losses import (
     mask_metadata,
+    mean_pool_real,
     NextItemLoss,
     MaskedItemLoss,
     MultiStepLoss,
@@ -217,7 +218,6 @@ def train_one_step(
         # sequence. Next-item, multi-step and contrastive read this clean forward; MIM gets
         # its own forward of `masked_seq` below.
         all_hidden = model(seq, metadata=metadata, return_all_hidden=True)
-        pooled = all_hidden[:, -1, :]
 
         moe.clear_cache()
         active_losses = {}
@@ -264,8 +264,12 @@ def train_one_step(
 
         is_contrastive_batch = config.use_contrastive and (batch_idx % config.contrastive_interval == 0)
         if is_contrastive_batch:
-            Z_cl, r_cl = moe(all_hidden, pooled, 3)
-            z_orig = torch.nn.functional.normalize(Z_cl[:, -1, :].float(), p=2, dim=-1)
+            # Sequence-level: both views are compared (and routed) as the mean over their
+            # real positions, never the last position alone -- see `mean_pool_real`.
+            Z_cl, r_cl = moe(all_hidden, mean_pool_real(all_hidden, seq), 3)
+            z_orig = torch.nn.functional.normalize(
+                mean_pool_real(Z_cl, seq).float(), p=2, dim=-1,
+            )
 
             B, S = seq.shape
             aug_seqs = []
@@ -294,9 +298,10 @@ def train_one_step(
                 aug_meta = metadata_matrix[aug_seq_t.to(metadata_matrix.device)].to(device=device)
 
             aug_hidden = model(aug_seq_t, metadata=aug_meta, return_all_hidden=True)
-            aug_pooled = aug_hidden[:, -1, :]
-            Z_aug, _ = moe(aug_hidden, aug_pooled, 3)
-            z_aug = torch.nn.functional.normalize(Z_aug[:, -1, :].float(), p=2, dim=-1)
+            Z_aug, _ = moe(aug_hidden, mean_pool_real(aug_hidden, aug_seq_t), 3)
+            z_aug = torch.nn.functional.normalize(
+                mean_pool_real(Z_aug, aug_seq_t).float(), p=2, dim=-1,
+            )
 
             active_losses["contrastive"] = loss_fns["contrastive"](z_orig, z_aug)
             if r_cl is not None:
@@ -750,7 +755,12 @@ def collect_validation_routing(
                 for obj_idx, obj_name in enumerate(OBJECTIVE_ORDER):
                     if not enabled[obj_name]:
                         continue
-                    _, r = moe(all_hidden, pooled, obj_idx)
+                    # The routing input each objective trains with: contrastive routes
+                    # from the mean-pooled sequence, the others from the last position.
+                    route_in = (
+                        mean_pool_real(all_hidden, seq) if obj_name == "contrastive" else pooled
+                    )
+                    _, r = moe(all_hidden, route_in, obj_idx)
                     if r is not None:
                         routing.append((obj_name, r.detach()))
             for obj_name, r in routing:

@@ -652,8 +652,8 @@ def test_fingerprint_changes_with_semantics_version(monkeypatch):
 
     cfg = Config()
     current = ar._training_fingerprint(cfg)
-    assert ar.TRAINING_SEMANTICS_VERSION == 4
-    monkeypatch.setattr(ar, "TRAINING_SEMANTICS_VERSION", 5)
+    assert ar.TRAINING_SEMANTICS_VERSION == 5
+    monkeypatch.setattr(ar, "TRAINING_SEMANTICS_VERSION", 6)
     assert ar._training_fingerprint(cfg) != current
 
 

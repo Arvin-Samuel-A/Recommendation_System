@@ -269,7 +269,9 @@ _RUNTIME_ONLY_FIELDS = frozenset({"num_workers", "pin_memory", "resume_training"
 #: on leave-one-out splits of every rating.
 #: 4 = the masked sequence feeds only the masked-item objective; next-item, multi-step
 #: and contrastive read a clean forward (owner decision 2026-10-25).
-TRAINING_SEMANTICS_VERSION = 4
+#: 5 = contrastive compares and routes mean-pooled sequences, not the last position,
+#: which it had pushed ~100x harder than next-item (2026-10-30).
+TRAINING_SEMANTICS_VERSION = 5
 
 
 #: Training fields added after TRAINING_SEMANTICS_VERSION 2, with the value that

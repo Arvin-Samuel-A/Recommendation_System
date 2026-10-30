@@ -478,6 +478,20 @@ def mask_metadata(
     return metadata.masked_fill(mask_positions.unsqueeze(-1).to(metadata.device), 0.0)
 
 
+def mean_pool_real(hidden: torch.Tensor, seq: torch.Tensor) -> torch.Tensor:
+    """`(B, D)` mean of `hidden` over each row's non-padding positions (`seq != 0`).
+
+    The contrastive objective compares sequences, so it reads this rather than the last
+    position. Under LLM-style training the next-item loss is spread over every position
+    (~53k per batch), so a last-position InfoNCE averaged over the B rows weighted the
+    scored position ~100x more than next-item did; measured, it drove the last
+    position's next-item loss to chance (10.25 vs 7.8 elsewhere) and val NDCG@10 below
+    popularity. Pooled, its gradient spreads over the row like every other objective's.
+    """
+    real = (seq != 0).unsqueeze(-1).to(hidden.dtype)
+    return (hidden * real).sum(dim=1) / real.sum(dim=1).clamp(min=1)
+
+
 def static_weighted_sum(active_losses: dict, config) -> torch.Tensor:
     total = active_losses.get("next_item", torch.tensor(0.0))
     if "masked_item" in active_losses:

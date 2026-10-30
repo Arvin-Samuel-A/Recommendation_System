@@ -831,3 +831,63 @@ class TestMaskedSequenceOnlyFeedsMaskedItem:
         assert "masked_item" in with_mim and "masked_item" not in without_mim
         for name in ("next_item", "multi_step", "contrastive"):
             assert torch.equal(with_mim[name], without_mim[name]), name
+
+
+class TestContrastivePoolsTheSequence:
+    """Contrastive reads the mean over real positions, so its gradient reaches every real
+    position equally and never concentrates on the last (scored) one."""
+
+    def test_mean_pool_ignores_padding(self):
+        from training.losses import mean_pool_real
+
+        hidden = torch.arange(12, dtype=torch.float32).reshape(2, 3, 2)
+        seq = torch.tensor([[0, 5, 6], [7, 8, 9]])
+        out = mean_pool_real(hidden, seq)
+        assert torch.allclose(out[0], hidden[0, 1:].mean(0))
+        assert torch.allclose(out[1], hidden[1].mean(0))
+
+    def test_gradient_is_spread_over_real_positions(self):
+        from training.losses import mean_pool_real
+
+        torch.manual_seed(0)
+        hidden = torch.randn(4, 6, 8, requires_grad=True)
+        seq = torch.randint(1, 50, (4, 6))
+        seq[0, :2] = 0
+        z = torch.nn.functional.normalize(mean_pool_real(hidden, seq), dim=-1)
+        z_aug = torch.nn.functional.normalize(torch.randn(4, 8), dim=-1)
+        InfoNCELoss(0.07)(z, z_aug).backward()
+        g = hidden.grad.norm(dim=-1)
+        assert torch.all(g[0, :2] == 0)
+        for row in range(4):
+            real = g[row][seq[row] != 0]
+            assert torch.allclose(real, real[0].expand_as(real)), row
+
+    def test_train_step_feeds_contrastive_the_pooled_views(self, monkeypatch):
+        """The last position alone must not decide the contrastive loss."""
+        import random
+
+        from torch.optim.lr_scheduler import LambdaLR
+
+        import training.pretrain as P
+
+        seen = []
+        real = P.mean_pool_real
+        monkeypatch.setattr(P, "mean_pool_real", lambda h, s: seen.append(h.shape) or real(h, s))
+        config = Config()
+        config.apply_model_config("t-small")
+        config.num_items, config.vocab_size = 200, 202
+        config.use_metadata, config.feature_dim = False, 0
+        config.device, config.batch_size, config.max_seq_length = "cpu", 4, 12
+        config.use_gradnorm, config.contrastive_interval = False, 1
+        torch.manual_seed(0)
+        model, moe = P.build_model(config)
+        loss_fns = P._build_loss_fns(config, torch.device("cpu"))
+        params = P.collect_trainable_parameters(model, moe, loss_fns)
+        optimizer = torch.optim.SGD(params, lr=0.0)
+        scheduler = LambdaLR(optimizer, lr_lambda=lambda step: 1.0)
+        batch = {"sequences": torch.randint(1, 201, (4, 12)), "targets": torch.randint(1, 201, (4, 12))}
+        values, _ = P.train_one_step(model, moe, batch, config, loss_fns, None, optimizer,
+                                     scheduler, 0, random.Random(0))
+        assert "contrastive" in values
+        # Routing input and representation, for the original and the augmented view.
+        assert len(seen) == 4
