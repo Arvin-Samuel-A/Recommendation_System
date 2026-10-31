@@ -65,10 +65,11 @@ class Config:
     # interaction is a target exactly once per epoch. 200 keeps 81% of ML-20M users in a
     # single chunk; evaluation reads the most recent `max_seq_length` items.
     max_seq_length: int = 200
-    # Multi-step horizons: step s predicts the item s + 2 ahead, so k = 9 covers
-    # horizons 2..10 (owner decision 2026-10-25; was 3). Each horizon is a full-catalogue
-    # softmax at every position, so the objective costs ~k next-item losses.
-    multi_step_k: int = 9
+    # Multi-step horizons: step s predicts the item s + 2 ahead, so k = 3 covers
+    # horizons 2..4. Each horizon is a full-catalogue softmax at every position, so the
+    # objective costs ~k next-item losses (owner decision 2026-10-31: back to 3 from 9,
+    # which made multi-step 9 of the step's 11 softmaxes).
+    multi_step_k: int = 3
 
     # --- Model ---
     model_name: str = "t-base"

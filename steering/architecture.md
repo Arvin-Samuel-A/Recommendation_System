@@ -54,7 +54,7 @@ Training (LLM-style, owner decision 2026-10-25):
     → Item embedding + Positional embedding [+ Metadata projection]
     → Transformer backbone (Pre-LN, causal self-attention)
     → [MoE layer: shared experts computed once, per-objective routing]
-    → Per-objective heads: next-item and multi-step (k = 9 horizons, 2..10 ahead) at EVERY position
+    → Per-objective heads: next-item and multi-step (k = 3 horizons, 2..4 ahead) at EVERY position
       (full-catalogue softmax, chunked + checkpointed), contrastive per sequence -- all on
       the clean sequence; MIM on its own forward of the masked sequence
     → Next-item-primary GradNorm: lambda_next = 1, auxiliaries balanced under budget beta = 3

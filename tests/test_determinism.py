@@ -24,22 +24,23 @@ GOLDEN_MACHINE = "arm64"
 #: RE-captured on 2026-10-25 for TRAINING_SEMANTICS_VERSION 3 (leave-one-out data,
 #: chunked whole-sequence training with full-catalogue next-item / multi-step losses), and
 #: again for TRAINING_SEMANTICS_VERSION 4 (masked input only for the masked-item loss,
-#: next-item-primary GradNorm with beta = 3, multi_step_k = 9), and for version 5
-#: (contrastive on mean-pooled sequences, 2026-10-30).
-GOLDEN_PARAM_SHA256 = "4da49e578b32457deaef5d7a7ddf9e47551037b99669864dcc274a179bebc735"
+#: next-item-primary GradNorm with beta = 3, multi_step_k = 9), for version 5
+#: (contrastive on mean-pooled sequences, 2026-10-30), and for multi_step_k = 3
+#: (2026-10-31).
+GOLDEN_PARAM_SHA256 = "8135acb2e0f12566b0ccd9a718dc7c4251b50a55d5c91efa686e72f844e14591"
 GOLDEN_LOSSES = [
-    {"next_item": 5.0, "masked_item": 5.03125, "multi_step": 5.03125, "contrastive": 1.863506, "total": 16.92601},
+    {"next_item": 5.0, "masked_item": 5.03125, "multi_step": 5.0, "contrastive": 1.844193, "total": 16.87544},
     {"next_item": 5.0, "masked_item": 5.0, "multi_step": 5.03125, "total": 15.0979},
-    {"next_item": 5.03125, "masked_item": 5.03125, "multi_step": 5.0, "total": 15.06236},
+    {"next_item": 5.0, "masked_item": 5.0, "multi_step": 5.0, "total": 15.0},
     {"next_item": 5.0, "masked_item": 5.0625, "multi_step": 5.0, "total": 15.06182},
-    {"next_item": 5.0, "masked_item": 4.96875, "multi_step": 5.0, "contrastive": 2.630535, "total": 17.52337},
-    {"next_item": 5.0, "masked_item": 5.0, "multi_step": 5.0, "total": 15.1316},
-    {"next_item": 4.96875, "masked_item": 5.0, "multi_step": 5.0, "contrastive": 2.276696, "total": 17.17386},
-    {"next_item": 5.03125, "masked_item": 5.0, "multi_step": 5.0, "total": 15.17413},
-    {"next_item": 4.96875, "masked_item": 5.03125, "multi_step": 5.0, "total": 14.99872},
+    {"next_item": 5.0, "masked_item": 5.0, "multi_step": 5.0, "contrastive": 2.547048, "total": 17.47301},
+    {"next_item": 5.0, "masked_item": 5.0625, "multi_step": 5.0, "total": 15.19365},
+    {"next_item": 5.0, "masked_item": 5.03125, "multi_step": 5.0, "contrastive": 2.098186, "total": 17.06233},
+    {"next_item": 5.03125, "masked_item": 5.0, "multi_step": 5.0, "total": 15.17495},
     {"next_item": 4.96875, "masked_item": 5.0, "multi_step": 5.0, "total": 14.96875},
-    {"next_item": 5.0, "masked_item": 5.0, "multi_step": 5.0, "contrastive": 1.613586, "total": 16.54267},
-    {"next_item": 4.9375, "masked_item": 5.0625, "multi_step": 5.0, "total": 15.17915},
+    {"next_item": 4.96875, "masked_item": 5.0, "multi_step": 5.0, "total": 14.96875},
+    {"next_item": 5.0, "masked_item": 5.0, "multi_step": 4.96875, "contrastive": 1.489349, "total": 16.39069},
+    {"next_item": 4.9375, "masked_item": 5.0625, "multi_step": 4.96875, "total": 15.14627},
 ]
 GOLDEN_LRS = [
     0.001, 0.000981771838126524, 0.0009285640897740315, 0.0008446873302753783,
