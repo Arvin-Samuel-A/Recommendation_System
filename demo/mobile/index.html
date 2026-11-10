@@ -89,7 +89,7 @@
     </div>
     <div id="mode-user">
       <div class="row">
-        <button class="go needs-model" id="goExample" disabled>Example user 13408</button>
+        <button class="go needs-model" id="goExample" disabled>Example user</button>
         <button class="go needs-model" id="goRandom" disabled>Random user</button>
       </div>
       <div class="hint">The model sees the user's history before their test period. ✓ marks movies they really liked later, which the model never saw.</div>
@@ -108,6 +108,13 @@
     <div class="err" id="error"></div>
   </section>
 
+  <section class="panel">
+    <h2>Device benchmark</h2>
+    <div class="desc">Times the model on this device: 20 warm-up runs, then 100 timed runs on real user histories. The results are sent to the computer serving this page and shown below.</div>
+    <div class="row"><button class="go needs-model" id="goBench" disabled>Run benchmark</button></div>
+    <div id="bench"></div>
+  </section>
+
   <div id="results"></div>
 </div>
 
@@ -116,7 +123,13 @@
 <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/ort.wasm.min.js"></script>
 <script>
 const $ = (id) => document.getElementById(id);
-const SEQ_LEN = 50, TOP_K = 10;
+// SEQ_LEN comes from assets/meta.json (written by scripts/export_mobile.py); 50 for older assets.
+let SEQ_LEN = 50;
+const TOP_K = 10;
+// ?threads=N asks for N WebAssembly threads. They need a cross-origin-isolated page
+// (scripts/run_mobile_demo.sh's server sends the headers); otherwise the page uses 1.
+const WANT_THREADS = Math.max(1, +new URLSearchParams(location.search).get("threads") || 1);
+let meta = {}, loadInfo = {};
 const PRESETS = {
   anim: ["Toy Story (1995)", "Finding Nemo", "Shrek (2001)", "Monsters, Inc.", "Incredibles"],
   sci: ["Star Wars: Episode IV", "Alien (1979)", "Blade Runner", "Terminator 2", "Matrix, The"],
@@ -158,24 +171,32 @@ async function init() {
   try {
     if (typeof ort === "undefined") throw new Error("could not load onnxruntime-web from the CDN (is the phone online?)");
     ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/";
-    ort.env.wasm.numThreads = 1;  // selects ort-wasm-simd.wasm, the build iOS can allocate
+    // 1 thread selects ort-wasm-simd.wasm, the build iOS can allocate.
+    ort.env.wasm.numThreads = self.crossOriginIsolated ? WANT_THREADS : 1;
     setStatus("Downloading movie data…");
-    [items, users] = await Promise.all([
+    [items, users, meta] = await Promise.all([
       fetch("assets/items.json").then((r) => r.json()),
       fetch("assets/users.json").then((r) => r.json()),
+      fetch("assets/meta.json").then((r) => (r.ok ? r.json() : {})).catch(() => ({})),
     ]);
+    if (meta.seq_len) SEQ_LEN = meta.seq_len;
     searchOrder = items.title.map((t, i) => i).sort((a, b) => items.likes[b] - items.likes[a]);
     const t0 = performance.now();
     const bytes = await fetchWithProgress("assets/model.onnx", (f) => {
       $("progress").style.width = (f * 100).toFixed(0) + "%";
       setStatus(`Downloading the model to this device… ${(f * 100).toFixed(0)}%`);
     });
+    const tDownloaded = performance.now();
     setStatus("Preparing the model…");
     // No memory arena or pattern planning: lower peak memory, which phones are short of.
     session = await ort.InferenceSession.create(bytes, {executionProviders: ["wasm"], graphOptimizationLevel: "all",
                                                          enableCpuMemArena: false, enableMemPattern: false});
-    await infer([1]);  // warm-up
+    const tCreated = performance.now();
+    const first = await infer([1]);  // warm-up
     const secs = ((performance.now() - t0) / 1000).toFixed(1);
+    loadInfo = {model_mb: +(bytes.length / 1e6).toFixed(2), download_s: +((tDownloaded - t0) / 1000).toFixed(2),
+                session_create_s: +((tCreated - tDownloaded) / 1000).toFixed(2), first_inference_ms: +first.ms.toFixed(1),
+                load_total_s: +secs};
     report({event: "loaded", seconds: secs, mb: (bytes.length / 1e6).toFixed(0), threads: ort.env.wasm.numThreads});
     $("progressWrap").classList.add("hidden");
     setStatus(`Model loaded on this device (${(bytes.length / 1e6).toFixed(0)} MB, WebAssembly, ` +
@@ -295,6 +316,68 @@ function preset(titles) {
 $("presetAnim").addEventListener("click", () => preset(PRESETS.anim));
 $("presetSci").addEventListener("click", () => preset(PRESETS.sci));
 $("clearLiked").addEventListener("click", () => { liked = []; renderChips(); });
+
+// ------------------------------------------------------------------ benchmark
+const WARMUP = 20, TIMED = 100;  // the same counts as Config.warmup_runs / timed_runs
+
+function stats(xs) {
+  const s = xs.slice().sort((a, b) => a - b), n = s.length;
+  const q = (p) => s[Math.min(n - 1, Math.floor(p * (n - 1) + 0.5))];
+  const mean = s.reduce((a, b) => a + b, 0) / n;
+  const sd = Math.sqrt(s.reduce((a, b) => a + (b - mean) ** 2, 0) / Math.max(1, n - 1));
+  const r = (x) => +x.toFixed(2);
+  return {n, mean: r(mean), std: r(sd), min: r(s[0]), p50: r(q(0.5)), p90: r(q(0.9)),
+          p95: r(q(0.95)), p99: r(q(0.99)), max: r(s[n - 1])};
+}
+
+async function benchmark() {
+  const btn = $("goBench");
+  btn.disabled = true;
+  const heap = () => (performance.memory ? +(performance.memory.usedJSHeapSize / 1e6).toFixed(1) : null);
+  try {
+    const heapBefore = heap();
+    const model = [], e2e = [];
+    for (let i = 0; i < WARMUP + TIMED; i++) {
+      $("bench").innerHTML = `<div class="hint">${i < WARMUP ? "Warm-up" : "Timed run"} ${i < WARMUP ? i + 1 : i - WARMUP + 1} of ${i < WARMUP ? WARMUP : TIMED}…</div>`;
+      const u = users[i % users.length];
+      const t0 = performance.now();
+      const r = await infer(u.history);
+      topK(r.scores, new Set(u.history), TOP_K);
+      const t1 = performance.now();
+      if (i >= WARMUP) { model.push(r.ms); e2e.push(t1 - t0); }
+    }
+    const result = {
+      time: new Date().toISOString(),
+      device: {ua: navigator.userAgent, cores: navigator.hardwareConcurrency ?? null,
+               device_memory_gb: navigator.deviceMemory ?? null, cross_origin_isolated: !!self.crossOriginIsolated},
+      runtime: {library: "onnxruntime-web 1.18.0", backend: "wasm", threads: ort.env.wasm.numThreads},
+      model: {...meta, ...loadInfo},
+      inference_ms: stats(model),                 // session.run only
+      end_to_end_ms: stats(e2e),                  // session.run + top-10 over the catalogue
+      throughput_per_s: +(1000 / stats(model).mean).toFixed(1),
+      js_heap_mb: {before: heapBefore, after: heap()},
+      warmup_runs: WARMUP, timed_runs: TIMED, seq_len: SEQ_LEN, num_items: items.title.length,
+    };
+    const res = await fetch("bench", {method: "POST", headers: {"Content-Type": "application/json"},
+                                      body: JSON.stringify(result)}).catch(() => null);
+    const saved = res && res.ok ? "Saved on the serving computer." : "Could not reach the serving computer; copy the JSON below.";
+    const m = result.inference_ms, e = result.end_to_end_ms;
+    $("bench").innerHTML = `<div class="badge">${saved}</div>
+      <ul class="plain">
+        <li><div class="t"><span>Inference (median / p90 / p99)</span><span class="s">${m.p50} / ${m.p90} / ${m.p99} ms</span></div></li>
+        <li><div class="t"><span>With top-${TOP_K} selection (median)</span><span class="s">${e.p50} ms</span></div></li>
+        <li><div class="t"><span>Throughput</span><span class="s">${result.throughput_per_s} / s</span></div></li>
+        <li><div class="t"><span>Model download / session create</span><span class="s">${loadInfo.model_mb} MB · ${loadInfo.download_s} s / ${loadInfo.session_create_s} s</span></div></li>
+        <li><div class="t"><span>Threads · cores · device memory</span><span class="s">${result.runtime.threads} · ${result.device.cores} · ${result.device.device_memory_gb ?? "?"} GB</span></div></li>
+      </ul>
+      <textarea readonly style="width:100%;height:120px;margin-top:8px;font-size:11px">${esc(JSON.stringify(result, null, 1))}</textarea>`;
+  } catch (err) {
+    $("bench").innerHTML = `<div class="err">Benchmark failed: ${esc(err.message)}</div>`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+$("goBench").addEventListener("click", benchmark);
 
 // ------------------------------------------------------------------ rendering
 function list(recs, future, fmt) {

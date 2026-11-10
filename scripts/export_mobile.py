@@ -1,11 +1,12 @@
 """Export the demo model to ONNX, plus the data the on-device demo (demo/mobile/) needs.
 
 Writes demo/mobile/assets/:
-    model.onnx   seq (1, 50) int64 item ids, left-padded with 0
+    model.onnx   seq (1, S) int64 item ids, left-padded with 0 (S = the model's max_seq_length)
                  -> scores (1, num_items) cosine per item (item i at index i-1)
                     routing (1, num_experts) next-item expert mixture
     items.json   titles, genres and like counts, indexed like `scores`
     users.json   a sample of real test users: history (train + val) and test-period items
+    meta.json    seq_len, num_items, parameter count and size, read by the page
 
 The graph is the production scoring path of scripts/demo_recommend.py `recommend()`:
 Transformer -> ARV-MMoE (next-item objective) -> cosine with every item embedding. The
@@ -128,6 +129,14 @@ def main():
     # into a constant; fail here rather than on the phone if it ever stops doing so.
     if "Trilu" in ops:
         raise SystemExit("the graph still contains Trilu, which the phone runtime lacks")
+    # What the page needs to build the input (seq_len) and what its benchmark reports.
+    n_params = sum(p.numel() for p in model.parameters()) + sum(p.numel() for p in moe.parameters())
+    meta = {"seq_len": S, "num_items": N, "params": n_params, "num_experts": cfg.num_experts,
+            "hidden_dim": cfg.hidden_dim, "onnx_mb": round(os.path.getsize(onnx_path) / 1e6, 2),
+            "checkpoint": os.path.relpath(os.path.abspath(args.checkpoint), ROOT)}
+    with open(os.path.join(args.out, "meta.json"), "w") as f:
+        json.dump(meta, f, indent=1)
+    print(f"wrote meta.json: {meta}")
 
     # ---------------------------------------------------------------- data
     titles = load_titles(args.movies_csv)
@@ -145,7 +154,8 @@ def main():
     splits = load_pickle(args.processed_dir, "splits.pkl")
     user_map = {int(k): v for k, v in load_pickle(args.processed_dir, "user_mapping.pkl").items()}
     orig = {v: k for k, v in user_map.items()}
-    pool = sorted(u for u, t in splits["test"].items() if len(t) >= 5)
+    # Leave-one-out (protocol v3) gives every user exactly one test item.
+    pool = sorted(u for u, t in splits["test"].items() if len(t) >= 1)
     chosen = EXAMPLE_USERS + [u for u in random.Random(0).sample(pool, args.num_users)
                               if u not in EXAMPLE_USERS]
     users = []

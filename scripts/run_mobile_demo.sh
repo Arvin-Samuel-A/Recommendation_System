@@ -12,6 +12,9 @@
 #   scripts/run_mobile_demo.sh             # port 8080
 #   scripts/run_mobile_demo.sh 9000        # another port
 #   scripts/run_mobile_demo.sh --export    # re-export the assets first
+#
+# demo/mobile_server.py serves the page and saves each device benchmark the page sends
+# to outputs/mobile_bench/.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -39,4 +42,7 @@ echo "On this computer:                  http://127.0.0.1:${port}/"
 echo "(If the phone can't connect: allow Python in the macOS firewall prompt, or the Wi-Fi may"
 echo " block device-to-device traffic -- connect this Mac to the phone's hotspot instead.)"
 echo
-exec uv run python -m http.server "$port" --bind 0.0.0.0 --directory demo/mobile
+echo "Device benchmark: tap \"Run benchmark\" on the phone; results land in outputs/mobile_bench/."
+echo "Add ?threads=4 to the URL to let WebAssembly use 4 threads (Android Chrome)."
+echo
+exec uv run python demo/mobile_server.py "$port"
