@@ -80,7 +80,17 @@ def _validate_row_counts(data_dir: str) -> Dict[str, int]:
     return counts
 
 
+def _is_amazon(config: Config) -> bool:
+    return getattr(config, "dataset_format", "movielens") == "amazon2014"
+
+
 def acquire_dataset(config: Config) -> str:
+    if _is_amazon(config):
+        # The Kaggle download, the six-CSV validation and the row-count checks below are
+        # MovieLens-specific; data/amazon.py checks its two files and fingerprints them.
+        from data.amazon import acquire
+        return acquire(config)
+
     raw_dir = config.raw_data_dir
     os.makedirs(raw_dir, exist_ok=True)
 
@@ -166,15 +176,8 @@ SAMPLING_FIELDS = (
 )
 
 
-def _read_ratings(config: Config, sampling_info: Optional[dict] = None) -> "pd.DataFrame":
-    """Read, filter and chronologically sort `rating.csv` -- ONCE.
-
-    REV-085: the file (20,000,263 rows, 690 MB) was read in full twice with no
-    `usecols`, no dtype map and no timestamp parsing. The `timestamp` column alone came
-    back as `object` -- Python strings -- at 1.52 GB of the 2.00 GB frame, and each read
-    was followed by three more full-width `.copy()` materialisations. Reading once, with
-    narrow dtypes and epoch-second timestamps, removes a whole pass and ~1.5 GB of it.
-    """
+def _read_movielens_ratings(config: Config) -> "pd.DataFrame":
+    """`rating.csv` in the shared schema, unfiltered and in file order."""
     rating_path = os.path.join(config.raw_data_dir, "rating.csv")
     if not os.path.exists(rating_path):
         raise FileNotFoundError(f"rating.csv not found at {rating_path}")
@@ -196,6 +199,27 @@ def _read_ratings(config: Config, sampling_info: Optional[dict] = None) -> "pd.D
     df["timestamp"] = (
         pd.to_datetime(df["timestamp"], errors="coerce").astype("int64") // 10**9
     )
+    return df
+
+
+def _read_ratings(config: Config, sampling_info: Optional[dict] = None) -> "pd.DataFrame":
+    """Read, filter and chronologically sort the interactions -- ONCE.
+
+    REV-085: the file (20,000,263 rows, 690 MB) was read in full twice with no
+    `usecols`, no dtype map and no timestamp parsing. The `timestamp` column alone came
+    back as `object` -- Python strings -- at 1.52 GB of the 2.00 GB frame, and each read
+    was followed by three more full-width `.copy()` materialisations. Reading once, with
+    narrow dtypes and epoch-second timestamps, removes a whole pass and ~1.5 GB of it.
+
+    dataset_format="amazon2014" reads `data/amazon.py`'s reviews frame instead: the same
+    schema with string `userId` (reviewerID) / `movieId` (asin) and a `review_order`
+    column, after which the filters, the sample and the sort below are shared.
+    """
+    if _is_amazon(config):
+        from data.amazon import read_reviews
+        df = read_reviews(config)
+    else:
+        df = _read_movielens_ratings(config)
 
     # MovieLens ratings are 0.5..5.0, so the default threshold of 0.0 keeps every rating.
     original_count = len(df)
@@ -227,7 +251,14 @@ def _read_ratings(config: Config, sampling_info: Optional[dict] = None) -> "pd.D
             users, size=n_keep, replace=False,
         )
         df = df[df["userId"].isin(keep)]
-        kept_sorted = np.sort(keep).astype(np.int64)
+        kept_sorted = np.sort(keep)
+        # MovieLens ids are ints, hashed as int64 exactly as before; Amazon ids are
+        # strings, hashed newline-joined.
+        kept_bytes = (
+            kept_sorted.astype(np.int64).tobytes()
+            if kept_sorted.dtype.kind in "iu"
+            else "\n".join(map(str, kept_sorted)).encode()
+        )
         logger.info(
             "User sample (fraction=%g, seed=%d): %d -> %d users, %d rows",
             fraction, config.user_sample_seed, n_before, n_keep, len(df),
@@ -239,7 +270,7 @@ def _read_ratings(config: Config, sampling_info: Optional[dict] = None) -> "pd.D
                 "num_users_before_sampling": int(n_before),
                 "num_users_after_sampling": int(n_keep),
                 "user_sample_fingerprint": hashlib.sha256(
-                    kept_sorted.tobytes()
+                    kept_bytes
                 ).hexdigest()[:16],
             })
     elif sampling_info is not None:
@@ -252,6 +283,18 @@ def _read_ratings(config: Config, sampling_info: Optional[dict] = None) -> "pd.D
             "user_sample_fingerprint": None,
         })
 
+    if _is_amazon(config):
+        from data.amazon import REVIEW_ORDER_COLUMN
+
+        # Amazon 2014 timestamps are day-granular, so a user's same-day reviews tie. The
+        # explicit third key keeps them in file order (the SASRec convention) whatever
+        # sort algorithm pandas picks for a multi-key sort; it is dropped afterwards so
+        # the frame has the shared schema. Every later step (groupby, LOO slicing)
+        # preserves this row order.
+        return (
+            df.sort_values(["userId", "timestamp", REVIEW_ORDER_COLUMN], kind="stable")
+            .drop(columns=[REVIEW_ORDER_COLUMN])
+        )
     return df.sort_values(["userId", "timestamp"], kind="stable")
 
 
@@ -454,7 +497,20 @@ def identify_cold_items(
 
     cold_item_set = set(selected_cold)
 
-    if not cold_item_set:
+    # 5-core Amazon data under leave-one-out: an item is cold only if every one of its
+    # (>= 5) interactions is some user's validation or test target, so the natural
+    # `unseen_in_training` set can be empty. That is a property of the data, not a bug,
+    # and nothing is deleted to avoid it; H3's cold bucket is then reported as empty
+    # (evaluation/cold_start.py) rather than aborting preprocessing. MovieLens keeps the
+    # REV-011 hard error below.
+    allow_empty_cold = _is_amazon(config) and strategy == "unseen_in_training"
+    if not cold_item_set and allow_empty_cold:
+        logger.warning(
+            "Cold-start holdout is EMPTY under strategy '%s' over %d items: every item "
+            "has at least one training interaction. H3's cold bucket will be empty.",
+            strategy, len(all_items),
+        )
+    elif not cold_item_set:
         # REV-011: an empty holdout must fail loudly, not proceed with an INFO log.
         raise RuntimeError(
             f"Cold-start holdout is EMPTY under strategy '{strategy}' with "
@@ -497,7 +553,7 @@ def identify_cold_items(
     assert cold_item_set.isdisjoint(warm_item_set), (
         "Cold and warm items overlap"
     )
-    assert len(cold_item_set) > 0, "Cold item set must be non-empty"
+    assert allow_empty_cold or len(cold_item_set) > 0, "Cold item set must be non-empty"
 
     os.makedirs(config.processed_data_dir, exist_ok=True)
     cold_path = os.path.join(config.processed_data_dir, "cold_items.pkl")
@@ -525,6 +581,11 @@ def extract_metadata(
     item_map: Dict[int, int],
     num_items: int,
 ) -> np.ndarray:
+    if _is_amazon(config):
+        # Title SVD + brand + price bins + categories instead of genome + genres.
+        from data.amazon import extract_metadata as extract_amazon_metadata
+        return extract_amazon_metadata(config, item_map, num_items)
+
     genome_path = os.path.join(config.raw_data_dir, "genome_scores.csv")
     movie_path = os.path.join(config.raw_data_dir, "movie.csv")
 
@@ -635,6 +696,9 @@ def run_preprocessing(config: Config) -> None:
     config.num_items = stats["num_items"]
     config.num_users = stats["num_users"]
     config.vocab_size = stats["VOCAB_SIZE"]
+    if _is_amazon(config):
+        from data.amazon import check_expected_stats
+        check_expected_stats(config, stats)
 
     logger.info("=== Step 3/7: Timestamps taken from step 2 ===")
 
@@ -742,6 +806,7 @@ def run_preprocessing(config: Config) -> None:
         "train_interactions_removed_by_holdout": int(train_interactions_removed),
         "num_sampled_negatives": config.num_sampled_negatives,
         "split_strategy": SPLIT_STRATEGY,
+        "dataset_format": getattr(config, "dataset_format", "movielens"),
         "implicit_threshold": float(config.implicit_threshold),
         "seed": config.seed,
         "stored_seq_length": int(stored_width),
@@ -749,6 +814,8 @@ def run_preprocessing(config: Config) -> None:
     # specs/ablation-run FR-6: the same five sampling fields as dataset_stats.json.
     for key in SAMPLING_FIELDS:
         manifest[key] = stats.get(key)
+    if _is_amazon(config):
+        manifest["amazon_category"] = config.amazon_category
     with open(os.path.join(processed, "preprocessing_manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
 
@@ -783,6 +850,23 @@ def check_processed_dir(config: Config) -> None:
     rebuild = (
         f"Re-run `python main.py --stage preprocess` into {config.processed_data_dir}."
     )
+    # A manifest without `dataset_format` predates the Amazon loader, so it is MovieLens.
+    stored_format = manifest.get("dataset_format", "movielens")
+    wanted_format = getattr(config, "dataset_format", "movielens")
+    if stored_format != wanted_format:
+        raise ValueError(
+            f"{config.processed_data_dir} was preprocessed from dataset_format="
+            f"{stored_format!r} but this run asks for {wanted_format!r}. Point "
+            f"processed_data_dir at that dataset's directory (e.g. --dataset_preset) or "
+            + rebuild[0].lower() + rebuild[1:]
+        )
+    if wanted_format == "amazon2014" and manifest.get("amazon_category") not in (
+        None, config.amazon_category,
+    ):
+        raise ValueError(
+            f"{config.processed_data_dir} holds Amazon category "
+            f"{manifest.get('amazon_category')!r}, not {config.amazon_category!r}. " + rebuild
+        )
     stored_split = manifest.get("split_strategy")
     if stored_split != SPLIT_STRATEGY:
         raise ValueError(

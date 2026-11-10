@@ -138,6 +138,28 @@ def run_cold_start_evaluation(
                 for key, val in per_metric.items():
                     results[bucket][arm].setdefault(key, []).append(val.detach().cpu()[sel])
 
+    # The cold set is data-determined under the default "unseen_in_training" strategy and
+    # can be EMPTY (5-core Amazon data under leave-one-out, where every item usually has
+    # a training interaction). An empty bucket is reported as `{}` metrics plus these
+    # counts -- never NaN, never a crash -- so study H assembles either way.
+    is_cold_target = [int(t) in cold_item_set for t in test_examples["targets"]]
+    cold_set = {
+        "num_cold_items": len(cold_item_set),
+        "num_warm_items": len(warm_item_set),
+        "num_cold_test_rows": int(sum(is_cold_target)),
+        "num_warm_test_rows": int(n - sum(is_cold_target)),
+    }
+    logger.info(
+        "Cold-start evaluation: %d cold / %d warm items; %d cold / %d warm test rows",
+        cold_set["num_cold_items"], cold_set["num_warm_items"],
+        cold_set["num_cold_test_rows"], cold_set["num_warm_test_rows"],
+    )
+    if cold_set["num_cold_test_rows"] == 0:
+        logger.warning(
+            "Cold-start evaluation: no test target is a cold item (%d cold items) -- the "
+            "cold bucket is reported empty", cold_set["num_cold_items"],
+        )
+
     report = {}
     for bucket in ["cold", "warm"]:
         for meta in ["meta_on", "meta_off"]:
@@ -147,8 +169,10 @@ def run_cold_start_evaluation(
         stacked = {k: torch.cat(v) for k, v in results[bucket]["popularity"].items()}
         report[f"{bucket}_popularity"] = aggregate_metrics(stacked) if stacked else {}
 
-    _save_report(config, model_name, report, source_revision=source_revision)
+    _save_report(config, model_name, report, source_revision=source_revision,
+                 cold_set=cold_set)
     _plot_cold_start(config, model_name, report)
+    report["cold_set"] = cold_set
     return report
 
 
@@ -157,6 +181,7 @@ def _save_report(
     model_name: str,
     report: Dict,
     source_revision: Optional[Dict] = None,
+    cold_set: Optional[Dict] = None,
 ) -> None:
     os.makedirs(config.log_dir, exist_ok=True)
     mn = model_name.replace("-", "_")
@@ -171,6 +196,8 @@ def _save_report(
         serializable["source_revision"] = source_revision
     # specs/eval-integrity FR-1.5: fp32 scores, tie-averaged metrics.
     serializable["eval_protocol"] = dict(EVAL_PROTOCOL)
+    if cold_set is not None:
+        serializable["cold_set"] = dict(cold_set)
 
     with open(path, "w") as f:
         json.dump(serializable, f, indent=2)

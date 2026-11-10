@@ -1,3 +1,4 @@
+import copy
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -14,6 +15,16 @@ MODEL_CONFIGS = {
 @dataclass
 class Config:
     # --- Dataset ---
+    # Which raw format `data/preprocessing.py` reads. "movielens" (default): the
+    # MovieLens-20M Kaggle CSVs, whose Kaggle slug is `dataset`. "amazon2014": one
+    # category of the Amazon Reviews 2014 5-core release (`amazon_category`), read by
+    # data/amazon.py. Every stage after preprocessing sees the same artifacts either way.
+    # Select the Amazon settings together with `apply_dataset_preset("amazon_beauty_2014")`
+    # (CLI `--dataset_preset`), not field by field.
+    dataset_format: str = "movielens"
+    # Amazon 2014 category: the raw files are `reviews_{category}_5.json.gz` and
+    # `meta_{category}.json.gz`. Read only when dataset_format="amazon2014".
+    amazon_category: str = "Beauty"
     dataset: str = "grouplens/movielens-20m-dataset"
     raw_data_dir: str = "data/raw"
     processed_data_dir: str = "data/processed"
@@ -83,6 +94,14 @@ class Config:
     # --- Metadata ---
     use_metadata: bool = True
     genome_top_tags: int = 20
+    # amazon2014 item features, replacing MovieLens' genome+genres block: [title TF-IDF
+    # -> SVD (L2-normalised) | top-K brand one-hot | price quantile-bin one-hot | top-K
+    # category multi-hot (second-level and leaf of every `categories` path)]. A missing
+    # meta field leaves its block zero. Read only when dataset_format="amazon2014".
+    amazon_title_dim: int = 32
+    amazon_top_brands: int = 32
+    amazon_price_bins: int = 8
+    amazon_top_categories: int = 64
 
     # --- Attention ---
     attention_backend: str = "auto"
@@ -181,6 +200,12 @@ class Config:
     # specs/ablation-run FR-8: `run_pretrain` resumes from `last.pt` when it exists.
     # `--no_resume` turns it off (also disables reuse of persisted ablation arms, FR-11).
     resume_training: bool = True
+    # Which per-epoch snapshots (`epoch_XXX.pt`) `run_pretrain` keeps. 1 (default, the
+    # previous behaviour): every epoch. N > 1: every N-th epoch. 0: none. `best.pt` and
+    # `last.pt` (the resume state) are written every epoch regardless. On ML-20M, 20
+    # epochs x 14 arms kept 280 snapshots (55 GB); the 300-epoch Beauty preset sets 0.
+    # `--stage ablation_rescore` re-scores the kept snapshots, so it needs them.
+    epoch_snapshot_interval: int = 1
 
     # --- LoRA / personalization ---
     # REV-070: `use_lora` and `use_federated` were added for REV-018 but REV-018 was
@@ -337,10 +362,35 @@ class Config:
     def model_checkpoint_dir(self) -> str:
         return f"{self.checkpoint_dir}/{self.model_dir_name()}"
 
+    DATASET_FORMATS = ("movielens", "amazon2014")
     PERSONALIZATION_MODES = ("none", "lora")
     SYSTEM_EVALS = ("none", "cold_start", "longtail", "latency", "communication")
 
+    def apply_dataset_preset(self, name: str) -> None:
+        """Set every field of a named dataset preset (see DATASET_PRESETS).
+
+        Applied before any other override, so an explicit CLI flag still wins.
+        """
+        if name not in DATASET_PRESETS:
+            raise ValueError(
+                f"Unknown dataset preset '{name}'. Choose from {list(DATASET_PRESETS)}"
+            )
+        for key, value in DATASET_PRESETS[name].items():
+            if not hasattr(self, key):
+                raise AttributeError(f"dataset preset '{name}': unknown Config field '{key}'")
+            setattr(self, key, copy.deepcopy(value))
+
     def validate(self) -> None:
+        if self.dataset_format not in self.DATASET_FORMATS:
+            raise ValueError(
+                f"Unknown dataset_format '{self.dataset_format}'. "
+                f"Choose from {list(self.DATASET_FORMATS)}"
+            )
+        if self.epoch_snapshot_interval < 0:
+            raise ValueError(
+                f"epoch_snapshot_interval must be >= 0 (0 = keep no per-epoch snapshot), "
+                f"got {self.epoch_snapshot_interval}"
+            )
         if self.system_eval not in self.SYSTEM_EVALS:
             raise ValueError(
                 f"Unknown system_eval '{self.system_eval}'. "
@@ -462,3 +512,35 @@ class Config:
             raise ValueError(
                 f"cold_start_ratio must be in (0, 1), got {self.cold_start_ratio}"
             )
+
+
+#: Named dataset presets: every field that differs from the MovieLens-20M defaults, set
+#: together by `Config.apply_dataset_preset` (CLI `--dataset_preset`). Everything not
+#: listed -- model size, batch 256, losses, multi_step_k, LoRA, federated settings and the
+#: leave-one-out full-ranking protocol -- stays at the defaults.
+DATASET_PRESETS = {
+    # The defaults themselves, so a command can name its dataset explicitly.
+    "movielens_20m": {},
+    "amazon_beauty_2014": {
+        "dataset_format": "amazon2014",
+        "amazon_category": "Beauty",
+        # Own raw/processed directories and output roots, so nothing collides with the
+        # MovieLens data, checkpoints (the by-fingerprint store) or ablation results.
+        "raw_data_dir": "data/raw_beauty",
+        "processed_data_dir": "data/processed_beauty",
+        "output_dir": "outputs/amazon_beauty_2014",
+        "checkpoint_dir": "outputs/amazon_beauty_2014/checkpoints",
+        "log_dir": "outputs/amazon_beauty_2014/logs",
+        "plot_dir": "outputs/amazon_beauty_2014/plots",
+        "ablation_dir": "outputs/amazon_beauty_2014/ablations",
+        # 5-core Beauty histories are short (mean ~8.9 interactions per user), so the
+        # reference arm reads 20 items and study H2 sweeps 5/10/15/20 -- the reference
+        # coincides with H2_seq20 as max_seq_length=200 does with H2_seq200 on ML-20M.
+        "max_seq_length": 20,
+        "sequence_length_grid": [5, 10, 15, 20],
+        # The best epoch is still chosen on validation NDCG (`run_pretrain`).
+        "pretrain_epochs": 300,
+        # 300 snapshots per arm would dwarf ML's 55 GB; best.pt and last.pt (resume) stay.
+        "epoch_snapshot_interval": 0,
+    },
+}

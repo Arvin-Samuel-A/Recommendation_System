@@ -11,7 +11,7 @@ from typing import Optional
 import numpy as np
 import torch
 
-from configs.config import OBJECTIVE_ORDER, Config
+from configs.config import DATASET_PRESETS, OBJECTIVE_ORDER, Config
 from models.transformer import VALID_BACKENDS
 from utils import set_seed
 
@@ -39,12 +39,38 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Recommendation System Pipeline")
     parser.add_argument("--stage", required=True, choices=VALID_STAGES, help="Pipeline stage to run")
     parser.add_argument("--model", default="t-base", choices=VALID_MODELS, help="Model variant")
+    # Every field of a named dataset (configs/config.py DATASET_PRESETS), applied before
+    # any other flag, so e.g. `--epochs` or `--sequence_length_grid` still override it.
+    # Absent = the MovieLens-20M defaults.
+    parser.add_argument(
+        "--dataset_preset", default=None, choices=list(DATASET_PRESETS),
+        help="Select a dataset's settings at once (data dirs, output roots, sequence "
+             "length, epochs), e.g. amazon_beauty_2014. Explicit flags override it.",
+    )
+    parser.add_argument(
+        "--raw_data_dir", default=None,
+        help="Override raw_data_dir (where preprocessing reads the raw files).",
+    )
+    parser.add_argument(
+        "--processed_data_dir", default=None,
+        help="Override processed_data_dir. An explicit directory is never rewritten for "
+             "a user sample.",
+    )
+    parser.add_argument(
+        "--max_seq_length", type=int, default=None,
+        help="Override max_seq_length (the reference arm's sequence width).",
+    )
     parser.add_argument("--epochs", type=int, default=None, help="Override pretrain_epochs/federated_rounds")
     parser.add_argument("--batch_size", type=int, default=None, help="Override batch_size")
     parser.add_argument("--moe_variant", default=None, choices=["none", "mmoe", "arv_mmoe"])
     parser.add_argument("--num_experts", type=int, default=None)
     parser.add_argument("--use_gradnorm", action="store_true", default=None)
     parser.add_argument("--no_gradnorm", action="store_true", default=False)
+    # Static auxiliary loss weights, used when GradNorm is off (next-item's weight is
+    # always 1). For example, a GradNorm-off arm fixed at GradNorm's learned weights.
+    parser.add_argument("--masked_lm_weight", type=float, default=None)
+    parser.add_argument("--multi_step_weight", type=float, default=None)
+    parser.add_argument("--contrastive_weight", type=float, default=None)
     parser.add_argument("--study", default="all", help="Ablation study letter (A-H) or 'all'")
     # REV-115: `run_ablation(train=...)` existed but had no CLI surface, so evaluating
     # already-trained arms meant editing source -- which conventions.md's "Config-Driven
@@ -186,20 +212,40 @@ def derive_processed_dir(config: Config) -> Optional[str]:
     specs/ablation-run FR-6: `data/processed_users{pct}pct`, with `_seed{S}` when
     `user_sample_seed` differs from its default, so a sampled dataset never overwrites
     `data/processed`. Shared with `scripts/package_ablation_run.py`.
+
+    For another dataset's full-data directory (a preset's `processed_data_dir`, e.g.
+    `data/processed_beauty`) the sample goes next to it with the same suffix
+    (`data/processed_beauty_users10pct`), so it never shares a directory with MovieLens'.
     """
     fraction = config.user_sample_fraction
     if fraction >= 1.0:
         return None
     pct = format(round(fraction * 100, 6), "g")
-    name = f"processed_users{pct}pct"
+    suffix = f"users{pct}pct"
     if config.user_sample_seed != Config.user_sample_seed:
-        name += f"_seed{config.user_sample_seed}"
+        suffix += f"_seed{config.user_sample_seed}"
+    if config.processed_data_dir != Config.processed_data_dir:
+        return f"{config.processed_data_dir.rstrip('/')}_{suffix}"
     base = os.path.dirname(Config.processed_data_dir) or "."
-    return f"{base}/{name}"
+    return f"{base}/processed_{suffix}"
 
 
 def apply_cli_overrides(config: Config, args) -> None:
     overrides = []
+    # The preset first, so every explicit flag below overrides it.
+    preset = getattr(args, "dataset_preset", None)
+    if preset is not None:
+        before = asdict(config)
+        config.apply_dataset_preset(preset)
+        for name, new in asdict(config).items():
+            if before[name] != new:
+                overrides.append((f"{name} [preset {preset}]", before[name], new))
+    # The selected dataset's OWN full-data directory (the preset's, else the Config
+    # default); a user sample is derived only from that one, never from a directory set
+    # explicitly in code or by --processed_data_dir (FR-6).
+    default_processed_dir = DATASET_PRESETS.get(preset or "", {}).get(
+        "processed_data_dir", Config.processed_data_dir,
+    )
     if args.epochs is not None:
         # REV-031: --epochs always overwrote `pretrain_epochs` and ADDITIONALLY set
         # `federated_rounds` for the federated stage, so a federated run mutated
@@ -225,6 +271,11 @@ def apply_cli_overrides(config: Config, args) -> None:
     elif args.no_gradnorm:
         overrides.append(("use_gradnorm", config.use_gradnorm, False))
         config.use_gradnorm = False
+    for field in ("masked_lm_weight", "multi_step_weight", "contrastive_weight"):
+        value = getattr(args, field, None)
+        if value is not None:
+            overrides.append((field, getattr(config, field), value))
+            setattr(config, field, value)
     if args.seed is not None:
         overrides.append(("seed", config.seed, args.seed))
         config.seed = args.seed
@@ -258,6 +309,9 @@ def apply_cli_overrides(config: Config, args) -> None:
 
     # specs/ablation-run T1.2.
     for flag, field_name in (
+        ("raw_data_dir", "raw_data_dir"),
+        ("processed_data_dir", "processed_data_dir"),
+        ("max_seq_length", "max_seq_length"),
         ("user_sample_fraction", "user_sample_fraction"),
         ("user_sample_seed", "user_sample_seed"),
         ("attention_backend", "attention_backend"),
@@ -287,7 +341,10 @@ def apply_cli_overrides(config: Config, args) -> None:
         config.resume_training = False
     # FR-6: a sample gets its own directory, but an explicitly chosen one is never
     # rewritten.
-    if config.processed_data_dir == Config.processed_data_dir:
+    if (
+        config.processed_data_dir == default_processed_dir
+        and getattr(args, "processed_data_dir", None) is None
+    ):
         derived = derive_processed_dir(config)
         if derived is not None:
             overrides.append(("processed_data_dir", config.processed_data_dir, derived))

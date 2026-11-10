@@ -1197,11 +1197,16 @@ def run_pretrain(config: Config, model_name: str) -> Dict[str, float]:
         ):
             _emit_routing_diagnostics(routing_buffer, config, model_name)
 
-        ckpt_path = os.path.join(ckpt_dir, f"epoch_{epoch:03d}.pt")
-        save_checkpoint(
-            ckpt_path, epoch, model, moe, optimizer, scheduler, gradnorm,
-            val_metrics, config, loss_fns=loss_fns,
-        )
+        # `epoch_snapshot_interval`: 1 (default) keeps every epoch, N every N-th, 0 none.
+        # best.pt and last.pt below are written either way, so selection and resume do
+        # not depend on it; only `--stage ablation_rescore` reads these snapshots.
+        interval = getattr(config, "epoch_snapshot_interval", 1)
+        if interval > 0 and (epoch + 1) % interval == 0:
+            ckpt_path = os.path.join(ckpt_dir, f"epoch_{epoch:03d}.pt")
+            save_checkpoint(
+                ckpt_path, epoch, model, moe, optimizer, scheduler, gradnorm,
+                val_metrics, config, loss_fns=loss_fns,
+            )
 
         val_ndcg = val_metrics.get("ndcg", {}).get("mean", 0.0)
         if val_ndcg > best_val_ndcg:

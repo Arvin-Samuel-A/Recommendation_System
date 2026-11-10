@@ -31,6 +31,13 @@ NEW_FIELDS = (
     "gradnorm_primary_objective", "gradnorm_aux_budget", "grad_projection",
 )
 
+#: Dataset fields added later with the Amazon 2014 loader (also default-omitted from the
+#: fingerprint); the legacy payload below predates them too. See tests/test_amazon.py.
+LATER_DATASET_FIELDS = (
+    "dataset_format", "amazon_category", "amazon_title_dim", "amazon_top_brands",
+    "amazon_price_bins", "amazon_top_categories",
+)
+
 
 def _ce_floor(num_candidates: int, scale: float) -> float:
     """The lowest CE over `num_candidates` cosine logits times `scale`: target at +1,
@@ -282,7 +289,7 @@ class TestFingerprint:
             k: v for k, v in asdict(cfg).items()
             if k not in POST_TRAINING_ONLY_FIELDS and k not in _PATH_FIELDS
             and k not in _RUN_SELECTION_FIELDS and k not in _RUNTIME_ONLY_FIELDS
-            and k not in NEW_FIELDS
+            and k not in NEW_FIELDS and k not in LATER_DATASET_FIELDS
         }
         fields["_training_semantics"] = TRAINING_SEMANTICS_VERSION
         payload = json.dumps(fields, sort_keys=True, default=str)

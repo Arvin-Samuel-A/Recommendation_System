@@ -257,7 +257,11 @@ _RUN_SELECTION_FIELDS = frozenset({"final_seeds"})
 #: stays IN the fingerprint on purpose: a persistent iterator is reset between epochs
 #: without redrawing its base seed, which consumes the loader generator differently and
 #: so changes the data order from epoch 2 on.
-_RUNTIME_ONLY_FIELDS = frozenset({"num_workers", "pin_memory", "resume_training"})
+#: `epoch_snapshot_interval` only decides which `epoch_XXX.pt` files are kept on disk;
+#: best.pt, last.pt and the training trajectory are the same whatever its value.
+_RUNTIME_ONLY_FIELDS = frozenset({
+    "num_workers", "pin_memory", "resume_training", "epoch_snapshot_interval",
+})
 
 
 #: Bump when a code fix changes what training produces for an unchanged config, so
@@ -287,6 +291,16 @@ _DEFAULT_OMITTED_FIELDS = {
     "gradnorm_primary_objective": "",
     "gradnorm_aux_budget": None,
     "grad_projection": "",
+    # Dataset selection (the Amazon 2014 loader). At the MovieLens defaults they are
+    # omitted, so every MovieLens fingerprint -- and with it every finished ML arm and
+    # `last.pt` -- is unchanged; an amazon2014 config hashes `dataset_format` (and any
+    # non-default Amazon feature size) and so never shares a backbone with ML.
+    "dataset_format": "movielens",
+    "amazon_category": "Beauty",
+    "amazon_title_dim": 32,
+    "amazon_top_brands": 32,
+    "amazon_price_bins": 8,
+    "amazon_top_categories": 64,
 }
 
 #: GradNorm fields added after TRAINING_SEMANTICS_VERSION 2 that `run_pretrain` reads only
