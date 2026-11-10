@@ -1,0 +1,328 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#3b5bdb">
+<title>On-Device Recommendations</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --text: #1d2330; --muted: #667085; --border: #e3e6eb;
+    --accent: #3b5bdb; --accent-soft: #e7ecfd; --hit: #2b8a3e; --hit-soft: #e6f4ea; --err: #c92a2a;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12151b; --panel: #1b1f27; --text: #e6e8ec; --muted: #98a2b3; --border: #2c323d;
+      --accent: #748ffc; --accent-soft: #252c45; --hit: #69db7c; --hit-soft: #1d3324; --err: #ff8787;
+    }
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 16px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  .wrap { max-width: 720px; margin: 0 auto; padding: 16px 16px 48px; }
+  h1 { font-size: 21px; margin: 4px 0 2px; }
+  .sub { color: var(--muted); font-size: 13px; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 14px; margin-top: 14px; }
+  .status { display: flex; align-items: center; gap: 10px; font-size: 14px; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); flex: none; }
+  .dot.ok { background: var(--hit); } .dot.bad { background: var(--err); }
+  .progress { height: 6px; background: var(--bg); border-radius: 3px; overflow: hidden; margin-top: 8px; }
+  .progress div { height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+  .tabs { display: flex; gap: 6px; margin-bottom: 12px; }
+  .tab { flex: 1; border: 1px solid var(--border); background: transparent; color: var(--text);
+         padding: 9px; border-radius: 999px; font: inherit; font-size: 15px; }
+  .tab.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  button.go { flex: 1; min-width: 140px; font: inherit; font-size: 15px; background: var(--accent); color: #fff;
+              border: 0; border-radius: 8px; padding: 11px 14px; }
+  button.go:disabled { opacity: .5; }
+  button.link { font: inherit; background: none; border: 0; color: var(--accent); padding: 0; font-size: 14px; }
+  input[type=search] { width: 100%; font: inherit; color: var(--text); background: var(--bg);
+                       border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
+  .search { position: relative; }
+  .suggest { position: absolute; top: 100%; left: 0; right: 0; z-index: 5; background: var(--panel);
+             border: 1px solid var(--border); border-radius: 8px; margin-top: 4px; max-height: 50vh;
+             overflow-y: auto; display: none; box-shadow: 0 6px 20px rgba(0,0,0,.15); }
+  .suggest div { padding: 10px 12px; border-bottom: 1px solid var(--border); }
+  .suggest div:last-child { border-bottom: 0; }
+  .suggest small { color: var(--muted); display: block; font-size: 12px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0; }
+  .chip { background: var(--accent-soft); border-radius: 999px; padding: 5px 4px 5px 12px; font-size: 13px; }
+  .chip button { background: none; border: 0; color: var(--muted); font-size: 16px; padding: 0 6px; }
+  .hint { color: var(--muted); font-size: 13px; margin-top: 10px; }
+  .err { color: var(--err); font-size: 14px; margin-top: 8px; }
+  .badge { display: inline-block; background: var(--hit-soft); color: var(--hit); border-radius: 999px;
+           padding: 3px 10px; font-size: 13px; font-weight: 600; }
+  h2 { font-size: 16px; margin: 0 0 2px; }
+  .desc { color: var(--muted); font-size: 12px; margin-bottom: 8px; }
+  ol, ul { margin: 0; padding-left: 24px; }
+  ul.plain { list-style: none; padding: 0; }
+  li { padding: 6px 0; border-bottom: 1px solid var(--border); }
+  li:last-child { border-bottom: 0; }
+  li .t { display: flex; justify-content: space-between; gap: 8px; }
+  li .g { color: var(--muted); font-size: 12px; }
+  li .s { color: var(--muted); font-size: 12px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  li.hit { background: var(--hit-soft); border-radius: 6px; }
+  li.hit .t > span:first-child::before { content: "✓ "; color: var(--hit); font-weight: 700; }
+  .hits { margin-top: 8px; font-size: 13px; color: var(--hit); }
+  .bar { display: grid; grid-template-columns: 64px 1fr 40px; gap: 8px; align-items: center; font-size: 13px; margin: 5px 0; }
+  .track { background: var(--bg); border-radius: 4px; height: 12px; overflow: hidden; }
+  .fill { background: var(--accent); height: 100%; }
+  details summary { cursor: pointer; font-weight: 600; font-size: 16px; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>On-Device Movie Recommendations</h1>
+  <div class="sub">ARV-MMoE model (t-base Transformer, 4 experts) running inside this browser. No server is involved after the page loads.</div>
+
+  <section class="panel">
+    <div class="status"><span class="dot" id="dot"></span><span id="status">Starting…</span></div>
+    <div class="progress" id="progressWrap"><div id="progress"></div></div>
+  </section>
+
+  <section class="panel">
+    <div class="tabs">
+      <button class="tab active" data-mode="user">Real user</button>
+      <button class="tab" data-mode="new">New viewer</button>
+    </div>
+    <div id="mode-user">
+      <div class="row">
+        <button class="go needs-model" id="goExample" disabled>Example user 13408</button>
+        <button class="go needs-model" id="goRandom" disabled>Random user</button>
+      </div>
+      <div class="hint">The model sees the user's history before their test period. ✓ marks movies they really liked later, which the model never saw.</div>
+    </div>
+    <div id="mode-new" class="hidden">
+      <div class="search">
+        <input type="search" id="searchBox" placeholder="Search a movie you liked" autocomplete="off" disabled>
+        <div class="suggest" id="suggest"></div>
+      </div>
+      <div class="chips" id="chips"></div>
+      <div class="row"><button class="go needs-model" id="goNew" disabled>Recommend</button></div>
+      <div class="hint">Try: <button class="link" id="presetAnim">animated films</button> ·
+        <button class="link" id="presetSci">sci-fi classics</button> ·
+        <button class="link" id="clearLiked">clear</button></div>
+    </div>
+    <div class="err" id="error"></div>
+  </section>
+
+  <div id="results"></div>
+</div>
+
+<!-- 1.18 still ships a single-threaded WebAssembly build. From 1.19 on there is only the
+     threaded one, whose shared-memory reservation iOS Safari refuses ("RangeError: Out of memory"). -->
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/ort.wasm.min.js"></script>
+<script>
+const $ = (id) => document.getElementById(id);
+const SEQ_LEN = 50, TOP_K = 10;
+const PRESETS = {
+  anim: ["Toy Story (1995)", "Finding Nemo", "Shrek (2001)", "Monsters, Inc.", "Incredibles"],
+  sci: ["Star Wars: Episode IV", "Alien (1979)", "Blade Runner", "Terminator 2", "Matrix, The"],
+};
+let session = null, items = null, users = null, searchOrder = null, liked = [];
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+}
+// Report timings to the serving computer: they show up in run_mobile_demo.sh's request log
+// (as a 404, which is expected -- the static server has no such file).
+function report(fields) {
+  const q = new URLSearchParams({...fields, ua: navigator.userAgent.replace(/^[^(]*\(([^)]*)\).*/, "$1")});
+  fetch("report?" + q, {keepalive: true}).catch(() => {});
+}
+function setStatus(text, state) {
+  $("status").textContent = text;
+  $("dot").className = "dot" + (state ? " " + state : "");
+}
+
+// ------------------------------------------------------------------ loading
+async function fetchWithProgress(url, onProgress) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`${url}: HTTP ${res.status}`);
+  const total = +res.headers.get("Content-Length") || 0;
+  if (!res.body || !total) return new Uint8Array(await res.arrayBuffer());
+  const reader = res.body.getReader(), out = new Uint8Array(total);
+  let got = 0;
+  for (;;) {
+    const {done, value} = await reader.read();
+    if (done) break;
+    out.set(value, got); got += value.length;
+    onProgress(got / total);
+  }
+  return out;
+}
+
+async function init() {
+  try {
+    if (typeof ort === "undefined") throw new Error("could not load onnxruntime-web from the CDN (is the phone online?)");
+    ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/";
+    ort.env.wasm.numThreads = 1;  // selects ort-wasm-simd.wasm, the build iOS can allocate
+    setStatus("Downloading movie data…");
+    [items, users] = await Promise.all([
+      fetch("assets/items.json").then((r) => r.json()),
+      fetch("assets/users.json").then((r) => r.json()),
+    ]);
+    searchOrder = items.title.map((t, i) => i).sort((a, b) => items.likes[b] - items.likes[a]);
+    const t0 = performance.now();
+    const bytes = await fetchWithProgress("assets/model.onnx", (f) => {
+      $("progress").style.width = (f * 100).toFixed(0) + "%";
+      setStatus(`Downloading the model to this device… ${(f * 100).toFixed(0)}%`);
+    });
+    setStatus("Preparing the model…");
+    // No memory arena or pattern planning: lower peak memory, which phones are short of.
+    session = await ort.InferenceSession.create(bytes, {executionProviders: ["wasm"], graphOptimizationLevel: "all",
+                                                         enableCpuMemArena: false, enableMemPattern: false});
+    await infer([1]);  // warm-up
+    const secs = ((performance.now() - t0) / 1000).toFixed(1);
+    report({event: "loaded", seconds: secs, mb: (bytes.length / 1e6).toFixed(0), threads: ort.env.wasm.numThreads});
+    $("progressWrap").classList.add("hidden");
+    setStatus(`Model loaded on this device (${(bytes.length / 1e6).toFixed(0)} MB, WebAssembly, ` +
+              `${ort.env.wasm.numThreads} thread${ort.env.wasm.numThreads > 1 ? "s" : ""}) in ${secs} s`, "ok");
+    document.querySelectorAll(".needs-model").forEach((b) => b.disabled = false);
+    $("searchBox").disabled = false;
+  } catch (e) {
+    setStatus("Failed: " + e.message, "bad");
+    report({event: "error", message: e.message});
+  }
+}
+
+// ------------------------------------------------------------------ inference
+async function infer(history) {
+  const recent = history.slice(-SEQ_LEN);
+  const seq = new BigInt64Array(SEQ_LEN);
+  recent.forEach((item, i) => { seq[SEQ_LEN - recent.length + i] = BigInt(item); });
+  const t0 = performance.now();
+  const out = await session.run({seq: new ort.Tensor("int64", seq, [1, SEQ_LEN])});
+  const ms = performance.now() - t0;
+  return {scores: out.scores.data, routing: Array.from(out.routing.data), ms};
+}
+
+function topK(scores, exclude, k) {
+  // scores[i] belongs to item i + 1
+  const best = [];
+  for (let i = 0; i < scores.length; i++) {
+    const s = scores[i];
+    if (exclude.has(i + 1) || (best.length === k && s <= best[k - 1][1])) continue;
+    best.push([i + 1, s]);
+    best.sort((a, b) => b[1] - a[1]);
+    if (best.length > k) best.pop();
+  }
+  return best;
+}
+
+function popular(exclude, k) {
+  const out = [];
+  for (const i of searchOrder) {
+    if (!exclude.has(i + 1)) out.push([i + 1, items.likes[i]]);
+    if (out.length === k) break;
+  }
+  return out;
+}
+
+async function recommendFor(history, viewer, future) {
+  $("error").textContent = "";
+  try {
+    const exclude = new Set(history);
+    const r = await infer(history);
+    const recs = topK(r.scores, exclude, TOP_K);
+    render(viewer, history, future, r, recs, popular(exclude, TOP_K));
+    report({event: "inference", ms: r.ms.toFixed(1), history: history.length,
+            top1: items.title[recs[0][0] - 1]});
+  } catch (e) {
+    $("error").textContent = "Inference failed: " + e.message;
+  }
+}
+
+// ------------------------------------------------------------------ inputs
+document.querySelectorAll(".tab").forEach((b) => b.addEventListener("click", () => {
+  document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t === b));
+  $("mode-user").classList.toggle("hidden", b.dataset.mode !== "user");
+  $("mode-new").classList.toggle("hidden", b.dataset.mode !== "new");
+}));
+
+function runUser(u) {
+  const viewer = `<h2>User ${u.id} <span class="desc">(MovieLens userId ${u.ml})</span></h2>
+    <div class="desc">Liked ${u.n} movies before the test period, then ${u.test.length} more in it (hidden from the model).</div>`;
+  recommendFor(u.history, viewer, new Set(u.test));
+}
+$("goExample").addEventListener("click", () => runUser(users.find((u) => u.id === 13408) || users[0]));
+$("goRandom").addEventListener("click", () => runUser(users[Math.floor(Math.random() * users.length)]));
+
+function search(q, limit) {
+  q = q.toLowerCase().trim();
+  if (!q) return [];
+  const out = [];
+  for (const i of searchOrder) {
+    if (items.title[i].toLowerCase().includes(q)) out.push(i + 1);
+    if (out.length === limit) break;
+  }
+  return out;
+}
+$("searchBox").addEventListener("input", () => {
+  const box = $("suggest"), q = $("searchBox").value;
+  const res = q.trim().length >= 2 ? search(q, 8) : [];
+  if (!res.length) { box.style.display = q.trim().length >= 2 ? "block" : "none"; box.innerHTML = "<div><small>No matches</small></div>"; return; }
+  box.innerHTML = res.map((it) => `<div data-item="${it}">${esc(items.title[it - 1])}<small>${esc(items.genres[it - 1])}</small></div>`).join("");
+  box.querySelectorAll("div[data-item]").forEach((d) => d.addEventListener("click", () => addLiked(+d.dataset.item)));
+  box.style.display = "block";
+});
+document.addEventListener("click", (e) => { if (!e.target.closest(".search")) $("suggest").style.display = "none"; });
+
+function addLiked(item) {
+  if (item && !liked.includes(item)) liked.push(item);
+  $("searchBox").value = "";
+  $("suggest").style.display = "none";
+  renderChips();
+}
+function renderChips() {
+  $("chips").innerHTML = liked.map((it, i) =>
+    `<span class="chip">${esc(items.title[it - 1])}<button data-i="${i}" aria-label="remove">×</button></span>`).join("");
+  $("chips").querySelectorAll("button").forEach((b) => b.addEventListener("click", () => { liked.splice(+b.dataset.i, 1); renderChips(); }));
+}
+function runNew() {
+  if (!liked.length) { $("error").textContent = "Add at least one movie you liked."; return; }
+  recommendFor(liked.slice(), `<h2>A new viewer</h2><div class="desc">Described by ${liked.length} liked movies.</div>`, new Set());
+}
+$("goNew").addEventListener("click", runNew);
+function preset(titles) {
+  if (!session) return;
+  liked = [];
+  titles.forEach((t) => { const r = search(t, 1); if (r.length) addLiked(r[0]); });
+  runNew();
+}
+$("presetAnim").addEventListener("click", () => preset(PRESETS.anim));
+$("presetSci").addEventListener("click", () => preset(PRESETS.sci));
+$("clearLiked").addEventListener("click", () => { liked = []; renderChips(); });
+
+// ------------------------------------------------------------------ rendering
+function list(recs, future, fmt) {
+  const lis = recs.map(([it, s]) => `<li class="${future.has(it) ? "hit" : ""}">
+    <div class="t"><span>${esc(items.title[it - 1])}</span><span class="s">${fmt(s)}</span></div>
+    <div class="g">${esc(items.genres[it - 1])}</div></li>`).join("");
+  const hits = recs.filter(([it]) => future.has(it)).length;
+  return `<ol>${lis}</ol>` + (future.size ? `<div class="hits">${hits}/${recs.length} were movies this user liked in the held-out test period</div>` : "");
+}
+
+function render(viewer, history, future, r, recs, pop) {
+  const recent = history.slice(-10);
+  $("results").innerHTML = `
+    <section class="panel">${viewer}<span class="badge">Computed on this device in ${r.ms.toFixed(0)} ms</span></section>
+    <section class="panel"><h2>Recommended for you</h2>
+      <div class="desc">Top ${TOP_K} of ${items.title.length} movies, scored on this device</div>
+      ${list(recs, future, (s) => s.toFixed(3))}</section>
+    <section class="panel"><h2>Expert routing</h2>
+      <div class="desc">How the router mixed the 4 experts for this viewer</div>
+      ${r.routing.map((w, i) => `<div class="bar"><span>expert ${i}</span><div class="track"><div class="fill" style="width:${(w * 100).toFixed(1)}%"></div></div><span>${w.toFixed(2)}</span></div>`).join("")}</section>
+    <section class="panel"><details><summary>Recent history (${recent.length} of ${history.length})</summary>
+      <ul class="plain">${recent.map((it) => `<li><div class="t"><span>${esc(items.title[it - 1])}</span></div><div class="g">${esc(items.genres[it - 1])}</div></li>`).join("")}</ul></details></section>
+    <section class="panel"><details><summary>Most popular (non-personalised)</summary>
+      ${list(pop, future, (s) => `${s} likes`)}</details></section>`;
+  $("results").scrollIntoView({behavior: "smooth", block: "start"});
+}
+
+init();
+</script>
+</body>
+</html>

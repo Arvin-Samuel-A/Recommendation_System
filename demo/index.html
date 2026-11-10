@@ -1,0 +1,307 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Movie Recommendation Demo</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --text: #1d2330; --muted: #667085; --border: #e3e6eb;
+    --accent: #3b5bdb; --accent-soft: #e7ecfd; --hit: #2b8a3e; --hit-soft: #e6f4ea; --err: #c92a2a;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12151b; --panel: #1b1f27; --text: #e6e8ec; --muted: #98a2b3; --border: #2c323d;
+      --accent: #748ffc; --accent-soft: #252c45; --hit: #69db7c; --hit-soft: #1d3324; --err: #ff8787;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { padding: 20px 24px 8px; max-width: 1280px; margin: 0 auto; }
+  h1 { margin: 0 0 4px; font-size: 22px; }
+  .sub { color: var(--muted); font-size: 13px; }
+  main { max-width: 1280px; margin: 0 auto; padding: 8px 24px 40px; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+  .tabs { display: flex; gap: 6px; margin-bottom: 14px; }
+  .tab { border: 1px solid var(--border); background: transparent; color: var(--text);
+         padding: 7px 14px; border-radius: 999px; cursor: pointer; font: inherit; }
+  .tab.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 10px; }
+  input[type=text], input[type=number], select {
+    font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--border);
+    border-radius: 6px; padding: 7px 10px; }
+  input[type=number] { width: 120px; }
+  button.go { font: inherit; background: var(--accent); color: #fff; border: 0; border-radius: 6px;
+              padding: 8px 16px; cursor: pointer; }
+  button.go:disabled { opacity: .6; cursor: wait; }
+  button.link { font: inherit; background: none; border: 0; color: var(--accent); cursor: pointer; padding: 0; }
+  label { color: var(--muted); font-size: 13px; }
+  .search { position: relative; flex: 1; min-width: 260px; }
+  .search input { width: 100%; }
+  .suggest { position: absolute; top: 100%; left: 0; right: 0; z-index: 5; background: var(--panel);
+             border: 1px solid var(--border); border-radius: 6px; margin-top: 2px; max-height: 300px;
+             overflow-y: auto; display: none; }
+  .suggest div { padding: 6px 10px; cursor: pointer; }
+  .suggest div:hover, .suggest div.sel { background: var(--accent-soft); }
+  .suggest small { color: var(--muted); }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; min-height: 30px; }
+  .chip { background: var(--accent-soft); border-radius: 999px; padding: 4px 6px 4px 12px; font-size: 13px; }
+  .chip button { background: none; border: 0; color: var(--muted); cursor: pointer; font-size: 14px; }
+  .presets { font-size: 13px; color: var(--muted); }
+  .err { color: var(--err); margin-top: 8px; }
+  #viewer { margin: 18px 0 10px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; }
+  h2 { font-size: 15px; margin: 0 0 4px; }
+  .desc { color: var(--muted); font-size: 12px; margin-bottom: 10px; }
+  ol { margin: 0; padding-left: 26px; }
+  li { padding: 4px 0; border-bottom: 1px solid var(--border); }
+  li:last-child { border-bottom: 0; }
+  li .t { display: flex; justify-content: space-between; gap: 8px; }
+  li .g { color: var(--muted); font-size: 12px; }
+  li .s { color: var(--muted); font-size: 12px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  li.hit { background: var(--hit-soft); }
+  li.hit .t::before { content: "✓ "; color: var(--hit); font-weight: 700; }
+  .hits { margin-top: 8px; font-size: 13px; color: var(--hit); }
+  ul.hist { list-style: none; padding: 0; margin: 0; }
+  .bars { display: flex; flex-direction: column; gap: 6px; }
+  .bar { display: grid; grid-template-columns: 70px 1fr 44px; gap: 8px; align-items: center; font-size: 13px; }
+  .bar .track { background: var(--bg); border-radius: 4px; height: 12px; overflow: hidden; }
+  .bar .fill { background: var(--accent); height: 100%; }
+  .hidden { display: none; }
+  @media (max-width: 600px) { header, main { padding-left: 16px; padding-right: 16px; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Movie Recommendation Demo</h1>
+  <div class="sub" id="modelInfo">Connecting to the server…</div>
+</header>
+<main>
+  <section class="panel">
+    <div class="tabs">
+      <button class="tab active" data-mode="user">Real user</button>
+      <button class="tab" data-mode="new">New viewer</button>
+    </div>
+
+    <div id="mode-user">
+      <div class="row">
+        <label>Find by
+          <select id="idKind">
+            <option value="user">internal user id</option>
+            <option value="movielens_user">MovieLens userId</option>
+          </select>
+        </label>
+        <input type="number" id="userId" placeholder="e.g. 13408" min="0">
+        <button class="go" id="goUser">Recommend</button>
+        <button class="go" id="goRandom">Random user</button>
+      </div>
+      <div class="presets">Example: <button class="link" data-user="13408">user 13408</button>.
+        The model sees the user's history up to their test period; ✓ marks recommendations
+        they really liked later, which the model never saw.</div>
+    </div>
+
+    <div id="mode-new" class="hidden">
+      <div class="row">
+        <div class="search">
+          <input type="text" id="searchBox" placeholder="Search a movie you liked, e.g. Toy Story" autocomplete="off">
+          <div class="suggest" id="suggest"></div>
+        </div>
+        <button class="go" id="goNew">Recommend</button>
+      </div>
+      <div class="chips" id="chips"></div>
+      <div class="presets">Try: <button class="link" id="presetAnim">five animated films</button> ·
+        <button class="link" id="presetSci">sci-fi classics</button> ·
+        <button class="link" id="clearLiked">clear</button></div>
+    </div>
+
+    <div class="row" style="margin: 14px 0 0">
+      <label>Top-K <input type="number" id="topK" value="10" min="1" max="50" style="width:70px"></label>
+      <label><input type="checkbox" id="compare"> compare with the next-item-only baseline</label>
+    </div>
+    <div class="err" id="error"></div>
+  </section>
+
+  <div id="viewer"></div>
+  <div class="grid" id="results"></div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+// Served by demo/server.py: same origin. Opened as a file: talk to the default server address.
+const API = location.protocol.startsWith("http") ? "" : "http://127.0.0.1:8000";
+let mode = "user";
+let liked = [];   // [{item, title}]
+
+const PRESETS = {
+  anim: ["Toy Story (1995)", "Finding Nemo", "Shrek (2001)", "Monsters, Inc.", "Incredibles"],
+  sci: ["Star Wars: Episode IV", "Alien (1979)", "Blade Runner", "Terminator 2", "Matrix, The"],
+};
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+}
+
+async function api(path, body) {
+  const res = await fetch(API + path, body === undefined ? {} : {
+    method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const d = data.detail;
+    throw new Error(typeof d === "string" ? d : (d ? JSON.stringify(d) : `HTTP ${res.status}`));
+  }
+  return data;
+}
+
+// ------------------------------------------------------------------ tabs
+document.querySelectorAll(".tab").forEach((b) => b.addEventListener("click", () => {
+  mode = b.dataset.mode;
+  document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t === b));
+  $("mode-user").classList.toggle("hidden", mode !== "user");
+  $("mode-new").classList.toggle("hidden", mode !== "new");
+}));
+
+// ------------------------------------------------------------------ new-viewer search
+let searchTimer = null, suggestions = [], selIdx = -1;
+
+$("searchBox").addEventListener("input", () => {
+  clearTimeout(searchTimer);
+  const q = $("searchBox").value.trim();
+  if (q.length < 2) { hideSuggest(); return; }
+  searchTimer = setTimeout(async () => {
+    try {
+      suggestions = await api(`/api/search?q=${encodeURIComponent(q)}&limit=10`);
+      selIdx = -1;
+      renderSuggest();
+    } catch (e) { hideSuggest(); }
+  }, 150);
+});
+$("searchBox").addEventListener("keydown", (e) => {
+  if (!suggestions.length) return;
+  if (e.key === "ArrowDown") { selIdx = (selIdx + 1) % suggestions.length; renderSuggest(); e.preventDefault(); }
+  else if (e.key === "ArrowUp") { selIdx = (selIdx - 1 + suggestions.length) % suggestions.length; renderSuggest(); e.preventDefault(); }
+  else if (e.key === "Enter") { addLiked(suggestions[Math.max(selIdx, 0)]); e.preventDefault(); }
+  else if (e.key === "Escape") hideSuggest();
+});
+document.addEventListener("click", (e) => { if (!e.target.closest(".search")) hideSuggest(); });
+
+function renderSuggest() {
+  const box = $("suggest");
+  if (!suggestions.length) { box.innerHTML = '<div><small>No matches</small></div>'; box.style.display = "block"; return; }
+  box.innerHTML = suggestions.map((m, i) =>
+    `<div data-i="${i}" class="${i === selIdx ? "sel" : ""}">${esc(m.title)} <small>${esc(m.genres)}</small></div>`).join("");
+  box.querySelectorAll("div[data-i]").forEach((d) => d.addEventListener("click", () => addLiked(suggestions[+d.dataset.i])));
+  box.style.display = "block";
+}
+function hideSuggest() { $("suggest").style.display = "none"; suggestions = []; }
+
+function addLiked(m) {
+  if (m && !liked.some((x) => x.item === m.item)) liked.push({item: m.item, title: m.title});
+  $("searchBox").value = "";
+  hideSuggest();
+  renderChips();
+}
+function renderChips() {
+  $("chips").innerHTML = liked.map((m, i) =>
+    `<span class="chip">${esc(m.title)} <button title="remove" data-i="${i}">×</button></span>`).join("");
+  $("chips").querySelectorAll("button").forEach((b) => b.addEventListener("click", () => {
+    liked.splice(+b.dataset.i, 1); renderChips();
+  }));
+}
+async function loadPreset(titles) {
+  liked = [];
+  for (const t of titles) {
+    const res = await api(`/api/search?q=${encodeURIComponent(t)}&limit=1`).catch(() => []);
+    if (res.length) addLiked(res[0]);
+  }
+  renderChips();
+  run({liked: liked.map((m) => m.item)});
+}
+$("presetAnim").addEventListener("click", () => loadPreset(PRESETS.anim));
+$("presetSci").addEventListener("click", () => loadPreset(PRESETS.sci));
+$("clearLiked").addEventListener("click", () => { liked = []; renderChips(); });
+
+// ------------------------------------------------------------------ requests
+$("goUser").addEventListener("click", () => {
+  const v = $("userId").value.trim();
+  if (v === "") { showError("Enter a user id, or pick a random user."); return; }
+  run({[$("idKind").value]: parseInt(v, 10)});
+});
+$("userId").addEventListener("keydown", (e) => { if (e.key === "Enter") $("goUser").click(); });
+$("goRandom").addEventListener("click", () => run({seed: Math.floor(Math.random() * 1e9)}));
+document.querySelectorAll("[data-user]").forEach((b) => b.addEventListener("click", () => {
+  $("idKind").value = "user"; $("userId").value = b.dataset.user; run({user: +b.dataset.user});
+}));
+$("goNew").addEventListener("click", () => {
+  if (!liked.length) { showError("Add at least one movie you liked."); return; }
+  run({liked: liked.map((m) => m.item)});
+});
+
+function showError(msg) { $("error").textContent = msg || ""; }
+
+async function run(who) {
+  showError("");
+  const buttons = document.querySelectorAll("button.go");
+  buttons.forEach((b) => b.disabled = true);
+  $("results").innerHTML = '<div class="desc">Scoring the whole catalogue…</div>';
+  $("viewer").innerHTML = "";
+  try {
+    const body = {...who, top_k: parseInt($("topK").value, 10) || 10, compare: $("compare").checked};
+    render(await api("/api/recommend", body));
+  } catch (e) {
+    $("results").innerHTML = "";
+    showError(e.message);
+  } finally {
+    buttons.forEach((b) => b.disabled = false);
+  }
+}
+
+// ------------------------------------------------------------------ rendering
+function render(r) {
+  const v = r.viewer;
+  if (v.kind === "user") {
+    $("userId").value = $("idKind").value === "user" ? v.user : v.movielens_user;
+    $("viewer").innerHTML = `<h2>User ${v.user} <span class="desc">(MovieLens userId ${v.movielens_user})</span></h2>
+      <div class="desc">Liked ${v.num_history} movies before the test period, then ${v.num_future} more in it (hidden from the model).</div>`;
+  } else {
+    $("viewer").innerHTML = `<h2>A new viewer</h2><div class="desc">Described by ${v.num_history} liked movies.` +
+      (r.unmatched.length ? ` Not found: ${esc(r.unmatched.join(", "))}.` : "") + "</div>";
+  }
+
+  const cards = [];
+  cards.push(card("Recent history", "Most recent liked movies, oldest first",
+    `<ul class="hist">${r.history.map((m) => `<li><div class="t"><span>${esc(m.title)}</span></div><div class="g">${esc(m.genres)}</div></li>`).join("")}</ul>`));
+  cards.push(card("ARV-MMoE recommendations", r.model.model, list(r.model, (s) => s.toFixed(3))));
+  if (r.baseline) cards.push(card("Baseline (next-item only)", r.baseline.model, list(r.baseline, (s) => s.toFixed(3))));
+  cards.push(card("Most popular", "What a non-personalised system would show", list(r.popular, (s) => `${Math.round(s)} likes`)));
+  if (r.routing) {
+    cards.push(card("Expert routing", "How the router mixed the experts for this viewer (next-item objective)",
+      `<div class="bars">${r.routing.map((w, i) => `<div class="bar"><span>expert ${i}</span>
+        <div class="track"><div class="fill" style="width:${(w * 100).toFixed(1)}%"></div></div>
+        <span>${w.toFixed(2)}</span></div>`).join("")}</div>`));
+  }
+  $("results").innerHTML = cards.join("");
+}
+
+function card(title, desc, inner) {
+  return `<section class="panel"><h2>${esc(title)}</h2><div class="desc">${esc(desc)}</div>${inner}</section>`;
+}
+
+function list(l, fmt) {
+  const items = l.items.map((m) => `<li class="${m.hit ? "hit" : ""}">
+      <div class="t"><span>${esc(m.title)}</span><span class="s">${fmt(m.score)}</span></div>
+      <div class="g">${esc(m.genres)}</div></li>`).join("");
+  const hits = l.hits === undefined ? "" :
+    `<div class="hits">${l.hits}/${l.items.length} were movies this user liked in the held-out test period</div>`;
+  return `<ol>${items}</ol>${hits}`;
+}
+
+// ------------------------------------------------------------------ init
+api("/api/info").then((i) => {
+  $("modelInfo").textContent = `MovieLens-20M, 10% user sample · ${i.num_users} users, ${i.num_items} movies · Model: ${i.model}`;
+  if (!i.baseline) { $("compare").disabled = true; $("compare").parentElement.title = "baseline checkpoint not found"; }
+}).catch(() => { $("modelInfo").textContent = `Could not reach the server at ${API || location.origin}. Start it with scripts/run_demo_server.sh and open http://127.0.0.1:8000`; });
+</script>
+</body>
+</html>
