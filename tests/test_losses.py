@@ -6,7 +6,6 @@ import pytest
 from configs.config import Config, OBJECTIVE_ORDER
 from training.losses import (
     mask_metadata,
-    SampledSoftmaxLoss,
     NextItemLoss,
     MaskedItemLoss,
     MultiStepLoss,
@@ -32,33 +31,6 @@ def device():
 @pytest.fixture
 def dtype():
     return torch.bfloat16
-
-
-class TestSampledSoftmax:
-    def test_loss_decreases_with_optimizer(self, device, dtype):
-        V, D, B, K = 50, 16, 8, 10
-        item_emb = torch.randn(V, D, device=device, dtype=dtype, requires_grad=True)
-        loss_fn = SampledSoftmaxLoss()
-
-        user_emb = torch.randn(B, D, device=device, dtype=dtype, requires_grad=True)
-        pos_ids = torch.randint(1, V, (B,), device=device)
-        neg_ids = torch.randint(1, V, (B, K), device=device)
-
-        loss = loss_fn(user_emb, pos_ids, neg_ids, item_emb)
-        assert torch.isfinite(loss)
-        assert loss.item() > 0
-
-    def test_high_positive_score_low_loss(self, device, dtype):
-        V, D, B = 10, 8, 4
-        item_emb = torch.eye(V, D, device=device, dtype=dtype)
-        loss_fn = SampledSoftmaxLoss()
-
-        user_emb = item_emb[1:B+1].clone()
-        pos_ids = torch.arange(1, B+1, device=device)
-        neg_ids = torch.randint(B+1, V, (B, 3), device=device)
-
-        loss = loss_fn(user_emb, pos_ids, neg_ids, item_emb)
-        assert loss.item() < 2.0
 
 
 class TestMaskedItemLoss:

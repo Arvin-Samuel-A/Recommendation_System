@@ -377,10 +377,13 @@ def _legacy_fingerprint(cfg):
     """The fingerprint payload as computed before the Amazon fields existed."""
     from training.ablation_runner import (
         TRAINING_SEMANTICS_VERSION, _GRADNORM_ONLY_FIELDS, _DEFAULT_OMITTED_FIELDS,
-        _PATH_FIELDS, _RUN_SELECTION_FIELDS, _RUNTIME_ONLY_FIELDS, POST_TRAINING_ONLY_FIELDS,
+        _PATH_FIELDS, _REMOVED_FIELD_DEFAULTS, _RUN_SELECTION_FIELDS, _RUNTIME_ONLY_FIELDS,
+        POST_TRAINING_ONLY_FIELDS,
     )
 
-    d = {k: v for k, v in asdict(cfg).items() if k not in AMAZON_FIELDS}
+    # The config then still had the LoRA / federated fields, at their defaults.
+    full = {**copy.deepcopy(_REMOVED_FIELD_DEFAULTS), **asdict(cfg)}
+    d = {k: v for k, v in full.items() if k not in AMAZON_FIELDS}
     fields = {
         k: v for k, v in d.items()
         if k not in POST_TRAINING_ONLY_FIELDS and k not in _PATH_FIELDS
@@ -515,7 +518,7 @@ class TestEndToEnd:
         assert os.path.exists(os.path.join(cfg.log_dir, "longtail_t_small.json"))
 
     def test_every_ablation_study_runs_on_the_fixture(self, tiny_amazon_processed_dir, tmp_path):
-        """A-H, including E's per-user LoRA, H3 (empty cold set), H5 and H6, few steps."""
+        """Every study, including H3 (empty cold set) and H5, few steps."""
         from training.ablation_runner import STUDY_CONFIGS, run_ablation
 
         cfg = tiny_amazon_config(tiny_amazon_processed_dir(), str(tmp_path),
@@ -530,8 +533,6 @@ class TestEndToEnd:
         by_label = {a["label"]: a for a in results["H"]}
         assert by_label["H3_cold_start"]["cold_start"]["cold_set"]["num_cold_items"] == 0
         assert "latency" in by_label["H5_latency"]
-        assert by_label["H6_communication"]["communication"]["num_rounds"] == 1
-        assert "personalization" in {a["label"]: a for a in results["E"]}["global_lora"]
         study_json = os.path.join(cfg.ablation_dir, "seed_42")
         assert os.path.isdir(study_json)
         # The Beauty preset keeps no per-epoch snapshot in the backbone store.

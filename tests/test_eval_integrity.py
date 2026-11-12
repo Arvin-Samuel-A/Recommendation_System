@@ -482,29 +482,19 @@ FORWARD_SITES = [
     "run_gradient_diagnostics",
     "benchmark_latency",
     "retrieve_candidates",
-    "train_user_lora",
 ]
 
 
 def _run_forward_site(site: str):
     """Set up a tiny mixed-bf16 model, hook an encoder Linear, call `site` with no caller
     region. Returns the dtypes the hooked Linear produced."""
-    import numpy as np
-
     cfg, model, moe, loss_fns, optimizer, scheduler, rng = _train_setup(
         warmup_runs=1, timed_runs=1, grad_diag_num_batches=1, ann_candidates=10,
-        num_sampled_negatives=8,
     )
     batch = _train_batch(cfg, 3)
     seqs, cands = _eval_inputs(cfg)
 
-    if site == "train_user_lora":
-        from models.lora import inject_lora
-
-        inject_lora(model, cfg.lora_rank)
-
     seen = []
-    # k_proj stays a plain nn.Linear even after LoRA injection (q/v become LoRALinear).
     handle = model.blocks[0].attn.k_proj.register_forward_hook(
         lambda m, a, out: seen.append(out.dtype)
     )
@@ -547,14 +537,6 @@ def _run_forward_site(site: str):
             from models.ann_retrieval import retrieve_candidates
 
             retrieve_candidates(model, seqs, cands[:, 0], cfg, moe_layer=moe)
-        elif site == "train_user_lora":
-            from training.local_train import train_user_lora
-
-            train_user_lora(
-                model, moe, [seqs[0], seqs[1]], [int(cands[0, 0]), int(cands[1, 0])],
-                np.arange(1, cfg.num_items + 1), set(), cfg, torch.device("cpu"),
-                rng=np.random.RandomState(0),
-            )
         else:
             raise AssertionError(site)
     finally:
@@ -570,47 +552,6 @@ def test_forward_site_owns_its_autocast_region(site):
     seen = _run_forward_site(site)
     assert seen, f"{site} never ran the hooked encoder Linear"
     assert all(dt == torch.bfloat16 for dt in seen), f"{site}: {seen}"
-
-
-@pytest.mark.parametrize("mixed_precision", [True, False], ids=["mixed", "pure-bf16"])
-def test_evaluate_user_sees_loaded_lora_adapters(monkeypatch, mixed_precision):
-    """AC-12: evaluate_user -> load_lora_state_dict(non-zero B) -> evaluate_user, all inside
-    one enclosing raw autocast region; the second evaluation reflects the new adapters."""
-    import evaluation.metrics as metrics_mod
-    from models.lora import get_lora_state_dict, inject_lora, load_lora_state_dict
-    from training.local_train import evaluate_user
-
-    cfg = _tiny_cfg(mixed_precision=mixed_precision)
-    model, moe = _tiny_model(cfg)
-    inject_lora(model, cfg.lora_rank)
-    # `score_candidates_batch` puts the model in eval mode but not the MoE layer; without
-    # this the experts' dropout alone would make the two evaluations differ.
-    moe.eval()
-    seqs, cands = _eval_inputs(cfg, n=4)
-
-    recorded = []
-    real = metrics_mod.score_candidates_batch
-
-    def spy(*args, **kwargs):
-        out = real(*args, **kwargs)
-        recorded.append(out.detach().clone())
-        return out
-
-    monkeypatch.setattr(metrics_mod, "score_candidates_batch", spy)
-    new_sd = {
-        k: (torch.randn_like(v) * 0.5 if "lora_B" in k else v)
-        for k, v in get_lora_state_dict(model).items()
-    }
-    with torch.autocast("cpu", dtype=torch.bfloat16):
-        evaluate_user(model, moe, list(seqs), [0] * 4, list(cands), cfg)
-        load_lora_state_dict(model, new_sd)
-        evaluate_user(model, moe, list(seqs), [0] * 4, list(cands), cfg)
-    assert len(recorded) == 2
-    assert not torch.equal(recorded[0], recorded[1]), "the loaded adapters were not used"
-    # Control: re-evaluating without a change reproduces the second scores exactly.
-    with torch.autocast("cpu", dtype=torch.bfloat16):
-        evaluate_user(model, moe, list(seqs), [0] * 4, list(cands), cfg)
-    assert torch.equal(recorded[1], recorded[2])
 
 
 # ---------------------------------------------------------------------------------------

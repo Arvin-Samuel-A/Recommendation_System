@@ -39,12 +39,9 @@ project_root/
 ├── models/                        # All model components
 │   ├── transformer.py             # Backbone + metadata integration
 │   ├── moe.py                     # ARV-MMoE + conventional MMoE
-│   ├── lora.py                    # LoRA injection and utilities
 │   └── ann_retrieval.py           # ANN / brute-force retrieval
 ├── training/                      # Training loops and loss functions
 │   ├── pretrain.py                # Central pretraining
-│   ├── local_train.py             # Local personalization
-│   ├── federated.py               # Federated simulation
 │   ├── losses.py                  # ALL loss functions in one file
 │   ├── gradnorm.py                # GradNorm controller
 │   └── ablation_runner.py         # Ablation studies A–H

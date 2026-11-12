@@ -55,7 +55,7 @@ def test_arm_reusing_a_stored_backbone_is_reseeded_before_building(
     tiny_processed_dir, tmp_path, monkeypatch,
 ):
     """An arm that loads a stored backbone still draws random numbers after training
-    (LoRA init, federated client choice, eval negatives), so it reseeds too -- and before
+    (eval negatives), so it reseeds too -- and before
     `build_model`, whose weight initialisation uses the global generators."""
     import training.pretrain as pretrain
     from training.ablation_runner import run_ablation

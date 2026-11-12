@@ -739,7 +739,7 @@ class TestRescoreScripts:
         ])
         assert result.returncode == 0, result.stdout + result.stderr
         launch = out / "launch"
-        studies = {"h100": ["A", "D", "E", "H"], "aws": ["B", "C", "F", "G"]}
+        studies = {"h100": ["A", "D", "H"], "aws": ["B", "C", "F", "G"]}
         backends = {"h100": "flash_attention_3", "aws": "sdpa"}
         with tarfile.open(out / "code.tar.gz") as tar:
             members = set(tar.getnames())

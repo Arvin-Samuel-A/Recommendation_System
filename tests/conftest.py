@@ -182,11 +182,6 @@ def tiny_config(processed_dir: str, out_dir: str, **overrides) -> Config:
     cfg.pin_memory = False
     cfg.warmup_runs = 1
     cfg.timed_runs = 2
-    cfg.personalization_eval_users = 2
-    cfg.local_epochs = 1
-    cfg.federated_rounds = 1
-    cfg.clients_per_round = 2
-    cfg.federated_eval_examples = 32
     cfg.ablation_eval_examples = 32
     cfg.grad_diag_num_batches = 1
     for key, value in overrides.items():

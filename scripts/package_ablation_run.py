@@ -54,7 +54,7 @@ def parse_args(argv=None):
     p.add_argument("--model", default="t-base", choices=["t-small", "t-base", "t-large"])
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--num-workers", type=int, default=8)
-    p.add_argument("--h100-studies", default="A,D,E,H")
+    p.add_argument("--h100-studies", default="A,D,H")
     p.add_argument("--aws-studies", default="B,C,F,G")
     p.add_argument("--h100-backend", default="flash_attention_3", choices=["flash_attention_3", "sdpa"])
     p.add_argument("--aws-backend", default="sdpa", choices=["flash_attention_3", "sdpa"])
@@ -440,10 +440,8 @@ def render_launch_md(args, data_name: str, manifest: Dict) -> str:
 FALLBACK_HOURS_SEQ_LE_50 = 1.81
 FALLBACK_HOURS_PER_100_POSITIONS = 4.5
 
-#: Rough post-training hours per arm (fixed user/client counts, so not scaled by fraction).
+#: Rough post-training hours per arm (not scaled by the user fraction).
 OVERHEAD_BASE = 0.05
-OVERHEAD_PERSONALIZATION = 0.25
-OVERHEAD_COMMUNICATION = 0.5
 OVERHEAD_GRADIENT = 0.1
 OVERHEAD_EFFICIENCY = 0.05
 
@@ -558,10 +556,6 @@ def arm_overhead_hours(study: str, cfg: Config) -> float:
 
     extras = STUDY_EXTRAS.get(study, ())
     hours = OVERHEAD_BASE
-    if cfg.personalization_mode == "lora" and "personalization" in extras:
-        hours += OVERHEAD_PERSONALIZATION
-    if cfg.system_eval == "communication":
-        hours += OVERHEAD_COMMUNICATION
     if "gradient" in extras:
         hours += OVERHEAD_GRADIENT
     if "efficiency" in extras or cfg.system_eval == "latency":

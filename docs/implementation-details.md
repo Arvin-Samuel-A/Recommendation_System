@@ -12,20 +12,19 @@ How the system is built, as of commit `542135c` (master, 2026-10-18). Every numb
 >
 > Run12's numbers are not comparable with runs under the new protocol. See `steering/architecture.md`.
 
-**ARV-MMoE** is a sequential recommender for MovieLens-20M with five parts:
+**ARV-MMoE** is a sequential recommender for MovieLens-20M with four parts:
 - a causal Transformer backbone;
 - **four training objectives**: next-item, masked-item, multi-step and contrastive;
 - a **Mixture-of-Experts layer with an objective-conditioned router** (Adaptive Routing Vector, "ARV"), so the four objectives share experts but mix them differently;
-- **GradNorm** loss balancing, in a next-item-primary form;
-- **LoRA adapters**, for per-user personalisation and a simulated federated setting.
+- **GradNorm** loss balancing, in a next-item-primary form.
 
 Everything is written by hand in PyTorch 2.x; no recommendation library is used. `configs/config.py` is the single source of truth for hyperparameters, and `main.py` is the command-line entry point for every stage.
 
 ```
 data/       preprocessing, sequence generation, augmentation, tensorised datasets
-models/     Transformer backbone, MoE layer (ARV-MMoE / MMoE / none), LoRA, ANN retrieval
-training/   pretraining loop, losses, GradNorm, gradient projection, LoRA personalisation,
-            federated simulation, ablation runner and rescoring
+models/     Transformer backbone, MoE layer (ARV-MMoE / MMoE / none), ANN retrieval
+training/   pretraining loop, losses, GradNorm, gradient projection, ablation runner and
+            rescoring
 evaluation/ ranking metrics, popularity reference, cold-start, long-tail, latency/FLOPs,
             routing and gradient diagnostics
 scripts/    ablation packaging, timing estimates, retry wrapper, demo
@@ -240,17 +239,15 @@ Three variants (`moe_variant`):
 - **Cold-start (H3):** test rows split by cold/warm target, scored with metadata on and off (the metadata-off forward skips the metadata input entirely).
 - **Long-tail (H4):** items bucketed by training popularity into head (top 20% of the catalogue), mid (next 20%) and tail (bottom 60%, including zero-interaction items).
 - **Latency (H5):** milliseconds per recommendation (20 warmup and 100 timed runs), plus parameter counts and an analytical FLOPs estimate (`evaluation/flops.py`).
-- **Communication (H6):** the federated simulation of §7.2 with byte accounting.
 - **Gradient diagnostics (study D):** cosine similarity and norm of every objective's gradient on the anchor layer, over 10 fresh batches.
 - **Routing diagnostics:** expert-usage entropy and per-objective routing over the validation set.
 
 ### 6.3 Ablation runner (`training/ablation_runner.py`)
-- **Studies:** eight, **A–H**, 33 arms in total:
+- **Studies:** seven (A–D, F–H; E was removed with LoRA), 29 arms in total:
   - A: architecture progression;
   - B: router conditioning;
   - C: ARV vs MMoE;
   - D: routing × GradNorm;
-  - E: personalisation;
   - F: leave-one-objective-out;
   - G: number of experts;
   - H: metadata, sequence length and system evaluations.
@@ -261,25 +258,9 @@ Three variants (`moe_variant`):
 
 ---
 
-## 7. Personalisation and federated simulation
+## 7. Personalisation and federated simulation (removed)
 
-### 7.1 Per-user LoRA (`models/lora.py`, `training/local_train.py`)
-- **Adapters:** LoRA, **rank 8**, on the **query and value projections** of every attention layer.
-  - A is initialised with N(0, 0.02²); B is zero, so a fresh adapter changes nothing.
-  - Everything else is frozen: backbone, MoE experts, router, objective embeddings.
-- **Local training:**
-  - Each of 1,000 evaluation users trains its own adapter for 3 epochs on its **32 most recent training examples**.
-  - The loss is next-item sampled softmax only.
-  - AdamW, lr 1e-3, no weight decay.
-- **Gain:** the user's test NDCG with the adapter minus without it. Adapters are reset between users, and a checksum confirms the frozen weights never change.
-
-### 7.2 Federated LoRA (`training/federated.py`)
-- **Setup:** 20 rounds, **100 clients per round**, sampled from the users.
-- **Each round:** every client loads the global adapter, trains locally and uploads **only its LoRA weights** (80 KB). Weighted FedAvg (weighted by local example count) produces the next global adapter.
-- **Global state:** the backbone and MoE are never sent; they stay frozen.
-- **Monitoring:** each round is scored on a fixed 5,000-row validation subset; the last round is scored on the full validation split.
-
-**Run12 result:** neither per-user LoRA (gain −0.0002 ± 0.047) nor federated rounds improved the model.
+Per-user LoRA adapters (rank 8 on the query and value projections, 3 local epochs on each user's 32 most recent training examples) and a federated simulation (20 rounds, 100 clients, weighted FedAvg of the adapters) were part of the system until 2026-11-12. Neither improved the model: in run12 the per-user gain was −0.0002 ± 0.047, and a later diagnosis on protocol v3 found no setup that helped. The code, study E, study A's sixth arm and study H's communication arm were removed. Their config fields are still hashed at their old defaults, so every stored backbone keeps its training fingerprint.
 
 ---
 

@@ -51,7 +51,7 @@ Contrastive conflicts with next-item on most steps, which fits GradNorm driving 
 - **Config:** `grad_projection = "next_item"`, which requires `use_gradnorm = False` (validated). It uses the static weights `masked_lm_weight`, `multi_step_weight` and `contrastive_weight`, all 1.0 by default. fp16 loss scaling isn't supported. The default `""` leaves every training fingerprint unchanged.
 - **Code:** `training/grad_projection.py` and `train_one_step` in `training/pretrain.py`. Tests are in `tests/test_grad_projection.py`.
 - **Logging:** each epoch line gets `proj_cos_<aux>` (mean cosine before projection) and `proj_frac_<aux>` (fraction of steps projected).
-- **Adding the arm:** add it to study A in `training/ablation_runner.py`, after `arv_mmoe_gradnorm_lora`:
+- **Adding the arm:** add it to study A in `training/ablation_runner.py`, after `arv_mmoe_gradnorm`:
   ```python
   {"label": "arv_mmoe_projection", "use_masked_lm": True, "use_multi_step": True, "use_contrastive": True, "moe_variant": "arv_mmoe", "use_gradnorm": False, "grad_projection": "next_item"},
   ```

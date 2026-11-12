@@ -19,12 +19,11 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname
 logger = logging.getLogger(__name__)
 
 VALID_STAGES = [
-    "preprocess", "pretrain", "personalize", "federated",
+    "preprocess", "pretrain",
     "evaluate", "cold_start", "longtail", "latency",
     "routing_diagnostics", "gradient_diagnostics",
-    # REV-013 / REV-014: multi-seed aggregation (FR-15) and the LoRA-rank sweep that
-    # feeds personalization_gain_vs_lora_rank.png had no entry points at all.
-    "lora_rank_sweep", "multi_seed",
+    # REV-013: multi-seed aggregation (FR-15) had no entry point at all.
+    "multi_seed",
     "ablation", "plots", "all",
     # specs/ablation-run FR-15: assemble study JSON + plots from persisted arm files.
     "ablation_collect",
@@ -60,7 +59,7 @@ def parse_args(argv=None):
         "--max_seq_length", type=int, default=None,
         help="Override max_seq_length (the reference arm's sequence width).",
     )
-    parser.add_argument("--epochs", type=int, default=None, help="Override pretrain_epochs/federated_rounds")
+    parser.add_argument("--epochs", type=int, default=None, help="Override pretrain_epochs")
     parser.add_argument("--batch_size", type=int, default=None, help="Override batch_size")
     parser.add_argument("--moe_variant", default=None, choices=["none", "mmoe", "arv_mmoe"])
     parser.add_argument("--num_experts", type=int, default=None)
@@ -100,28 +99,6 @@ def parse_args(argv=None):
         "--max_steps", type=int, default=None,
         help="Cap training steps per epoch (0 = uncapped). The Phase 17 few-step smoke "
              "gate uses this to exercise run_pretrain end to end on real data.",
-    )
-    # REV-131: the owner's 2026-09-17 smoke-gate decision reduced personalization-federated
-    # AC-05/AC-06 to pipeline-integrity gates at `personalization_eval_users = 10` and
-    # `clients_per_round = 10`, but none of the three parameters had a CLI surface -- so
-    # running that gate meant editing `configs/config.py`, which conventions.md's
-    # "Config-Driven Design" forbids and which would silently change the configured values
-    # every later run inherits. This is the third instance of the same gap, after
-    # `--no_train` (REV-115) and `--max_steps`.
-    # All three default to None so the CONFIGURED values stay authoritative when the flags
-    # are absent -- Phase 14 runs the configured values; the gate is a CLI-time reduction.
-    parser.add_argument(
-        "--eval_users", type=int, default=None,
-        help="Override personalization_eval_users (number of users scored by "
-             "--stage personalize).",
-    )
-    parser.add_argument(
-        "--clients_per_round", type=int, default=None,
-        help="Override clients_per_round for --stage federated.",
-    )
-    parser.add_argument(
-        "--local_epochs", type=int, default=None,
-        help="Override local_epochs for per-user LoRA training.",
     )
     # specs/ablation-run (owner decisions 2026-10-15). Every flag defaults to None/False
     # so the configured values stay authoritative when it is absent.
@@ -247,15 +224,8 @@ def apply_cli_overrides(config: Config, args) -> None:
         "processed_data_dir", Config.processed_data_dir,
     )
     if args.epochs is not None:
-        # REV-031: --epochs always overwrote `pretrain_epochs` and ADDITIONALLY set
-        # `federated_rounds` for the federated stage, so a federated run mutated
-        # pretrain_epochs in the saved manifest. T1.2 maps the flag by stage.
-        if args.stage == "federated":
-            overrides.append(("federated_rounds", config.federated_rounds, args.epochs))
-            config.federated_rounds = args.epochs
-        else:
-            overrides.append(("pretrain_epochs", config.pretrain_epochs, args.epochs))
-            config.pretrain_epochs = args.epochs
+        overrides.append(("pretrain_epochs", config.pretrain_epochs, args.epochs))
+        config.pretrain_epochs = args.epochs
     if args.batch_size is not None:
         overrides.append(("batch_size", config.batch_size, args.batch_size))
         config.batch_size = args.batch_size
@@ -290,23 +260,6 @@ def apply_cli_overrides(config: Config, args) -> None:
             ("max_steps_per_epoch", config.max_steps_per_epoch, args.max_steps)
         )
         config.max_steps_per_epoch = args.max_steps
-    # REV-131: logged original -> new like every other override (code-quality.md).
-    if getattr(args, "eval_users", None) is not None:
-        overrides.append((
-            "personalization_eval_users",
-            config.personalization_eval_users,
-            args.eval_users,
-        ))
-        config.personalization_eval_users = args.eval_users
-    if getattr(args, "clients_per_round", None) is not None:
-        overrides.append(
-            ("clients_per_round", config.clients_per_round, args.clients_per_round)
-        )
-        config.clients_per_round = args.clients_per_round
-    if getattr(args, "local_epochs", None) is not None:
-        overrides.append(("local_epochs", config.local_epochs, args.local_epochs))
-        config.local_epochs = args.local_epochs
-
     # specs/ablation-run T1.2.
     for flag, field_name in (
         ("raw_data_dir", "raw_data_dir"),
@@ -431,16 +384,6 @@ def run_preprocess(config, args):
 def run_pretrain_stage(config, args):
     from training.pretrain import run_pretrain
     return run_pretrain(config, args.model)
-
-
-def run_personalize_stage(config, args):
-    from training.local_train import run_local_personalization
-    return run_local_personalization(config, args.model)
-
-
-def run_federated_stage(config, args):
-    from training.federated import run_federated
-    return run_federated(config, args.model)
 
 
 def run_evaluate_stage(config, args):
@@ -894,8 +837,6 @@ def run_plots_stage(config, args):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    from training.federated import final_val_ndcg
-
     os.makedirs(config.plot_dir, exist_ok=True)
     logger.info("Generating core tradeoff plots from completed evaluation results...")
 
@@ -935,50 +876,7 @@ def run_plots_stage(config, args):
         fig.savefig(os.path.join(config.plot_dir, "accuracy_vs_model_size.png"), dpi=config.plot_dpi)
         plt.close(fig)
 
-    # ---- FR-14 plot 2: accuracy vs communication cost ----------------------
-    # REV-014: only accuracy_vs_model_size was implemented; the other three FR-14
-    # figures had no code at all.
-    comm_points = []
-    for model_name in ["t_small", "t_base", "t_large"]:
-        fed_path = os.path.join(config.log_dir, f"federated_rounds_{model_name}.json")
-        if not os.path.exists(fed_path):
-            continue
-        with open(fed_path) as f:
-            rounds = json.load(f)
-        if not rounds:
-            continue
-        # REV-101(b): FR-14 specifies "Comm cost/round vs NDCG@10". This summed
-        # `total_round_kb` across every round and labelled the axis "Cumulative
-        # communication (KB)", so the ratio between two models changed with how many
-        # rounds each happened to run. `total_round_kb` is already the per-round figure.
-        per_round_kb = rounds[-1].get("total_round_kb", 0.0)
-        # REV-117: the headline federated number is the final round's FULL-SPLIT score,
-        # not the bounded per-round prefix the convergence curve plots.
-        comm_points.append((model_name, per_round_kb, final_val_ndcg(rounds)))
-
-    if comm_points:
-        fig, ax = plt.subplots(figsize=(8, 5))
-        xs = [c for _, c, _ in comm_points]
-        ys = [n for _, _, n in comm_points]
-        ax.scatter(xs, ys)
-        for name, c, n in comm_points:
-            ax.annotate(name, (c, n))
-        ax.set_xlabel("Communication per round (KB)")
-        ax.set_ylabel("Final federated NDCG@10")
-        ax.set_title("Accuracy vs Communication Cost")
-        fig.tight_layout()
-        fig.savefig(
-            os.path.join(config.plot_dir, "accuracy_vs_communication.png"),
-            dpi=config.plot_dpi,
-        )
-        plt.close(fig)
-    else:
-        logger.warning(
-            "accuracy_vs_communication.png skipped: no federated_rounds_*.json found. "
-            "Run --stage federated first."
-        )
-
-    # ---- FR-14 plot 3: accuracy vs FLOPs -----------------------------------
+    # ---- FR-14 plot 2: accuracy vs FLOPs -----------------------------------
     flops = [results[m].get("flops_per_inference", 0) for m in models]
     if any(f > 0 for f in flops):
         fig, ax = plt.subplots(figsize=(8, 5))
@@ -999,78 +897,7 @@ def run_plots_stage(config, args):
             "reports. Re-run --stage latency."
         )
 
-    # ---- FR-14 plot 4: personalization gain vs LoRA rank -------------------
-    rank_points = []
-    for rank in config.lora_rank_grid:
-        gain_path = os.path.join(
-            config.log_dir, f"personalization_gain_rank{rank}_{args.model.replace('-', '_')}.json",
-        )
-        if not os.path.exists(gain_path):
-            continue
-        with open(gain_path) as f:
-            report = json.load(f)
-        gain = report.get("gain", {})
-        rank_points.append((rank, gain.get("mean", 0.0), gain.get("std", 0.0)))
-
-    if rank_points:
-        fig, ax = plt.subplots(figsize=(8, 5))
-        ranks = [r for r, _, _ in rank_points]
-        means = [m for _, m, _ in rank_points]
-        stds = [sd for _, _, sd in rank_points]
-        ax.errorbar(ranks, means, yerr=stds, marker="o", capsize=4)
-        ax.set_xlabel("LoRA rank")
-        ax.set_ylabel("Mean personalization gain (NDCG@10)")
-        ax.set_title("Personalization Gain vs LoRA Rank")
-        ax.set_xticks(ranks)
-        fig.tight_layout()
-        fig.savefig(
-            os.path.join(config.plot_dir, "personalization_gain_vs_lora_rank.png"),
-            dpi=config.plot_dpi,
-        )
-        plt.close(fig)
-    else:
-        logger.warning(
-            "personalization_gain_vs_lora_rank.png skipped: no "
-            "personalization_gain_rank*_%s.json found. Run --stage lora_rank_sweep.",
-            args.model.replace("-", "_"),
-        )
-
     logger.info("Plot generation complete.")
-
-
-def run_lora_rank_sweep_stage(config, args):
-    """Sweep `config.lora_rank_grid`, writing one gain report per rank.
-
-    REV-014: `personalization_gain_vs_lora_rank.png` had no data source -- nothing ever
-    varied `lora_rank` or wrote a per-rank report.
-    """
-    from training.local_train import run_local_personalization
-
-    mn = args.model.replace("-", "_")
-    for rank in config.lora_rank_grid:
-        logger.info("LoRA rank sweep: rank=%d", rank)
-        cfg = copy.deepcopy(config)
-        cfg.lora_rank = rank
-        try:
-            report = run_local_personalization(cfg, args.model)
-        except (FileNotFoundError, KeyError) as exc:
-            logger.warning("  rank=%d skipped: %s", rank, exc)
-            continue
-
-        path = os.path.join(config.log_dir, f"personalization_gain_rank{rank}_{mn}.json")
-        os.makedirs(config.log_dir, exist_ok=True)
-        with open(path, "w") as f:
-            json.dump(
-                {
-                    "lora_rank": rank,
-                    "num_users_evaluated": report["num_users_evaluated"],
-                    "with_lora": {k: float(v) for k, v in report["with_lora"].items()},
-                    "without_lora": {k: float(v) for k, v in report["without_lora"].items()},
-                    "gain": {k: float(v) for k, v in report["gain"].items()},
-                },
-                f, indent=2,
-            )
-        logger.info("  rank=%d mean gain=%.5f", rank, report["gain"]["mean"])
 
 
 def run_multi_seed_stage(config, args):
@@ -1190,8 +1017,6 @@ def _all_pipeline_stages():
     return [
         ("preprocess", run_preprocess),
         ("pretrain", run_pretrain_stage),
-        ("personalize", run_personalize_stage),
-        ("federated", run_federated_stage),
         ("evaluate", run_evaluate_stage),
         ("cold_start", run_cold_start_stage),
         ("longtail", run_longtail_stage),
@@ -1215,15 +1040,12 @@ def run_all_pipeline(config, args):
 STAGE_MAP = {
     "preprocess": run_preprocess,
     "pretrain": run_pretrain_stage,
-    "personalize": run_personalize_stage,
-    "federated": run_federated_stage,
     "evaluate": run_evaluate_stage,
     "cold_start": run_cold_start_stage,
     "longtail": run_longtail_stage,
     "latency": run_latency_stage,
     "routing_diagnostics": run_routing_diagnostics_stage,
     "gradient_diagnostics": run_gradient_diagnostics_stage,
-    "lora_rank_sweep": run_lora_rank_sweep_stage,
     "multi_seed": run_multi_seed_stage,
     "ablation": run_ablation_stage,
     "ablation_collect": run_ablation_collect_stage,

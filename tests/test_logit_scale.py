@@ -20,7 +20,6 @@ from training.losses import (
     InfoNCELoss,
     LogitScale,
     MaskedItemLoss,
-    SampledSoftmaxLoss,
     clamp_logit_scales_,
     learnable_logit_scale_values,
 )
@@ -43,6 +42,26 @@ def _ce_floor(num_candidates: int, scale: float) -> float:
     """The lowest CE over `num_candidates` cosine logits times `scale`: target at +1,
     every other candidate at -1."""
     return math.log(1 + (num_candidates - 1) * math.exp(-2 * scale))
+
+
+class SampledSoftmaxLoss(torch.nn.Module):
+    """Last-position CE over sampled negatives, with a `LogitScale`: the smallest loss
+    that exercises the scale. (The production sampled loss went with the per-user LoRA
+    code; the scale itself is what these tests cover.)"""
+
+    def __init__(self, normalize_embeddings=True, logit_scale=None):
+        super().__init__()
+        assert normalize_embeddings
+        self.logit_scale = logit_scale if logit_scale is not None else LogitScale()
+
+    def forward(self, user, pos_ids, neg_ids, table):
+        norm = torch.nn.functional.normalize
+        user, pos, neg = norm(user, dim=-1), norm(table[pos_ids], dim=-1), norm(table[neg_ids], dim=-1)
+        pos_score = (user * pos).sum(-1, keepdim=True)
+        neg_scores = torch.bmm(neg, user.unsqueeze(-1)).squeeze(-1)
+        logits = self.logit_scale(torch.cat([pos_score, neg_scores], dim=-1))
+        return torch.nn.functional.cross_entropy(
+            logits, torch.zeros(logits.shape[0], dtype=torch.long))
 
 
 def _best_case_next_item(B=3, D=8, num_neg=100):
@@ -282,11 +301,12 @@ class TestFingerprint:
         """The fingerprint payload exactly as computed before the new fields existed."""
         from training.ablation_runner import (
             TRAINING_SEMANTICS_VERSION, POST_TRAINING_ONLY_FIELDS, _PATH_FIELDS,
-            _RUN_SELECTION_FIELDS, _RUNTIME_ONLY_FIELDS,
+            _REMOVED_FIELD_DEFAULTS, _RUN_SELECTION_FIELDS, _RUNTIME_ONLY_FIELDS,
         )
 
+        # The config then still had the LoRA / federated fields, at their defaults.
         fields = {
-            k: v for k, v in asdict(cfg).items()
+            k: v for k, v in {**copy.deepcopy(_REMOVED_FIELD_DEFAULTS), **asdict(cfg)}.items()
             if k not in POST_TRAINING_ONLY_FIELDS and k not in _PATH_FIELDS
             and k not in _RUN_SELECTION_FIELDS and k not in _RUNTIME_ONLY_FIELDS
             and k not in NEW_FIELDS and k not in LATER_DATASET_FIELDS
@@ -303,7 +323,7 @@ class TestFingerprint:
         # they are omitted from the payload like every other new field.
         base.gradnorm_primary_objective, base.gradnorm_aux_budget = "", None
         assert _training_fingerprint(base) == self._legacy_fingerprint(base)
-        for study in ("A", "D", "E"):
+        for study in ("A", "D"):
             for arm in resolve_study_configs(study, base):
                 assert _training_fingerprint(arm) == self._legacy_fingerprint(arm)
 
@@ -444,34 +464,3 @@ class TestCheckpointRoundTrip:
         assert set(ckpt["loss_fns_state_dict"]) == {"multi_step"}
         assert not any("logit_scale" in k for k in ckpt["loss_fns_state_dict"]["multi_step"])
         assert len(ckpt["optimizer_state_dict"]["param_groups"]) == 1
-
-
-def test_lora_local_loss_uses_the_logit_temperature(monkeypatch):
-    import numpy as np
-
-    import training.local_train as lt
-    from models.lora import inject_lora
-    from models.moe import MoELayer
-    from models.transformer import TransformerModel
-
-    cfg = Config()
-    cfg.apply_model_config("t-small")
-    cfg.num_items, cfg.vocab_size, cfg.use_metadata = 20, 22, False
-    cfg.local_epochs = 0
-    cfg.logit_temperature = 0.25
-    captured = {}
-    real = lt.SampledSoftmaxLoss
-
-    def spy(*args, **kwargs):
-        obj = real(*args, **kwargs)
-        captured["scale"] = obj.logit_scale.scale()
-        return obj
-
-    monkeypatch.setattr(lt, "SampledSoftmaxLoss", spy)
-    model = TransformerModel(cfg)
-    for p in model.parameters():
-        p.requires_grad_(False)
-    inject_lora(model, cfg.lora_rank)
-    lt.train_user_lora(model, MoELayer(cfg), [], [], np.arange(1, 21), set(), cfg,
-                       torch.device("cpu"))
-    assert captured["scale"] == pytest.approx(4.0)

@@ -1,3 +1,4 @@
+import copy
 import json
 import inspect
 import os
@@ -14,12 +15,17 @@ from models.transformer import TransformerModel
 
 class TestCLIParsing:
     def test_all_stages_accepted(self):
-        for stage in ["preprocess", "pretrain", "personalize", "federated",
+        for stage in ["preprocess", "pretrain",
                        "evaluate", "cold_start", "longtail", "latency",
                        "routing_diagnostics", "gradient_diagnostics",
                        "ablation", "plots", "all"]:
             args = parse_args(["--stage", stage])
             assert args.stage == stage
+
+    def test_removed_lora_and_federated_stages_are_rejected(self):
+        for stage in ("personalize", "federated", "lora_rank_sweep"):
+            with pytest.raises(SystemExit):
+                parse_args(["--stage", stage])
 
     def test_model_choices(self):
         for model in ["t-small", "t-base", "t-large"]:
@@ -53,62 +59,6 @@ class TestCLIParsing:
         assert config.max_steps_per_epoch == 200
         assert config.pretrain_epochs == 1
 
-    def test_smoke_gate_overrides(self):
-        """REV-131: the owner's reduced personalization/federated gate needs three flags.
-
-        AC-05 and AC-06 were reduced on 2026-09-17 to pipeline-integrity gates at
-        `personalization_eval_users = 10`, `clients_per_round = 10`, `local_epochs = 1`.
-        Without a CLI surface, running that gate means editing `configs/config.py` --
-        which `conventions.md` forbids and which would silently change the configured
-        values every later run inherits. Same shape as `--no_train` (REV-115) and
-        `--max_steps`.
-        """
-        # Absent flags leave the CONFIGURED values authoritative -- Phase 14 runs these.
-        config = Config()
-        apply_cli_overrides(config, parse_args(["--stage", "personalize"]))
-        assert config.personalization_eval_users == 1000
-        assert config.clients_per_round == 100
-        assert config.local_epochs == 3
-
-        config = Config()
-        apply_cli_overrides(config, parse_args(
-            ["--stage", "personalize", "--model", "t-small",
-             "--eval_users", "10", "--local_epochs", "1"]
-        ))
-        assert config.personalization_eval_users == 10
-        assert config.local_epochs == 1
-        assert config.clients_per_round == 100, "untouched flag must not move"
-
-        config = Config()
-        apply_cli_overrides(config, parse_args(
-            ["--stage", "federated", "--model", "t-small",
-             "--clients_per_round", "10", "--epochs", "3"]
-        ))
-        assert config.clients_per_round == 10
-        assert config.federated_rounds == 3, "--epochs maps to rounds for federated"
-        assert config.personalization_eval_users == 1000
-
-    def test_smoke_gate_overrides_are_logged(self, caplog):
-        """code-quality.md: every CLI override logs original -> new."""
-        import logging
-
-        config = Config()
-        args = parse_args(
-            ["--stage", "federated", "--model", "t-small",
-             "--eval_users", "10", "--clients_per_round", "10", "--local_epochs", "1"]
-        )
-        with caplog.at_level(logging.INFO):
-            apply_cli_overrides(config, args)
-        text = caplog.text
-        for field, original, new in (
-            ("personalization_eval_users", 1000, 10),
-            ("clients_per_round", 100, 10),
-            ("local_epochs", 3, 1),
-        ):
-            assert f"CLI override: {field} {original} -> {new}" in text, (
-                f"{field} override was applied but not logged"
-            )
-
     def test_gradnorm_override(self):
         args = parse_args(["--stage", "pretrain", "--no_gradnorm"])
         config = Config()
@@ -118,20 +68,21 @@ class TestCLIParsing:
 
 
 class TestAblationConfigResolution:
-    def test_study_A_produces_6_configs(self):
+    def test_study_A_produces_5_configs(self):
         config = Config()
         configs = resolve_study_configs("A", config)
-        assert len(configs) == 6
+        assert len(configs) == 5
 
     def test_all_studies_produce_expected_count(self):
         config = Config()
         expected = {
-            "A": 6, "B": 2, "C": 2, "D": 4, "E": 3, "F": 4,
+            "A": 5, "B": 2, "C": 2, "D": 4, "F": 4,
             # REV-067: G and H2 are sweeps over config grids, so their arm counts are
             # derived from the config rather than asserted as literals.
             "G": len(config.expert_count_grid),
-            "H": 5 + len(config.sequence_length_grid),
+            "H": 4 + len(config.sequence_length_grid),
         }
+        assert set(expected) == set(STUDY_CONFIGS), "study E was removed with LoRA"
         for study, count in expected.items():
             configs = resolve_study_configs(study, config)
             assert len(configs) == count, f"Study {study}: expected {count}, got {len(configs)}"
@@ -196,51 +147,12 @@ class TestAblationConfigResolution:
         assert configs[3].moe_variant == "arv_mmoe"
         assert configs[4].use_gradnorm is True
 
-    def test_study_A_final_arm_is_federated(self):
-        """REV-100: FR-6 ends A's progression at "+federated"; T2.2 names arm 6
-        "federated ARV-MMoE+GradNorm+LoRA".
-
-        The arm was `personalization_mode="lora"` with no `system_eval`, so nothing in
-        study A ever reached `run_federated` -- the progression's final point was
-        labelled as the federated system while measuring single-machine LoRA
-        personalization. Those are different experiments: federated adds FedAvg across
-        `clients_per_round` clients and the communication cost RQ4 is about.
-        """
-        arm = resolve_study_configs("A", Config())[5]
-        assert arm.system_eval == "communication", (
-            "study A's final arm must route into run_federated"
-        )
-        assert arm.personalization_mode == "lora", "T2.2 names LoRA as well"
-        assert arm.moe_variant == "arv_mmoe"
-        assert arm.use_gradnorm is True
-
-    def test_federated_arm_reuses_the_gradnorm_arm_backbone(self):
-        """`system_eval` is post-training-only, so REV-100's fix must not add a
-        28th-plus training run to `--study all`."""
-        from training.ablation_runner import _training_fingerprint
-
-        arms = resolve_study_configs("A", Config())
-        assert _training_fingerprint(arms[4]) == _training_fingerprint(arms[5]), (
-            "arms 5 and 6 differ only in post-training fields, so they must share "
-            "one trained backbone"
-        )
-
-
 class TestCoreTradeoffPlotAxes:
-    """REV-101: two of FR-14's four figures plotted a different quantity from the one
-    the requirement names.
-
-    (a) FR-14: "`accuracy_vs_model_size.png`: Size MB vs NDCG@10" -- the code plotted
-        `total_parameters` under an axis labelled "Total Parameters".
-    (b) FR-14: "`accuracy_vs_communication.png`: Comm cost/round vs NDCG@10" -- the code
-        plotted the CUMULATIVE cost summed over every round, so the ratio between two
-        models changed with how many rounds each happened to run.
-    These are paper figures: a reader taking the x-axis at face value against the
-    requirement's wording would read a per-round cost off a cumulative axis.
-    """
+    """REV-101: FR-14: "`accuracy_vs_model_size.png`: Size MB vs NDCG@10" -- the code
+    plotted `total_parameters` under an axis labelled "Total Parameters"."""
 
     @staticmethod
-    def _write_inputs(log_dir, per_round_kb=64.0, n_rounds=4):
+    def _write_inputs(log_dir):
         os.makedirs(log_dir, exist_ok=True)
         with open(os.path.join(log_dir, "test_metrics_t_small.json"), "w") as f:
             json.dump({"ndcg": {"mean": 0.21}}, f)
@@ -251,15 +163,6 @@ class TestCoreTradeoffPlotAxes:
                 "model_size_fp32_mb": 45.0,
                 "flops_per_inference": 1.5e9,
             }, f)
-        rounds = [
-            {"round": i, "val_ndcg": 0.10 + 0.01 * i, "val_examples_scored": 5000,
-             "total_round_kb": per_round_kb, "upload_kb": per_round_kb / 8}
-            for i in range(n_rounds)
-        ]
-        rounds[-1]["val_ndcg_full"] = 0.17
-        rounds[-1]["val_examples_scored_full"] = 993_372
-        with open(os.path.join(log_dir, "federated_rounds_t_small.json"), "w") as f:
-            json.dump(rounds, f)
 
     def _run(self, tmp_path):
         from main import run_plots_stage
@@ -296,42 +199,6 @@ class TestCoreTradeoffPlotAxes:
         )
         xs = size_ax.collections[0].get_offsets()[:, 0].tolist()
         assert xs == [22.5], f"expected model_size_bf16_mb on the x axis, got {xs}"
-
-    def test_communication_axis_is_per_round(self, tmp_path):
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-
-        captured = []
-        real_subplots = plt.subplots
-
-        def spy(*args, **kwargs):
-            fig, ax = real_subplots(*args, **kwargs)
-            captured.append(fig)
-            return fig, ax
-
-        plt.subplots = spy
-        try:
-            self._run(tmp_path)
-        finally:
-            plt.subplots = real_subplots
-
-        comm_ax = captured[1].axes[0]
-        label = comm_ax.get_xlabel().lower()
-        assert "round" in label and "cumulative" not in label, (
-            f"FR-14 specifies comm cost PER ROUND; axis reads {comm_ax.get_xlabel()!r}"
-        )
-        offsets = comm_ax.collections[0].get_offsets()
-        xs = offsets[:, 0].tolist()
-        assert xs == [64.0], (
-            f"expected the per-round cost (64.0 KB), got {xs} -- 256.0 would be the "
-            f"cumulative sum across 4 rounds"
-        )
-        # REV-117: the headline y value is the final round's FULL-SPLIT score, not the
-        # bounded prefix the convergence curve plots.
-        ys = offsets[:, 1].tolist()
-        assert ys == [0.17], f"expected val_ndcg_full on the y axis, got {ys}"
-
 
 class TestAblationNoTrainFlag:
     """REV-115: `run_ablation(train=...)` had no CLI surface.
@@ -653,7 +520,7 @@ class TestNamedAblationFigures:
                 {"label": label, "metrics": self._metrics(0.10 + 0.02 * i)}
                 for i, label in enumerate([
                     "single_obj_baseline", "4obj_no_routing", "conv_mmoe",
-                    "arv_mmoe", "arv_mmoe_gradnorm", "arv_mmoe_gradnorm_lora",
+                    "arv_mmoe", "arv_mmoe_gradnorm",
                 ])
             ],
             "C": [
@@ -674,25 +541,6 @@ class TestNamedAblationFigures:
                 }
                 for i, k in enumerate([2, 4, 6, 8])
             ],
-            "E": [
-                {"label": "global_only", "metrics": self._metrics(0.10)},
-                {
-                    "label": "global_lora",
-                    "metrics": self._metrics(0.12),
-                    "personalization": {"per_user_scores": [
-                        {"user_id": u, "ndcg_without_lora": 0.10, "ndcg_with_lora": 0.11}
-                        for u in range(20)
-                    ]},
-                },
-                {
-                    "label": "global_lora_arv",
-                    "metrics": self._metrics(0.13),
-                    "personalization": {"per_user_scores": [
-                        {"user_id": u, "ndcg_without_lora": 0.10, "ndcg_with_lora": 0.125}
-                        for u in range(20)
-                    ]},
-                },
-            ],
         }
 
         for study, results in study_results.items():
@@ -703,7 +551,6 @@ class TestNamedAblationFigures:
             "architecture_progression.png",       # FR-6  / T2.2
             "mmoe_vs_arvmmoe_comparison.png",     # FR-8  / T2.4
             "expert_count_ablation.png",          # FR-12 / T2.8
-            "global_vs_personalized_ablation_E.png",  # FR-10 / T2.6
         ):
             path = tmp_path / filename
             assert path.exists(), f"{filename} was not written"
@@ -824,74 +671,25 @@ class TestNamedAblationFigures:
             plot_fn(config, "t-base", [])
             plot_fn(config, "t-base", [{"label": "x", "status": "failed"}])
 
-    def test_personalization_report_carries_paired_scores(self):
-        """FR-10's third series needs the paired NDCGs, not just the gain."""
-        from training.local_train import _build_report
-
-        results = [
-            {"user_id": 1, "ndcg_with_lora": 0.2, "ndcg_without_lora": 0.1,
-             "gain": 0.1, "is_cold": False},
-            {"user_id": 2, "ndcg_with_lora": 0.3, "ndcg_without_lora": 0.25,
-             "gain": 0.05, "is_cold": True},
-        ]
-        report = _build_report(results, num_users_skipped=0)
-
-        assert "per_user_gains" in report, "the spec-mandated array must be kept"
-        scores = report["per_user_scores"]
-        assert [s["user_id"] for s in scores] == [1, 2]
-        assert scores[0]["ndcg_without_lora"] == 0.1
-        assert scores[0]["ndcg_with_lora"] == 0.2
-
-    def test_scatter_draws_every_series(self, tmp_path):
-        from training.local_train import plot_personalization_scatter
-
-        config = Config()
-        config.plot_dir = str(tmp_path)
-        series = [
-            {"label": name, "results": [
-                {"ndcg_without_lora": 0.1, "ndcg_with_lora": 0.1 + bump}
-                for _ in range(10)
-            ]}
-            for name, bump in (("global_lora", 0.01), ("global_lora_arv", 0.03))
-        ]
-        plot_personalization_scatter(
-            config, "t-base", series, filename="three_series.png",
-        )
-        assert (tmp_path / "three_series.png").exists()
-
-        # A series with no users must not suppress the ones that have data.
-        plot_personalization_scatter(
-            config, "t-base",
-            [{"label": "empty", "results": []}] + series,
-            filename="with_empty.png",
-        )
-        assert (tmp_path / "with_empty.png").exists()
-
-
 class TestSharedBackboneReuse:
     """REV-084: paired arms differing only in post-training fields trained twice.
 
-    Ablation A's arms 5/6 and E's `global_only`/`global_lora` differ only in
-    `personalization_mode`, which `run_pretrain` never reads, so each pair trained two
-    bit-identical models under two checkpoint namespaces -- a full redundant pretraining
-    run per pair, and identical `metrics` that read as a null result for personalization.
+    Arms that differ only in fields `run_pretrain` never reads (H3-H5's `system_eval`)
+    trained bit-identical models under separate checkpoint namespaces -- a full redundant
+    pretraining run per arm.
     """
 
     def test_paired_arms_share_a_training_fingerprint(self):
         from training.ablation_runner import _training_fingerprint
 
         base = Config()
-        a = resolve_study_configs("A", base)
-        a_fps = [_training_fingerprint(c) for c in a]
-        assert a_fps[4] == a_fps[5], (
-            "A5/A6 differ only in personalization_mode and must share a backbone"
-        )
-        assert len(set(a_fps[:5])) == 5, "genuinely different arms must not share"
+        a_fps = [_training_fingerprint(c) for c in resolve_study_configs("A", base)]
+        assert len(set(a_fps)) == 5, "genuinely different arms must not share"
 
-        e = resolve_study_configs("E", base)
-        e_fps = [_training_fingerprint(c) for c in e]
-        assert e_fps[0] == e_fps[1], "E global_only/global_lora must share a backbone"
-        assert e_fps[2] != e_fps[0], "global_lora_arv changes moe_variant, so it retrains"
+        h = {c._study_label: c for c in resolve_study_configs("H", base)}
+        h_fps = {_training_fingerprint(h[k]) for k in ("H3_cold_start", "H4_longtail", "H5_latency")}
+        assert len(h_fps) == 1, "H3-H5 differ only in system_eval and must share a backbone"
+        assert _training_fingerprint(h["H1_no_metadata"]) not in h_fps
 
     def test_only_verified_post_training_fields_are_excluded(self):
         """A wrong exclusion would silently make two different arms share one model."""
@@ -915,7 +713,7 @@ class TestSharedBackboneReuse:
 
         for field in (
             "num_experts", "use_gradnorm", "moe_variant", "max_seq_length",
-            "lora_rank", "seed", "use_masked_lm", "use_contrastive",
+            "seed", "use_masked_lm", "use_contrastive",
             "router_conditioning", "use_metadata",
         ):
             cfg = Config()
@@ -957,7 +755,12 @@ class TestSharedBackboneReuse:
         with open(os.path.join(base.processed_data_dir, "dataset_stats.json"), "w") as f:
             json.dump({"num_items": 100, "num_users": 10, "MASK_ID": 101}, f)
 
-        arms = resolve_study_configs("A", base)[4:6]
+        first = resolve_study_configs("A", base)[4]
+        # The same arm with only a post-training field changed.
+        second = copy.deepcopy(first)
+        second._study_label = "arv_mmoe_gradnorm_eval_seed1"
+        second.ablation_eval_seed = 1
+        arms = [first, second]
         trained = []
 
         def fake_pretrain(cfg, model_name):
@@ -978,10 +781,7 @@ class TestSharedBackboneReuse:
                 patch("evaluation.metrics.load_item_popularity",
                       return_value=torch.zeros(102)), \
                 patch("evaluation.metrics.evaluate_model",
-                      return_value={"ndcg": {"mean": 0.1, "std": 0.0}}), \
-                patch("training.local_train.run_local_personalization", return_value={
-                    "num_users_evaluated": 1, "with_lora": {}, "without_lora": {},
-                    "gain": {}, "per_user_scores": []}):
+                      return_value={"ndcg": {"mean": 0.1, "std": 0.0}}):
             results = [
                 ar._run_single_config(cfg, "t-base", "A", base, True)
                 for cfg in arms
@@ -998,8 +798,8 @@ class TestSharedBackboneReuse:
         assert results[1]["best_val_ndcg"] == 0.42
         assert results[1]["best_epoch"] == 3
         # And the pair stays distinguishable on the dimension it exists to isolate.
-        assert "personalization" not in results[0]
-        assert "personalization" in results[1]
+        assert results[0]["resolved_config"]["ablation_eval_seed"] == 0
+        assert results[1]["resolved_config"]["ablation_eval_seed"] == 1
 
 
 class TestBackboneStore:

@@ -417,54 +417,47 @@ class TestOutputIsolation:
 
     @staticmethod
     def _mock_extras(monkeypatch):
-        import training.federated as federated
-        import training.local_train as local_train
+        import evaluation.cold_start as cold_start
+        import evaluation.longtail as longtail
 
-        def personalization(cfg, model_name):
-            mn = model_name.replace("-", "_")
-            os.makedirs(cfg.log_dir, exist_ok=True)
-            os.makedirs(cfg.plot_dir, exist_ok=True)
-            json.dump({"gain": 0.0}, open(os.path.join(cfg.log_dir, f"personalization_gain_{mn}.json"), "w"))
-            for name in (f"global_vs_personalized_{mn}.png", f"personalization_gain_histogram_{mn}.png"):
-                open(os.path.join(cfg.plot_dir, name), "w").close()
-            return {"num_users_evaluated": 1, "with_lora": {}, "without_lora": {},
-                    "gain": {"mean": 0.0}, "per_user_scores": []}
+        def side_output(kind):
+            def run(model, moe, cfg, run_tag):
+                mn = cfg.model_name.replace("-", "_")
+                os.makedirs(cfg.log_dir, exist_ok=True)
+                os.makedirs(cfg.plot_dir, exist_ok=True)
+                json.dump({}, open(os.path.join(cfg.log_dir, f"{kind}_{mn}.json"), "w"))
+                open(os.path.join(cfg.plot_dir, f"{kind}_{mn}.png"), "w").close()
+                return {}
+            return run
 
-        def federated_run(cfg, model_name):
-            mn = model_name.replace("-", "_")
-            os.makedirs(cfg.log_dir, exist_ok=True)
-            json.dump([], open(os.path.join(cfg.log_dir, f"federated_rounds_{mn}.json"), "w"))
-            return {"round_logs": [{"total_round_kb": 1.0, "upload_kb": 0.5}], "final_val_ndcg": 0.1}
-
-        monkeypatch.setattr(local_train, "run_local_personalization", personalization)
-        monkeypatch.setattr(federated, "run_federated", federated_run)
+        monkeypatch.setattr(cold_start, "run_cold_start_evaluation", side_output("cold_start"))
+        monkeypatch.setattr(longtail, "run_longtail_evaluation", side_output("longtail"))
 
     def test_side_outputs_are_scoped_per_arm(self, tiny_processed_dir, tmp_path, monkeypatch):
         import training.ablation_runner as runner
 
         self._mock_extras(monkeypatch)
         cfg = _cfg(tiny_processed_dir, tmp_path)
-        runner.run_ablation(copy.deepcopy(cfg), "t-small", "E", arms=["global_lora"])
-        runner.run_ablation(copy.deepcopy(cfg), "t-small", "A", arms=["arv_mmoe_gradnorm_lora"])
+        runner.run_ablation(copy.deepcopy(cfg), "t-small", "H", arms=["H3_cold_start"])
+        runner.run_ablation(copy.deepcopy(cfg), "t-small", "H", arms=["H4_longtail"])
 
-        e_dir = os.path.join(cfg.log_dir, "arms", "E_global_lora")
-        a_dir = os.path.join(cfg.log_dir, "arms", "A_arv_mmoe_gradnorm_lora")
-        assert os.path.exists(os.path.join(e_dir, "personalization_gain_t_small.json"))
-        assert os.path.exists(os.path.join(a_dir, "personalization_gain_t_small.json"))
-        assert os.path.exists(os.path.join(a_dir, "federated_rounds_t_small.json"))
-        assert os.path.exists(os.path.join(cfg.plot_dir, "arms", "E_global_lora",
-                                           "global_vs_personalized_t_small.png"))
-        assert not [f for f in os.listdir(cfg.log_dir) if f.startswith(("personalization_gain_", "federated_rounds_"))]
+        cold_dir = os.path.join(cfg.log_dir, "arms", "H_H3_cold_start")
+        tail_dir = os.path.join(cfg.log_dir, "arms", "H_H4_longtail")
+        assert os.path.exists(os.path.join(cold_dir, "cold_start_t_small.json"))
+        assert os.path.exists(os.path.join(tail_dir, "longtail_t_small.json"))
+        assert os.path.exists(os.path.join(cfg.plot_dir, "arms", "H_H3_cold_start",
+                                           "cold_start_t_small.png"))
+        assert not [f for f in os.listdir(cfg.log_dir) if f.startswith(("cold_start_", "longtail_"))]
 
         # Without --arms the paths are as before.
         base = copy.deepcopy(cfg)
-        arm = runner.resolve_study_configs("E", base)[1]
-        assert arm._study_label == "global_lora"
-        result = runner._run_single_config(arm, "t-small", "E", base, True)
+        (arm,) = [a for a in runner.resolve_study_configs("H", base)
+                  if a._study_label == "H3_cold_start"]
+        result = runner._run_single_config(arm, "t-small", "H", base, True)
         assert result["status"] == "ok" and result["shared_backbone_with"]
-        assert os.path.exists(os.path.join(cfg.log_dir, "personalization_gain_t_small.json"))
+        assert os.path.exists(os.path.join(cfg.log_dir, "cold_start_t_small.json"))
         # The arm's recorded config keeps the study's dirs either way.
-        persisted = json.load(open(runner._arm_path(cfg, "E", "t-small", "global_lora")))
+        persisted = json.load(open(runner._arm_path(cfg, "H", "t-small", "H3_cold_start")))
         assert persisted["resolved_config"]["log_dir"] == cfg.log_dir
 
     def test_run_config_is_atomic_and_records_the_selection(self, tiny_processed_dir, tmp_path, monkeypatch):

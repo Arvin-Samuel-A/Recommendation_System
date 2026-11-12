@@ -15,7 +15,7 @@ RUN_PRETRAIN_ARTIFACTS = (
     "preprocessing_manifest.json",
 )
 
-#: Read by evaluation, cold-start, long-tail, personalization and federated stages.
+#: Read by the evaluation, cold-start and long-tail stages.
 DOWNSTREAM_ARTIFACTS = (
     "test_tensorised.pt",
     "global_negative_pool.npy",

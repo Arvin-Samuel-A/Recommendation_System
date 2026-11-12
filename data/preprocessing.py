@@ -754,10 +754,9 @@ def run_preprocessing(config: Config) -> None:
     with open(os.path.join(processed, "eval_user_history.pkl"), "wb") as f:
         pickle.dump(eval_user_history, f)
 
-    # REV-002: the example dicts were tensorised but never persisted. Four downstream
-    # modules (cold_start, longtail, local_train, federated) open
-    # `test_examples.pkl` unconditionally, so all four raised FileNotFoundError on
-    # their first line of work and `--stage all` aborted at the personalize stage.
+    # REV-002: the example dicts were tensorised but never persisted. The cold-start and
+    # long-tail evaluations open `test_examples.pkl` unconditionally, so they raised
+    # FileNotFoundError on their first line of work.
     for name, examples in (
         ("val_examples.pkl", val_examples),
         ("test_examples.pkl", test_examples),

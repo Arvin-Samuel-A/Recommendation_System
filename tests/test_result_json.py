@@ -1,7 +1,6 @@
 """Result payloads are plain JSON, so an arm that trained to completion is never lost at
-write time (AWS ablation on c094b2c: every LoRA arm -- A:arv_mmoe_gradnorm_lora,
-E:global_lora, E:global_lora_arv -- trained, then failed in `atomic_write_json` with
-`TypeError: Object of type int32 is not JSON serializable`)."""
+write time (AWS ablation on c094b2c: arms trained, then failed in `atomic_write_json`
+with `TypeError: Object of type int32 is not JSON serializable`)."""
 import json
 import logging
 import os
@@ -62,44 +61,23 @@ def test_atomic_write_json_writes_numpy_payload_and_warns(tmp_path, caplog):
     assert not [f for f in os.listdir(tmp_path) if ".tmp-" in f]
 
 
-def test_personalization_report_is_plain():
-    from training.local_train import _build_report
-
-    results = [
-        {"user_id": 3, "ndcg_with_lora": 0.5, "ndcg_without_lora": 0.25, "gain": 0.25,
-         "is_cold": False},
-        {"user_id": 9, "ndcg_with_lora": 0.1, "ndcg_without_lora": 0.2, "gain": -0.1,
-         "is_cold": True},
-    ]
-    _, leaks = to_plain_json(_build_report(results, num_users_skipped=1))
-    assert leaks == [], leaks
-
-
-def test_lora_arm_with_personalization_is_written_ok(tiny_processed_dir, tmp_path):
-    """The failing path end to end: a LoRA arm with personalisation extras, run through
-    `run_ablation`, persists its arm JSON with status "ok"."""
+def test_arm_with_extras_is_written_ok(tiny_processed_dir, tmp_path):
+    """End to end: an arm with post-training extras (B's routing diagnostics), run
+    through `run_ablation`, persists a plain-JSON arm record with status "ok"."""
     from training.ablation_runner import _arm_path, run_ablation
 
     cfg = tiny_config(
         tiny_processed_dir(), str(tmp_path),
         pretrain_epochs=1, max_steps_per_epoch=2, ablation_eval_examples=32,
     )
-    results = run_ablation(cfg, "t-small", "E", arms=["global_lora"])
+    results = run_ablation(cfg, "t-small", "B", arms=["input_only"])
 
-    (record,) = results["E"]
+    (record,) = results["B"]
     assert record["status"] == "ok", record.get("error")
-    scores = record["personalization"]["per_user_scores"]
-    assert scores, "the tiny fixture must evaluate at least one user"
     # The source emits plain types; the writer's conversion is only a safety net.
     _, leaks = to_plain_json(record)
     assert leaks == [], leaks
 
-    with open(_arm_path(cfg, "E", "t-small", "global_lora")) as f:
+    with open(_arm_path(cfg, "B", "t-small", "input_only")) as f:
         stored = json.load(f)
     assert stored["status"] == "ok"
-    assert all(type(s["user_id"]) is int for s in stored["personalization"]["per_user_scores"])
-
-    gain_path = os.path.join(cfg.log_dir, "arms", "E_global_lora", "personalization_gain_t_small.json")
-    with open(gain_path) as f:
-        report = json.load(f)
-    assert all(type(g["user_id"]) is int for g in report["per_user_gains"])

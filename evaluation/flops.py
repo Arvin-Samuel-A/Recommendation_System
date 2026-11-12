@@ -8,7 +8,6 @@ import numpy as np
 import torch
 
 from configs.config import Config
-from models.lora import count_lora_parameters
 from data.sequence_generator import load_metadata_matrix
 from models.moe import MoELayer
 from utils import autocast_context, get_device
@@ -178,7 +177,6 @@ def estimate_flops_per_inference(config: Config, moe_layer: Optional[MoELayer] =
 def count_parameters(model: torch.nn.Module, moe_layer: Optional[MoELayer] = None) -> Dict[str, int]:
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    lora = count_lora_parameters(model)
 
     router_params = 0
     expert_params = 0
@@ -195,7 +193,6 @@ def count_parameters(model: torch.nn.Module, moe_layer: Optional[MoELayer] = Non
     return {
         "total_parameters": all_params,
         "trainable_parameters": trainable + (sum(p.numel() for p in moe_layer.parameters() if p.requires_grad) if moe_layer else 0),
-        "lora_parameters": lora,
         "router_parameters": router_params,
         "expert_parameters": expert_params,
         # REV-021b: FR-7 requires BOTH sizes as named fields. `model_size_mb` was a

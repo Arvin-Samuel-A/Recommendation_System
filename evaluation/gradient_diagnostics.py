@@ -21,7 +21,7 @@ def gradient_cosine_similarity(
     # diagonal of [1.00078, 1.00391, 0.99844, 1.00078], three entries of which are outside
     # the range a cosine similarity can take. This is one temporary copy on a diagnostic
     # path that runs rarely, and it is the same fp32-at-the-measurement-site pattern
-    # `routing_diagnostics` and `local_train` already use.
+    # `routing_diagnostics` already uses.
     grads = {}
     for name, loss in per_objective_losses.items():
         g = torch.autograd.grad(

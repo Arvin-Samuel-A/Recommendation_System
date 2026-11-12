@@ -80,7 +80,8 @@ RUNTIME_FIELDS = (
 #: Weight-dependent extras computed from the ORIGINAL best.pt with the defective pipeline;
 #: moved under `rescore.pre_rescore_extras` so no plot or table reads them as current
 #: (FR-8.6). Weight-independent fields (router_parameters, latency, parameters,
-#: flops_per_inference) stay at the top level.
+#: flops_per_inference) stay at the top level. "personalization" and "communication" come
+#: only from arm results written before the LoRA / federated code was removed.
 WEIGHT_DEPENDENT_EXTRAS = (
     "routing", "gradient", "cold_start", "longtail", "personalization", "communication",
 )

@@ -2,7 +2,7 @@
 
 ## System Overview
 
-ARV-MMoE is a communication-efficient multi-objective federated sequential recommendation system. It trains a Transformer-based sequential recommender with four objectives, routes per-objective representations through a shared Mixture-of-Experts layer with adaptive routing, balances objective gradients dynamically via GradNorm, and personalizes via LoRA adapters in a federated simulation.
+ARV-MMoE is a multi-objective sequential recommendation system. It trains a Transformer-based sequential recommender with four objectives, routes per-objective representations through a shared Mixture-of-Experts layer with adaptive routing, and balances objective gradients dynamically via GradNorm. (Per-user LoRA personalization and the federated simulation were removed on 2026-11-12: they gave no gain.)
 
 ## Technology Stack
 
@@ -23,9 +23,9 @@ ARV-MMoE is a communication-efficient multi-objective federated sequential recom
 
 ```
 data/              → Preprocessing, sequence generation, augmentation, tensorisation
-models/            → Transformer backbone, ARV-MMoE/MMoE, LoRA, ANN retrieval
-training/          → Pretraining loop, local personalization, federated simulation,
-                     loss functions, GradNorm, ablation runner
+models/            → Transformer backbone, ARV-MMoE/MMoE, ANN retrieval
+training/          → Pretraining loop, loss functions, GradNorm, gradient projection,
+                     ablation runner and rescoring
 evaluation/        → Metrics, cold-start, long-tail, latency, routing/gradient diagnostics
 configs/config.py  → Single source of truth for all hyperparameters
 utils.py           → Device helper, seed utilities
@@ -39,7 +39,7 @@ Raw CSVs (Kaggle)
   → Preprocessing (every rating kept, ID remapping, metadata extraction, cold-start holdout)
   → Leave-one-out split per user: last item → test, second-to-last → val, rest → train
   → Val/test rows (one per user, left-padded context, tensorised); train stays per-user histories
-  → Global negative pool (warm items only, deterministic; per-user LoRA training only)
+  → Global negative pool (warm items only, deterministic; built and recorded, read by no training)
 
 Stored vs. model sequence width:
   Val/test rows are stored at max(sequence_length_grid ∪ {max_seq_length}) (recorded as
@@ -76,7 +76,6 @@ Serving:
 |---|---|
 | Config ↔ Code | Config is the single source of truth; no hardcoded hyperparameters elsewhere |
 | Training ↔ Evaluation | Test data untouched until model configuration and best checkpoint are frozen |
-| Global ↔ Local (federated) | Only LoRA adapter state crosses the wire; backbone, MoE, router, experts, objective embeddings are frozen global state |
 | MoE variants | `moe_variant="none"` is a fully working direct-hidden-state path; `"mmoe"` uses independent per-objective gates; `"arv_mmoe"` uses the shared objective-conditioned router |
 | Preprocessing ↔ Model | ID scheme (pad=0, items=1..N, mask=N+1) is enforced at preprocessing and respected everywhere |
 
@@ -85,8 +84,7 @@ Serving:
 1. **Shared experts, differentiated routing.** The K expert FFN outputs are computed once per forward pass and reused by all four objectives — only the mixture weights r_{u,t} differ per objective.
 2. **Routing granularity follows the objective.** Objectives that predict at every position (next-item, multi-step) route each position from its own causal hidden state, so no position's routing has seen the items after it; at the last position this equals pooled routing, so serving is unchanged. MIM and contrastive keep one distribution computed from pooled H_u (the last position), broadcast across positions.
 3. **e_rec ≡ e_next at inference.** No separate inference-only embedding; the next-item objective embedding serves double duty.
-4. **LoRA-only federated communication.** Router, experts, objective embeddings, and GradNorm state remain global/frozen during local training.
-5. **GradNorm on shared Transformer anchor.** The anchor is the last shared Transformer block (before optional MoE), ensuring it exists in every model variant.
+4. **GradNorm on shared Transformer anchor.** The anchor is the last shared Transformer block (before optional MoE), ensuring it exists in every model variant.
 
 ## Run Execution (long runs on shared GPUs)
 

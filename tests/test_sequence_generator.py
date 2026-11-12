@@ -499,8 +499,6 @@ class TestNarrowedReadersRunEndToEnd:
         import main as cli
         from evaluation.cold_start import run_cold_start_evaluation
         from evaluation.longtail import run_longtail_evaluation
-        from training.federated import run_federated
-        from training.local_train import run_local_personalization
         from training.pretrain import build_model, load_checkpoint, run_pretrain
         from tests.conftest import tiny_config
 
@@ -520,12 +518,6 @@ class TestNarrowedReadersRunEndToEnd:
         assert os.path.exists(os.path.join(cfg.log_dir, "test_metrics_t_small.json"))
         assert cli.run_routing_diagnostics_stage(cfg, args)
         assert cli.run_gradient_diagnostics_stage(cfg, args)
-
-        report = run_local_personalization(cfg, "t-small")
-        assert report["num_users_evaluated"] > 0
-
-        fed = run_federated(cfg, "t-small")
-        assert len(fed["round_logs"]) == 1
 
         model, moe = build_model(cfg)
         load_checkpoint(os.path.join(cfg.model_checkpoint_dir(), "best.pt"), model, moe)

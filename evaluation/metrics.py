@@ -230,9 +230,9 @@ def _user_embeddings(
     autocast OFF, even when the caller has a region open.
     """
     model.eval()
-    # The MoE layer is a separate module, so `model.eval()` doesn't reach it. Callers
-    # that never switched it (per-user personalization) scored with expert dropout on,
-    # so the with/without-LoRA NDCG of the same frozen model differed run to run.
+    # The MoE layer is a separate module, so `model.eval()` doesn't reach it. A caller
+    # that never switched it would score with expert dropout on, so the NDCG of the same
+    # frozen model would differ run to run.
     if moe_layer is not None:
         moe_layer.eval()
     with torch.no_grad():

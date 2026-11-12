@@ -34,8 +34,7 @@ def normalize_item_table(
     Deliberately NOT cached across steps: the result is part of the step's autograd
     graph. A `_version`-keyed cache would serve a freed graph wherever the embedding is
     not updated between calls -- `evaluation/gradient_diagnostics.py` calls these losses
-    repeatedly with no optimizer step at all, and LoRA personalization freezes the
-    backbone entirely.
+    repeatedly with no optimizer step at all.
     """
     return l2_normalize(item_emb_weight) if normalize else None
 
@@ -233,41 +232,6 @@ class NextItemLoss(nn.Module):
             item_emb_weight, normalized_item_emb, self.normalize_embeddings,
         )
         return full_softmax_cross_entropy(h, targets[valid], w, self.logit_scale)
-
-
-class SampledSoftmaxLoss(nn.Module):
-    """Last-position next-item loss over sampled negatives. Used by per-user LoRA
-    training (local and federated); pretraining uses `NextItemLoss`."""
-
-    def __init__(self, normalize_embeddings: bool = False,
-                 logit_scale: Optional[LogitScale] = None):
-        # REV-049: the number of negatives is implied by `neg_ids.shape[-1]` and is not a
-        # constructor argument. `training/local_train.py` used to pass it positionally,
-        # which raised TypeError on the first call and blocked every personalization run.
-        super().__init__()
-        self.normalize_embeddings = normalize_embeddings
-        self.logit_scale = _scale_or_identity(logit_scale)
-
-    def forward(
-        self,
-        user_emb: torch.Tensor,
-        pos_ids: torch.Tensor,
-        neg_ids: torch.Tensor,
-        item_emb_weight: torch.Tensor,
-    ) -> torch.Tensor:
-        pos_emb = item_emb_weight[pos_ids]
-        neg_emb = item_emb_weight[neg_ids]
-
-        user_emb = _maybe_normalize(user_emb, self.normalize_embeddings)
-        pos_emb = _maybe_normalize(pos_emb, self.normalize_embeddings)
-        neg_emb = _maybe_normalize(neg_emb, self.normalize_embeddings)
-
-        pos_score = (user_emb * pos_emb).sum(dim=-1, keepdim=True)
-        neg_scores = torch.bmm(neg_emb, user_emb.unsqueeze(-1)).squeeze(-1)
-
-        logits = self.logit_scale(torch.cat([pos_score, neg_scores], dim=-1))
-        labels = torch.zeros(logits.shape[0], dtype=torch.long, device=logits.device)
-        return F.cross_entropy(logits, labels)
 
 
 class MaskedItemLoss(nn.Module):

@@ -24,7 +24,7 @@ Full MovieLens-20M training is forbidden until ALL of the following pass:
 | 10 | Loss-function unit tests (all four + GradNorm) | Training |
 | 11 | ARV-MMoE / conventional MMoE shape and sharing tests | MoE training |
 | 12 | GradNorm active-objective / lambda / anchor tests | GradNorm training |
-| 13 | LoRA exact-key / global-freeze tests | Personalization |
+| 13 | (removed 2026-11-12 with the LoRA / federated code) | — |
 | 14 | Evaluation metric toy tests (NDCG, MRR, Recall, Precision) | Evaluation |
 | 15 | ANN target force-inclusion toy test | ANN evaluation |
 | 16 | One-batch end-to-end smoke test on Mac | Full training |
@@ -44,7 +44,6 @@ gate on `scripts/verify_attention_backend.py --backend sdpa`.
 - Multi-step targets at causal positions S-1-step
 - Negative pool contains only warm items, excludes pad/mask
 - Loss functions produce expected gradients on toy inputs
-- LoRA state dict keys match `lora_`/`.A`/`.B` pattern only
 - GradNorm lambda renormalization preserves sum constraint
 - NDCG/MRR/Recall/Precision on known ranking inputs, **including deliberately tied scores**: ties must never favour the target (`specs/eval-integrity` FR-2)
 - Scores returned by evaluation are fp32 under mixed precision
@@ -100,8 +99,6 @@ These assertions must be active during all training/evaluation:
 - `train_user_history is not eval_user_history`
 - `cold_item_set.isdisjoint(train_interacted_items)`
 - GradNorm: `sum(active_lambdas) == num_active_objectives` within tolerance
-- LoRA state dict: no keys starting with `moe.router`, `moe.experts`, `moe.objective_embeddings`, `moe.gates`
-- Federated: global frozen-state checksum unchanged through every round
 - All losses, lambdas, and gradients are finite
 - Evaluation scores are fp32 (`score_candidates_batch` asserts it); ranking metrics reject NaN scores
 

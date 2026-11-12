@@ -1,8 +1,8 @@
-# ARV-MMoE: Communication-Efficient Multi-Objective Federated Sequential Recommendation with Adaptive Expert Routing
+# ARV-MMoE: Multi-Objective Sequential Recommendation with Adaptive Expert Routing
 
 > VIT Chennai — Project Report, August 2026
 
-A federated sequential recommendation system that combines a Transformer backbone with Adaptive Routing Vector Mixture-of-Experts (ARV-MMoE), GradNorm dynamic loss balancing, and LoRA-based personalization. Trained and evaluated on MovieLens-20M.
+A sequential recommendation system that combines a Transformer backbone with Adaptive Routing Vector Mixture-of-Experts (ARV-MMoE) and GradNorm dynamic loss balancing. Trained and evaluated on MovieLens-20M and Amazon Beauty 2014.
 
 ---
 
@@ -20,7 +20,6 @@ A federated sequential recommendation system that combines a Transformer backbon
 - [Model Variants](#model-variants)
 - [Training Objectives](#training-objectives)
 - [MoE Routing Variants](#moe-routing-variants)
-- [Federated Personalization](#federated-personalization)
 - [Evaluation Protocol](#evaluation-protocol)
 - [Ablation Studies A–H](#ablation-studies-ah)
 - [Outputs & Deliverables](#outputs--deliverables)
@@ -40,8 +39,7 @@ A federated sequential recommendation system that combines a Transformer backbon
 | **RQ1** | Does multi-objective training improve sequential recommendation over single-objective? | Ablation A (configs 1 vs 2) |
 | **RQ2** | Does ARV-MMoE's objective-conditioned routing outperform conventional MMoE and no-routing baselines? | Ablations A, B, C |
 | **RQ3** | Do ARV-MMoE and GradNorm reduce gradient interference, and are their effects complementary? | Ablation D + gradient diagnostics |
-| **RQ4** | Can federated LoRA personalization achieve competitive accuracy with communication-efficient payloads? | Ablation A (config 6), Ablation E, communication accounting |
-| **RQ5** | What is the inference latency overhead of the routing layer? | Latency benchmarking, efficiency report |
+| **RQ4** | What is the inference latency overhead of the routing layer? | Latency benchmarking, efficiency report |
 
 ---
 
@@ -109,13 +107,10 @@ project_root/
 ├── models/
 │   ├── transformer.py              ← Backbone with attention backends, metadata integration
 │   ├── moe.py                      ← ARV-MMoE, conventional MMoE, shared experts
-│   ├── lora.py                     ← LoRA injection, state dict utilities
 │   └── ann_retrieval.py            ← Optional ANN / brute-force retrieval
 │
 ├── training/
 │   ├── pretrain.py                 ← Central pretraining loop, LR scheduling, checkpointing
-│   ├── local_train.py              ← 1000-user local personalization
-│   ├── federated.py                ← Federated simulation, weighted FedAvg
 │   ├── losses.py                   ← All 4 loss functions
 │   ├── gradnorm.py                 ← GradNorm dynamic loss balancing
 │   └── ablation_runner.py          ← Config-driven ablation studies A–H
@@ -198,7 +193,7 @@ Run the complete pipeline (preprocessing through final plots) for a single model
 python main.py --stage all --model t-base
 ```
 
-This executes: preprocess → pretrain → personalize → federated → evaluate → cold_start → longtail → latency → routing_diagnostics → gradient_diagnostics → plots.
+This executes: preprocess → pretrain → evaluate → cold_start → longtail → latency → routing_diagnostics → gradient_diagnostics → plots.
 
 The ablation suite is **not** included in `--stage all` — it must be run explicitly.
 
@@ -216,12 +211,6 @@ python main.py --stage pretrain --model t-base --epochs 5 --batch_size 128
 
 # Train with specific MoE variant
 python main.py --stage pretrain --model t-base --moe_variant arv_mmoe --use_gradnorm
-
-# Local personalization (1000-user sample)
-python main.py --stage personalize --model t-base
-
-# Federated simulation
-python main.py --stage federated --model t-base
 
 # Evaluation (skips gracefully if no checkpoint exists)
 python main.py --stage evaluate --model t-base
@@ -255,9 +244,9 @@ Each ablation is config-driven — no source code edits required.
 
 | Flag | Values | Description |
 |---|---|---|
-| `--stage` | `preprocess`, `pretrain`, `personalize`, `federated`, `evaluate`, `cold_start`, `longtail`, `latency`, `routing_diagnostics`, `gradient_diagnostics`, `ablation`, `ablation_collect`, `plots`, `all` | Pipeline stage to run (`ablation_collect`: assemble study JSON + plots from persisted arms, train nothing; exit 1 if a study is incomplete) |
+| `--stage` | `preprocess`, `pretrain`, `evaluate`, `cold_start`, `longtail`, `latency`, `routing_diagnostics`, `gradient_diagnostics`, `ablation`, `ablation_collect`, `plots`, `all` | Pipeline stage to run (`ablation_collect`: assemble study JSON + plots from persisted arms, train nothing; exit 1 if a study is incomplete) |
 | `--model` | `t-small`, `t-base`, `t-large` | Model size variant |
-| `--epochs` | integer | Override `pretrain_epochs` (pretrain) or `federated_rounds` (federated) |
+| `--epochs` | integer | Override `pretrain_epochs` |
 | `--batch_size` | integer | Override `batch_size` for all stages |
 | `--moe_variant` | `none`, `mmoe`, `arv_mmoe` | Override MoE routing variant |
 | `--num_experts` | integer | Override number of experts (K) |
@@ -269,7 +258,6 @@ Each ablation is config-driven — no source code edits required.
 | `--dtype` | `bf16`, `fp16` | Compute dtype (`fp16` requires `--mixed_precision`) |
 | `--mixed_precision` | flag | fp32 master weights + autocast in `--dtype`; experiment runs use `--dtype bf16 --mixed_precision` |
 | `--max_steps` | integer | Cap optimizer steps per epoch (0 = uncapped) |
-| `--eval_users`, `--clients_per_round`, `--local_epochs` | integer | Personalization / federated overrides |
 | `--user_sample_fraction` | float in (0, 1] | Keep a seeded random fraction of users; below 1 the processed dir becomes `data/processed_users{pct}pct` |
 | `--user_sample_seed` | integer | Seed of the user sample (independent of `--seed`; non-default adds `_seed{S}` to the dir) |
 | `--sequence_length_grid` | integers | Ablation H2 lengths; preprocessing stores every split at `max(grid + [max_seq_length])` |
@@ -449,23 +437,6 @@ ARV-MMoE computes K shared expert outputs once per forward pass. Each objective 
 
 ---
 
-## Federated Personalization
-
-The federated setting personalizes a globally pretrained model using LoRA adapters:
-
-1. **Global pretraining**: Train the full model centrally (Transformer + MoE + GradNorm)
-2. **LoRA injection**: Replace Q and V attention projections with low-rank adapters
-3. **Local training**: Each client trains only LoRA parameters (backbone, MoE, router, experts, and objective embeddings are frozen)
-4. **Aggregation**: Weighted FedAvg on LoRA state dicts (weighted by client sample count)
-5. **Communication**: Only LoRA adapter weights cross the wire — backbone and MoE parameters are never transmitted
-
-**Parameter isolation guarantees:**
-- Backbone checksum verified before and after every federated round
-- LoRA state dict explicitly filtered to exclude MoE/router/expert/objective-embedding keys
-- Zero trainable backbone parameters asserted before each local training run
-
----
-
 ## Evaluation Protocol
 
 ### Metrics
@@ -497,14 +468,13 @@ Each user's last interaction is the test target and the second-to-last the valid
 
 | Study | Question | Configurations |
 |---|---|---|
-| **A** | Architecture progression | 6 configs: single-obj → +multi-obj → +MMoE → +ARV → +GradNorm → +federated |
+| **A** | Architecture progression | 5 configs: single-obj → +multi-obj → +MMoE → +ARV → +GradNorm |
 | **B** | Routing formulation | `objective_conditioned` vs `input_only` router conditioning |
 | **C** | MMoE vs ARV-MMoE | Conventional per-objective gates vs shared conditioned router |
 | **D** | ARV vs GradNorm | 2×2 grid: {no routing, ARV} × {no GradNorm, GradNorm} |
-| **E** | Personalization | Global only, +LoRA, +LoRA+ARV |
 | **F** | Objective ablation | Full system vs remove each auxiliary objective |
 | **G** | Expert count | K ∈ {2, 4, 6, 8} |
-| **H** | System-level | H1: metadata, H2: seq length, H3: cold-start, H4: long-tail, H5: latency, H6: communication |
+| **H** | System-level | H1: metadata, H2: seq length, H3: cold-start, H4: long-tail, H5: latency |
 
 All ablations are config-driven and executed via:
 
@@ -530,8 +500,6 @@ Results are saved to `outputs/ablations/{study}_{model}.json` with full resolved
 | File | Content |
 |---|---|
 | `outputs/logs/pretrain_{model}.log` | Per-epoch training loss, val metrics, LR, GradNorm lambdas |
-| `outputs/logs/personalization_gain_{model}.json` | Per-user LoRA personalization gains |
-| `outputs/logs/federated_rounds_{model}.json` | Per-round val NDCG, communication cost |
 | `outputs/logs/cold_start_{model}.json` | Cold/warm × metadata ON/OFF metrics |
 | `outputs/logs/longtail_{model}.json` | Head/mid/tail metrics |
 | `outputs/logs/efficiency_{model}.json` | Parameter counts, latency stats, model sizes |
@@ -546,14 +514,10 @@ Results are saved to `outputs/ablations/{study}_{model}.json` with full resolved
 | File | Content |
 |---|---|
 | `accuracy_vs_model_size.png` | NDCG@10 vs model size (BF16 MB) |
-| `accuracy_vs_communication.png` | NDCG@10 vs communication cost/round |
 | `accuracy_vs_flops.png` | NDCG@10 vs FLOPs |
-| `personalization_gain_histogram_{model}.png` | Distribution of per-user NDCG gains |
-| `global_vs_personalized_{model}.png` | Scatter: global vs personalized NDCG per user |
-| `federated_convergence_{model}.png` | Val NDCG@10 vs FL round |
 | `cold_vs_warm_{model}.png` | Cold/warm × metadata ON/OFF comparison |
 | `longtail_{model}.png` | Head/mid/tail metric comparison |
-| `architecture_progression.png` | Ablation A: 6-config metric progression |
+| `architecture_progression.png` | Ablation A: 5-config metric progression |
 | `mmoe_vs_arvmmoe_comparison.png` | Ablation C: grouped bar comparison |
 | `expert_count_ablation.png` | Ablation G: NDCG + latency vs K |
 | `gradnorm_lambda_trajectory_{model}.png` | λ_t per objective over training |
@@ -613,8 +577,6 @@ The complete resolved configuration (including any CLI overrides) is saved to `o
 - [ ] `train_user_history is not eval_user_history` asserted
 - [ ] Test data untouched until checkpoint selection is finalized
 - [ ] GradNorm lambda sum constraint verified per step
-- [ ] LoRA state dict contains no MoE/router/expert/embedding keys
-- [ ] Frozen backbone checksum unchanged through all federated rounds
 - [ ] BF16 used throughout; no silent dtype substitution
 - [ ] Attention backend self-test passes before training
 
@@ -626,7 +588,7 @@ The complete resolved configuration (including any CLI overrides) is saved to `o
 |---|---|---|---|
 | Smoke testing | Apple Silicon Mac (MPS) | SDPA | One-batch and few-step T-Small tests on real data |
 | Development | Apple Silicon Mac (MPS) | SDPA | Full T-Small training feasible |
-| Experiments | NVIDIA H100 (Hopper, CUDA) | FlashAttention-3 | Ablations A, D, E, H of the 10% run; final runs |
+| Experiments | NVIDIA H100 (Hopper, CUDA) | FlashAttention-3 | Ablations A, D, H of the 10% run; final runs |
 | Experiments | Other CUDA GPUs (e.g. AWS L4) | SDPA | Ablations B, C, F, G of the 10% run |
 
 Arms that are compared with each other (one ablation study) always run on one machine, so they share hardware, precision and attention backend.
@@ -649,7 +611,7 @@ The full 22-phase implementation sequence with test gates is in [`specs/BUILD_OR
 | 11 | **One-batch + few-step T-Small smoke tests (real data)** | **Full MovieLens-20M training** |
 | 13 | Hopper FlashAttention-3 self-test + parity (if CUDA) | H100 training |
 
-**Dependency chain:** data-pipeline → transformer-backbone → moe-routing → loss-functions → training-pipeline → personalization-federated → evaluation-diagnostics → ablations-cli
+**Dependency chain:** data-pipeline → transformer-backbone → moe-routing → loss-functions → training-pipeline → evaluation-diagnostics → ablations-cli
 
 ---
 
@@ -675,12 +637,11 @@ This project uses a spec-driven development workflow. Implementation contracts l
 | [`moe-routing`](specs/moe-routing/) | ARV-MMoE, conventional MMoE, passthrough, parameter accounting | Expert caching, broadcast routing, serving path | 17 tasks |
 | [`loss-functions`](specs/loss-functions/) | 4 losses, GradNorm, augmentation | Causal positions, interval gating, anchor selection | 19 tasks |
 | [`training-pipeline`](specs/training-pipeline/) | Pretraining loop, LR scheduling, checkpointing | Per-batch scheduling, retain_graph, routing buffers | 18 tasks |
-| [`personalization-federated`](specs/personalization-federated/) | LoRA, personalization, federated simulation | Fresh LoRA per user, checksum enforcement, weighted FedAvg | 21 tasks |
 | [`evaluation-diagnostics`](specs/evaluation-diagnostics/) | Metrics, cold-start, long-tail, latency, diagnostics | Fixed candidates, device sync, diagnostic batches | 25 tasks |
 | [`ablations-cli`](specs/ablations-cli/) | CLI, ablation runner A–H, plots | Config-driven studies, multi-seed aggregation | 21 tasks |
 | [`ablation-run`](specs/ablation-run/) | 10%-user ablation run: mixed bf16, FA3 on Hopper, LR floor, user sampling, wide storage, resume, OOM retry, packaging | FA3 unpad/repad, bit-identical throughput levers, epoch-granular resume, store lock | 28 tasks |
 
-**Total: 157 implementation tasks** across 7 feature specs, ordered by dependency chain.
+**Total: 136 implementation tasks** across 7 feature specs, ordered by dependency chain.
 
 ---
 
@@ -692,13 +653,11 @@ This project uses a spec-driven development workflow. Implementation contracts l
 
 3. **`e_rec ≡ e_next` at inference.** No separate inference-only embedding exists. The next-item objective embedding is already trained through the next-item loss and serves as the routing key at inference time.
 
-4. **LoRA-only federated communication.** Router, experts, objective embeddings, and GradNorm state are global parameters that never enter the federated payload. This is central to the communication-efficiency claim (RQ4).
+4. **GradNorm on shared Transformer anchor.** The anchor is the last shared Transformer block (before MoE), ensuring it exists in every model variant including `moe_variant="none"`. A separate optimizer with its own learning rate controls the loss weights.
 
-5. **GradNorm on shared Transformer anchor.** The anchor is the last shared Transformer block (before MoE), ensuring it exists in every model variant including `moe_variant="none"`. A separate optimizer with its own learning rate controls the loss weights.
+5. **Split-before-truncate.** Leave-one-out boundaries are determined on complete user histories. Truncation to `max_seq_length` happens afterward — preventing information leakage through shifted split points.
 
-6. **Split-before-truncate.** Leave-one-out boundaries are determined on complete user histories. Truncation to `max_seq_length` happens afterward — preventing information leakage through shifted split points.
-
-7. **Full-catalogue evaluation.** Every target is ranked against the whole catalogue minus the user's history, so metric differences reflect model quality, not candidate sampling.
+6. **Full-catalogue evaluation.** Every target is ranked against the whole catalogue minus the user's history, so metric differences reflect model quality, not candidate sampling.
 
 ---
 
@@ -710,10 +669,8 @@ This project uses a spec-driven development workflow. Implementation contracts l
 4. Test data is never used for model selection, threshold tuning, or diagnostic decisions.
 5. Attention backends must pass a startup self-test and never silently fall back.
 6. Cold items must be genuinely unseen during training — verified by set-disjointness assertions.
-7. LoRA state dicts must never contain MoE/router/expert/objective-embedding keys.
-8. Frozen backbone checksum must be unchanged through every federated round.
-9. Full MovieLens-20M training is forbidden until all unit, integration, and smoke tests pass.
-10. No ablation may require commenting/uncommenting code or manually editing source files.
+7. Full MovieLens-20M training is forbidden until all unit, integration, and smoke tests pass.
+8. No ablation may require commenting/uncommenting code or manually editing source files.
 
 ---
 

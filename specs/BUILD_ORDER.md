@@ -2,6 +2,8 @@
 
 The canonical implementation sequence. Each step maps to specific spec tasks and lists its test gate. The BUILD agent must follow this order — no step may begin until its prerequisites and test gates are satisfied.
 
+> **Removed 2026-11-12:** per-user LoRA personalization and the federated simulation (Phases 9, 15 and 16, Ablation E, study A's sixth arm and H6) were taken out of the code because they gave no gain. Those phases, and the LoRA/federated items in the other specs, are kept here as history; `specs/personalization-federated/` was deleted.
+
 **Legend:**
 - `→` references a spec task (e.g., `data-pipeline T1.1`)
 - `🧪 GATE` marks a test that must pass before proceeding to the next phase

@@ -349,8 +349,7 @@ def main():
         if args.price:
             line += f"   ~${gpu_h * args.price:,.0f}"
         print(line)
-    print("  (wall assumes runs split evenly across GPUs; evaluation/LoRA/federated "
-          "stages add a few %)")
+    print("  (wall assumes runs split evenly across GPUs; evaluation stages add a few %)")
     out["summary"] = {name: gpu_h for name, gpu_h in scopes}
 
     if args.out:

@@ -530,7 +530,7 @@ class TestEndToEndPreprocessing:
         "train_user_history.pkl",
         "eval_user_history.pkl",
         "splits.pkl",
-        # REV-002: consumed by cold_start.py, longtail.py, local_train.py, federated.py
+        # REV-002: consumed by cold_start.py and longtail.py
         "val_examples.pkl",
         "test_examples.pkl",
         # REV-007: long-tail popularity buckets

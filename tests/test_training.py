@@ -542,7 +542,6 @@ class TestArtifactProvenance:
         from evaluation.flops import save_efficiency_report
         from evaluation.gradient_diagnostics import save_gradient_diagnostics
         from evaluation.routing_diagnostics import save_routing_diagnostics
-        from training.local_train import _save_report as save_personalization
 
         revision = {"commit": "deadbeef", "dirty": False, "source_hash": "0123456789abcdef"}
 
@@ -583,13 +582,6 @@ class TestArtifactProvenance:
         }
         save_routing_diagnostics(routing, cfg, "t-small", source_revision=revision)
         written["routing_diagnostics_t_small.json"] = None
-
-        save_personalization(
-            cfg, "t-small",
-            {"num_users_evaluated": 0, "num_users_skipped": 0},
-            source_revision=revision,
-        )
-        written["personalization_gain_t_small.json"] = None
 
         for name in written:
             path = os.path.join(cfg.log_dir, name)

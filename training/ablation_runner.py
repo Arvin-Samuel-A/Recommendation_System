@@ -25,17 +25,7 @@ STUDY_CONFIGS = {
         {"label": "4obj_no_routing", "use_masked_lm": True, "use_multi_step": True, "use_contrastive": True, "moe_variant": "none", "use_gradnorm": False},
         {"label": "conv_mmoe", "use_masked_lm": True, "use_multi_step": True, "use_contrastive": True, "moe_variant": "mmoe", "use_gradnorm": False},
         {"label": "arv_mmoe", "use_masked_lm": True, "use_multi_step": True, "use_contrastive": True, "moe_variant": "arv_mmoe", "use_gradnorm": False},
-        {"label": "arv_mmoe_gradnorm", "use_masked_lm": True, "use_multi_step": True, "use_contrastive": True, "moe_variant": "arv_mmoe", "use_gradnorm": True, "personalization_mode": "none"},
-        # The final arm of the progression adds LoRA personalization. It used to be
-        # byte-identical to the arm above it, so the two could never differ.
-        # REV-100: FR-6 ends the progression at "+federated" and T2.2 spells arm 6 out as
-        # "(6) federated ARV-MMoE+GradNorm+LoRA", but the arm ran `run_local_personalization`
-        # only -- nothing in study A ever called `run_federated`, so the progression's
-        # final point was labelled as the federated system while measuring single-machine
-        # LoRA. `system_eval="communication"` routes `_run_single_config` into
-        # `run_federated` (rounds, final val NDCG, cumulative KB); `personalization_mode`
-        # stays "lora" because T2.2 names both, and federated training here IS LoRA-based.
-        {"label": "arv_mmoe_gradnorm_lora", "use_masked_lm": True, "use_multi_step": True, "use_contrastive": True, "moe_variant": "arv_mmoe", "use_gradnorm": True, "personalization_mode": "lora", "system_eval": "communication"},
+        {"label": "arv_mmoe_gradnorm", "use_masked_lm": True, "use_multi_step": True, "use_contrastive": True, "moe_variant": "arv_mmoe", "use_gradnorm": True},
     ],
     "B": [
         {"label": "objective_conditioned", "moe_variant": "arv_mmoe", "router_conditioning": "objective_conditioned"},
@@ -51,14 +41,6 @@ STUDY_CONFIGS = {
         {"label": "arv_no_gradnorm", "moe_variant": "arv_mmoe", "use_gradnorm": False},
         {"label": "arv_gradnorm", "moe_variant": "arv_mmoe", "use_gradnorm": True},
     ],
-    # FR-10: global only / global+LoRA / global+LoRA+ARV. REV-019: these three used to
-    # resolve to identical configs, so the arms were indistinguishable in their own
-    # result JSON; `personalization_mode` makes the dimension explicit and config-driven.
-    "E": [
-        {"label": "global_only", "personalization_mode": "none", "moe_variant": "none"},
-        {"label": "global_lora", "personalization_mode": "lora", "moe_variant": "none"},
-        {"label": "global_lora_arv", "personalization_mode": "lora", "moe_variant": "arv_mmoe"},
-    ],
     "F": [
         {"label": "full_reference", "use_masked_lm": True, "use_multi_step": True, "use_contrastive": True},
         {"label": "no_masked", "use_masked_lm": False, "use_multi_step": True, "use_contrastive": True},
@@ -71,7 +53,7 @@ STUDY_CONFIGS = {
     "G": [
         {"_grid": "expert_count"},
     ],
-    # FR-13: each sub-study selectable without source edits. H3-H6 used to carry no
+    # FR-13: each sub-study selectable without source edits. H3-H5 used to carry no
     # overrides at all, so they resolved to the base config and ran nothing specific.
     "H": [
         {"label": "H1_no_metadata", "use_metadata": False},
@@ -81,7 +63,6 @@ STUDY_CONFIGS = {
         {"label": "H3_cold_start", "system_eval": "cold_start"},
         {"label": "H4_longtail", "system_eval": "longtail"},
         {"label": "H5_latency", "system_eval": "latency"},
-        {"label": "H6_communication", "system_eval": "communication"},
     ],
 }
 
@@ -201,9 +182,7 @@ def select_study_configs(
 
 #: Study -> the extra diagnostics FR-5..FR-13 require beyond metrics.
 STUDY_EXTRAS = {
-    "A": ("personalization",),
     "B": ("routing",),
-    "E": ("personalization",),
     "C": ("efficiency",),
     "D": ("gradient",),
     # REV-065: FR-12's figure is "NDCG left axis, latency right axis", so G needs the
@@ -217,9 +196,8 @@ def _config_diff(cfg: Config, base: Config) -> Dict:
     """Every field where this config differs from the base.
 
     REV-019: the previous code took the key set of the study's FIRST override dict and
-    applied it to every config in the study. Study E's first entry is `{"label": ...}`
-    only, so every E result recorded an EMPTY diff; study H recorded only
-    `use_metadata`. The diff is now computed per-config against the base.
+    applied it to every config in the study, so study H recorded only `use_metadata`
+    for every arm. The diff is now computed per-config against the base.
     """
     base_d, cfg_d = asdict(base), asdict(cfg)
     return {k: v for k, v in cfg_d.items() if base_d.get(k) != v}
@@ -227,14 +205,12 @@ def _config_diff(cfg: Config, base: Config) -> Dict:
 
 #: Config fields that are read ONLY after training finishes, so two arms differing only
 #: in these produce a bit-identical backbone (REV-084). Verified against the codebase:
-#: `personalization_mode` and `system_eval` are read solely by this module's post-training
-#: extras dispatch, and `ablation_eval_examples` / `ablation_eval_seed` only choose the
+#: `system_eval` is read solely by this module's post-training extras dispatch, and `ablation_eval_examples` / `ablation_eval_seed` only choose the
 #: test rows scored after training (eval-integrity FR-6.4).
 #: Anything not listed here is treated as training-relevant -- the safe default, since a
 #: missing entry only costs a redundant run, while a wrong entry would silently make two
 #: genuinely different arms share one model.
 POST_TRAINING_ONLY_FIELDS = frozenset({
-    "personalization_mode",
     "system_eval",
     "ablation_eval_examples",
     "ablation_eval_seed",
@@ -309,16 +285,41 @@ _DEFAULT_OMITTED_FIELDS = {
 #: equal-weight arm.
 _GRADNORM_ONLY_FIELDS = frozenset({"gradnorm_primary_objective", "gradnorm_aux_budget"})
 
+#: Config fields of the per-user LoRA and federated code, removed on 2026-11-12, with the
+#: defaults every trained arm had. They never affected pretraining, but they were hashed
+#: into every fingerprint, so `_training_fingerprint` hashes them back in at these values:
+#: every backbone in the store keeps its fingerprint (reused, `last.pt` resumes).
+_REMOVED_FIELD_DEFAULTS = {
+    "local_train_source": "train",
+    "local_train_max_examples": 32,
+    "lora_rank": 8,
+    "lora_lr": 1e-3,
+    "lora_weight_decay": 0.0,
+    "local_epochs": 3,
+    "federated_rounds": 20,
+    "clients_per_round": 100,
+    "personalization_eval_users": 1000,
+    "use_weighted_fedavg": True,
+    "federated_eval_examples": 5000,
+    "lora_rank_grid": [2, 4, 8, 16],
+}
+#: Every removed field, for reading records and checkpoints written before the removal.
+#: `personalization_mode` was post-training only, so it was never in a fingerprint.
+_REMOVED_FIELDS = frozenset(_REMOVED_FIELD_DEFAULTS) | {"personalization_mode"}
+
 
 def _training_fields(cfg_dict: dict) -> dict:
     """The training-relevant subset of an `asdict(Config)` (the fingerprint's field set).
 
-    Also used by the rescore identity check (eval-integrity FR-8.9).
+    Also used by the rescore identity check (eval-integrity FR-8.9). The removed LoRA /
+    federated fields are dropped, so a config saved before their removal compares equal
+    to one saved after.
     """
     return {
         k: v for k, v in cfg_dict.items()
         if k not in POST_TRAINING_ONLY_FIELDS and k not in _PATH_FIELDS
         and k not in _RUN_SELECTION_FIELDS and k not in _RUNTIME_ONLY_FIELDS
+        and k not in _REMOVED_FIELDS
         and not (k in _DEFAULT_OMITTED_FIELDS and v == _DEFAULT_OMITTED_FIELDS[k]
                  and type(v) is type(_DEFAULT_OMITTED_FIELDS[k]))
         and not (k in _GRADNORM_ONLY_FIELDS and not cfg_dict.get("use_gradnorm", True))
@@ -328,19 +329,19 @@ def _training_fields(cfg_dict: dict) -> dict:
 def _training_fingerprint(cfg: Config) -> str:
     """Hash of everything about `cfg` that actually changes the trained model.
 
-    REV-084: Ablation A's arms 5/6 and E's `global_only`/`global_lora` differ only in
-    `personalization_mode`, which `run_pretrain` never reads. Under label-namespaced
-    checkpoints each pair trained two bit-identical models -- two full pretraining runs
-    wasted per pair, at `pretrain_epochs=20` over 7.8M examples -- and produced identical
-    `metrics`, which reads as a null result for personalization rather than as what it
-    is: the two arms sharing a backbone by construction.
+    REV-084: arms that differ only in post-training fields (`POST_TRAINING_ONLY_FIELDS`)
+    share one fingerprint, so they share one trained backbone instead of each running a
+    full, bit-identical pretraining.
 
     eval-integrity FR-4: the payload also carries `TRAINING_SEMANTICS_VERSION`, so a
     training-correctness fix changes every fingerprint and pre-fix backbones are never
     reused. Code that needs an old backbone locates it by the fingerprint recorded in its
     arm result, never by recomputing it.
+
+    The removed LoRA / federated fields are hashed at their old defaults
+    (`_REMOVED_FIELD_DEFAULTS`), so their removal changed no fingerprint.
     """
-    fields = _training_fields(asdict(cfg))
+    fields = {**copy.deepcopy(_REMOVED_FIELD_DEFAULTS), **_training_fields(asdict(cfg))}
     fields["_training_semantics"] = TRAINING_SEMANTICS_VERSION
     payload = json.dumps(fields, sort_keys=True, default=str)
     return hashlib.sha256(payload.encode()).hexdigest()[:12]
@@ -394,8 +395,7 @@ def register_backbone(
     """Record a finished backbone so later arms load it instead of retraining it.
 
     The entry records `trained_cfg.checkpoint_dir`, not just the file, because the
-    personalization and federated stages re-read `model_checkpoint_dir()/best.pt` from
-    the arm's config. It may live outside the store: the multi-seed stage registers its
+    post-training stages re-read `model_checkpoint_dir()/best.pt` from the arm's config. It may live outside the store: the multi-seed stage registers its
     per-seed checkpoint, so ablation arms on the base config reuse that model.
     """
     entry = {
@@ -610,7 +610,7 @@ def _run_single_config(
     # arms ran earlier in this process (H2_seq4 scored 0.4154 after the earlier H arms and
     # 0.4018 alone). It runs before any model is built -- weight init draws from the global
     # generators -- and also for arms that reuse a stored backbone, whose post-training
-    # steps (LoRA init, federated client choice, eval negatives) draw random numbers too.
+    # steps (eval negatives) draw random numbers too.
     # A resumed `run_pretrain` restores its checkpoint's RNG state over this, as it should.
     set_seed(cfg.seed)
 
@@ -796,25 +796,6 @@ def _run_single_config(
                 "objective_names": diff["objective_names"],
             }
 
-    if "personalization" in extras and cfg.personalization_mode == "lora":
-        # FR-10: the LoRA arms report the per-user personalization gain over the same
-        # global backbone the "global_only" arm is scored on.
-        from training.local_train import run_local_personalization
-
-        try:
-            gain_report = run_local_personalization(cfg, model_name)
-            result["personalization"] = {
-                "num_users_evaluated": gain_report["num_users_evaluated"],
-                "with_lora": gain_report["with_lora"],
-                "without_lora": gain_report["without_lora"],
-                "gain": gain_report["gain"],
-                # REV-065 / FR-10: the paired per-user NDCGs the Ablation E scatter
-                # overlays as its third series.
-                "per_user_scores": gain_report.get("per_user_scores", []),
-            }
-        except (FileNotFoundError, KeyError) as exc:
-            logger.warning("  %s: personalization skipped (%s)", label, exc)
-
     if cfg.system_eval == "cold_start":
         from evaluation.cold_start import run_cold_start_evaluation
 
@@ -831,21 +812,6 @@ def _run_single_config(
         result["latency"] = latency
         result["parameters"] = {k: float(v) for k, v in params.items()}
         result["flops_per_inference"] = estimate_flops_per_inference(cfg, moe)
-
-    elif cfg.system_eval == "communication":
-        from training.federated import run_federated
-
-        try:
-            fed = run_federated(cfg, model_name)
-            rounds = fed["round_logs"]
-            result["communication"] = {
-                "num_rounds": len(rounds),
-                "final_val_ndcg": fed["final_val_ndcg"],
-                "cumulative_kb": sum(r.get("total_round_kb", 0.0) for r in rounds),
-                "upload_kb_per_round": rounds[0]["upload_kb"] if rounds else 0.0,
-            }
-        except (FileNotFoundError, KeyError) as exc:
-            logger.warning("  %s: communication study skipped (%s)", label, exc)
 
     if "gradient" in extras:
         from training.gradnorm import get_anchor_layer_params
@@ -1011,7 +977,7 @@ def _consistency_problems(study: str, records: Dict[str, dict]) -> List[str]:
     overridden = set()
     for r in records.values():
         overridden.update((r.get("study_overrides") or {}).keys())
-    excluded = overridden | _PATH_FIELDS | _RUNTIME_ONLY_FIELDS
+    excluded = overridden | _PATH_FIELDS | _RUNTIME_ONLY_FIELDS | _REMOVED_FIELDS
     configs = {
         label: r["resolved_config"] for label, r in records.items()
         if isinstance(r.get("resolved_config"), dict)
@@ -1459,42 +1425,10 @@ def _plot_expert_count(config: Config, model_name: str, results: List[Dict]) -> 
     plt.close(fig)
 
 
-def _plot_personalization_study(
-    config: Config, model_name: str, results: List[Dict],
-) -> None:
-    """FR-10 / T2.6: overlay Ablation E's `global_lora_arv` arm as a third series.
-
-    REV-065: the scatter `local_train` draws covers one arm only. E exists to compare
-    global-only, global+LoRA and global+LoRA+ARV, so the ARV arm is overlaid onto the
-    same axes as a distinct series.
-    """
-    from training.local_train import plot_personalization_scatter
-
-    series = []
-    for r in results:
-        pairs = r.get("personalization", {}).get("per_user_scores")
-        if pairs:
-            series.append({"label": r["label"], "results": pairs})
-
-    if not series:
-        logger.warning(
-            "Ablation E: no arm reported per-user personalization scores, skipping "
-            "the multi-series scatter",
-        )
-        return
-
-    plot_personalization_scatter(
-        config, model_name, series,
-        filename="global_vs_personalized_ablation_E.png",
-        title=f"Ablation E: Personalization -- {model_name}",
-    )
-
-
 #: Study -> the specifically named figure that study's FR requires (REV-065).
 _STUDY_PLOTS = {
     "A": _plot_architecture_progression,
     "C": _plot_mmoe_comparison,
-    "E": _plot_personalization_study,
     "G": _plot_expert_count,
 }
 

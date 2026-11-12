@@ -149,8 +149,7 @@ class Config:
     # CE-optimal scales differ (the contrastive one ranks 2B-1 in-batch views, the
     # others the full catalogue), and a shared scalar would be pulled between them.
     # Each scale lives in its loss module (so `loss_fns_state_dict` checkpoints it), is
-    # excluded from weight decay, and is logged per epoch. Per-user LoRA training uses the
-    # fixed 1/logit_temperature, not the learned value.
+    # excluded from weight decay, and is logged per epoch.
     learnable_logit_scale: bool = False
     logit_scale_max: float = 100.0
     # True: contrastive uses logit_temperature (and, with learnable_logit_scale, its own
@@ -207,42 +206,9 @@ class Config:
     # `--stage ablation_rescore` re-scores the kept snapshots, so it needs them.
     epoch_snapshot_interval: int = 1
 
-    # --- LoRA / personalization ---
-    # REV-070: `use_lora` and `use_federated` were added for REV-018 but REV-018 was
-    # solved through `personalization_mode`, which IS read by the runner and by
-    # `_run_single_config`. Two flags that validated and changed nothing were recorded
-    # in every ablation's `resolved_config`, where a reader could reasonably think they
-    # distinguished the arms. Removed rather than left dangling.
-    # REV-003/REV-004: which split a client's LoRA is trained on. "train" uses the
-    # user's training interactions; the evaluation set is never trained on. Read by
-    # `training/local_train.py` and `training/federated.py`.
-    local_train_source: str = "train"
-    # REV-003: cap on the per-user local training examples drawn from that split, taking
-    # the MOST RECENT interactions. Unbounded, a heavy user contributes thousands of
-    # examples per local epoch across `personalization_eval_users` users.
-    local_train_max_examples: int = 32
-    lora_rank: int = 8
-    lora_lr: float = 1e-3
-    lora_weight_decay: float = 0.0
-    local_epochs: int = 3
-
-    # --- Federated ---
-    federated_rounds: int = 20
-    clients_per_round: int = 100
-    personalization_eval_users: int = 1000
-    use_weighted_fedavg: bool = True
-
-    # REV-112(b): examples scored in the per-round validation pass. The round loop runs
-    # `federated_rounds` times, so a full-split pass per round (one row per user under
-    # leave-one-out, ~138k on ML-20M) would dominate the stage. Every
-    # round scores the SAME prefix, so the round-over-round convergence curve stays
-    # comparable; the final round additionally runs the full split, which is the number
-    # AC-06 is judged on. Set to 0 to score the full split every round.
-    federated_eval_examples: int = 5000
-
     # --- Negative Sampling ---
-    # Pretraining and evaluation use the full catalogue. Sampled negatives (drawn from
-    # the global pool) remain only in per-user LoRA training (local + federated).
+    # Pretraining and evaluation use the full catalogue. Preprocessing still builds the
+    # global negative pool and records these values in its manifest; no training reads them.
     num_sampled_negatives: int = 100
     # REV-025: `pool_size` is the configured value; `resolve_pool_size()` applies the
     # `max(pool_size, num_items * pool_size_items_multiplier)` floor so the manifest and
@@ -278,13 +244,6 @@ class Config:
     # specific to their names. "Each selectable without source edits" is FR-13's wording,
     # so this is a config flag.
     system_eval: str = "none"
-
-    # Ablation E (FR-10) compares "global only" against "global + LoRA". That is a real
-    # experimental dimension with no config field, so every E arm resolved to an
-    # identical config and the arms were indistinguishable in their own result JSON
-    # (REV-019). "none" = evaluate the global backbone as-is; "lora" = additionally run
-    # per-user LoRA personalization and report the gain.
-    personalization_mode: str = "none"
 
     # Test rows scored per ablation arm (specs/eval-integrity FR-6). 0 = every row of the
     # stored test split (one per user) -- the default. N > 0 = a seeded uniform random
@@ -331,7 +290,6 @@ class Config:
     # --- Ablation grids ---
     sequence_length_grid: List[int] = field(default_factory=lambda: [25, 50, 100, 200])
     expert_count_grid: List[int] = field(default_factory=lambda: [2, 4, 6, 8])
-    lora_rank_grid: List[int] = field(default_factory=lambda: [2, 4, 8, 16])
 
     # --- Derived (set after preprocessing) ---
     num_items: int = 0
@@ -363,8 +321,7 @@ class Config:
         return f"{self.checkpoint_dir}/{self.model_dir_name()}"
 
     DATASET_FORMATS = ("movielens", "amazon2014")
-    PERSONALIZATION_MODES = ("none", "lora")
-    SYSTEM_EVALS = ("none", "cold_start", "longtail", "latency", "communication")
+    SYSTEM_EVALS = ("none", "cold_start", "longtail", "latency")
 
     def apply_dataset_preset(self, name: str) -> None:
         """Set every field of a named dataset preset (see DATASET_PRESETS).
@@ -395,11 +352,6 @@ class Config:
             raise ValueError(
                 f"Unknown system_eval '{self.system_eval}'. "
                 f"Choose from {list(self.SYSTEM_EVALS)}"
-            )
-        if self.personalization_mode not in self.PERSONALIZATION_MODES:
-            raise ValueError(
-                f"Unknown personalization_mode '{self.personalization_mode}'. "
-                f"Choose from {list(self.PERSONALIZATION_MODES)}"
             )
         if self.dtype not in ("bf16", "fp16"):
             raise ValueError(f"Unknown dtype '{self.dtype}'. Choose from 'bf16', 'fp16'")
@@ -483,11 +435,6 @@ class Config:
                 "Choose from 'unseen_in_training', 'first_appearance_rank', "
                 "'timestamp_cutoff'"
             )
-        if self.local_train_source not in ("train", "val"):
-            raise ValueError(
-                f"Unknown local_train_source '{self.local_train_source}'. "
-                "Choose from 'train', 'val'. The test split is never a training source."
-            )
         # T1.3 / AC-09: `flex_attention` is NOT a sanctioned value. It has no backward
         # pass on MPS in the pinned PyTorch build, so it can never satisfy the training
         # gates on the dev host; a selectable backend that provably cannot train is a
@@ -516,7 +463,7 @@ class Config:
 
 #: Named dataset presets: every field that differs from the MovieLens-20M defaults, set
 #: together by `Config.apply_dataset_preset` (CLI `--dataset_preset`). Everything not
-#: listed -- model size, batch 256, losses, multi_step_k, LoRA, federated settings and the
+#: listed -- model size, batch 256, losses, multi_step_k and the
 #: leave-one-out full-ranking protocol -- stays at the defaults.
 DATASET_PRESETS = {
     # The defaults themselves, so a command can name its dataset explicitly.
