@@ -1,0 +1,6 @@
+
+# --- auto_recover hook (2026-11-10): when the container's PID-1 shell starts after a restart,
+# restart the MovieLens seed runs. Does nothing in any other shell (ssh logins etc.).
+if [ "$$" = 1 ] && [ -x /root/early_stop/auto_recover.sh ]; then
+  ( setsid nohup bash -c 'sleep 30; /root/early_stop/auto_recover.sh' >/dev/null 2>&1 < /dev/null & )
+fi

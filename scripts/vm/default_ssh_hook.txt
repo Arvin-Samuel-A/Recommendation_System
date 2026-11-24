@@ -1,0 +1,4 @@
+
+# --- auto_recover hook (2026-11-10): /etc/init.d/ssh sources this file when sshd is started at
+# container start; restart the MovieLens seed runs (auto_recover.sh runs once per boot).
+[ -x /root/early_stop/auto_recover.sh ] && ( setsid nohup sh -c "sleep 30; /root/early_stop/auto_recover.sh" >/dev/null 2>&1 < /dev/null & )
