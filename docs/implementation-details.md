@@ -1,6 +1,6 @@
 # ARV-MMoE: implementation details
 
-How the system is built, as of commit `542135c` (master, 2026-10-18). Every number below is a value from the code or the config, or a measurement from the 10%-user experiments. Results are in docs/ablation-results-run12.md; the bugs found and fixed along the way are in docs/ablation-run-errors-and-fixes.md.
+How the system is built, as of commit `542135c` (master, 2026-10-18). Every number below is a value from the code or the config, or a measurement from the 10%-user experiments. Results are kept out of the repository (run12: outputs/ablation-results-run12.md); the bugs found and fixed along the way are in docs/ablation-run-errors-and-fixes.md.
 
 > **Changed since this was written (2026-10-25).** Sections 1, 3 and 6 describe the run12 protocol. The code now:
 > - keeps **every rating** (`implicit_threshold = 0.0`) and defaults to the **full dataset**;
