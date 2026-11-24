@@ -120,7 +120,13 @@
 
 <!-- 1.18 still ships a single-threaded WebAssembly build. From 1.19 on there is only the
      threaded one, whose shared-memory reservation iOS Safari refuses ("RangeError: Out of memory"). -->
-<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/ort.wasm.min.js"></script>
+<!-- ?ep=webgpu runs the model on the phone's GPU through WebGPU (onnxruntime-web's WebGPU
+     build; nodes it can't run fall back to the CPU). Without it the page loads the CPU build. -->
+<script>
+const EP = new URLSearchParams(location.search).get("ep") === "webgpu" ? "webgpu" : "wasm";
+document.write(`<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/` +
+               `${EP === "webgpu" ? "ort.webgpu.min.js" : "ort.wasm.min.js"}"><\/script>`);
+</script>
 <script>
 const $ = (id) => document.getElementById(id);
 // SEQ_LEN comes from assets/meta.json (written by scripts/export_mobile.py); 50 for older assets.
@@ -129,7 +135,10 @@ const TOP_K = 10;
 // ?threads=N asks for N WebAssembly threads. They need a cross-origin-isolated page
 // (scripts/run_mobile_demo.sh's server sends the headers); otherwise the page uses 1.
 const WANT_THREADS = Math.max(1, +new URLSearchParams(location.search).get("threads") || 1);
-let meta = {}, loadInfo = {};
+// ?assets=DIR loads another export (e.g. assets_beauty from export_mobile.py --dataset beauty).
+const ASSETS = (new URLSearchParams(location.search).get("assets") || "assets").replace(/[^A-Za-z0-9_-]/g, "");
+let meta = {}, loadInfo = {}, gpuInfo = null;
+const EP_LABEL = EP === "webgpu" ? "GPU (WebGPU)" : "WebAssembly";
 const PRESETS = {
   anim: ["Toy Story (1995)", "Finding Nemo", "Shrek (2001)", "Monsters, Inc.", "Incredibles"],
   sci: ["Star Wars: Episode IV", "Alien (1979)", "Blade Runner", "Terminator 2", "Matrix, The"],
@@ -173,23 +182,36 @@ async function init() {
     ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/";
     // 1 thread selects ort-wasm-simd.wasm, the build iOS can allocate.
     ort.env.wasm.numThreads = self.crossOriginIsolated ? WANT_THREADS : 1;
+    if (EP === "webgpu") {
+      if (!navigator.gpu) throw new Error("this browser has no WebGPU (navigator.gpu is missing)");
+      // onnxruntime-web 1.18 calls adapter.requestAdapterInfo(), which current Chrome removed in
+      // favour of the adapter.info property it returned. Answer the old call from the new one.
+      if (self.GPUAdapter && !GPUAdapter.prototype.requestAdapterInfo) {
+        GPUAdapter.prototype.requestAdapterInfo = async function () { return this.info; };
+      }
+      const adapter = await navigator.gpu.requestAdapter();
+      if (!adapter) throw new Error("WebGPU is present but no GPU adapter is available");
+      const info = adapter.info || {};
+      gpuInfo = {vendor: info.vendor || "", architecture: info.architecture || "",
+                 device: info.device || "", description: info.description || ""};
+    }
     setStatus("Downloading movie data…");
     [items, users, meta] = await Promise.all([
-      fetch("assets/items.json").then((r) => r.json()),
-      fetch("assets/users.json").then((r) => r.json()),
-      fetch("assets/meta.json").then((r) => (r.ok ? r.json() : {})).catch(() => ({})),
+      fetch(`${ASSETS}/items.json`).then((r) => r.json()),
+      fetch(`${ASSETS}/users.json`).then((r) => r.json()),
+      fetch(`${ASSETS}/meta.json`).then((r) => (r.ok ? r.json() : {})).catch(() => ({})),
     ]);
     if (meta.seq_len) SEQ_LEN = meta.seq_len;
     searchOrder = items.title.map((t, i) => i).sort((a, b) => items.likes[b] - items.likes[a]);
     const t0 = performance.now();
-    const bytes = await fetchWithProgress("assets/model.onnx", (f) => {
+    const bytes = await fetchWithProgress(`${ASSETS}/model.onnx`, (f) => {
       $("progress").style.width = (f * 100).toFixed(0) + "%";
       setStatus(`Downloading the model to this device… ${(f * 100).toFixed(0)}%`);
     });
     const tDownloaded = performance.now();
     setStatus("Preparing the model…");
     // No memory arena or pattern planning: lower peak memory, which phones are short of.
-    session = await ort.InferenceSession.create(bytes, {executionProviders: ["wasm"], graphOptimizationLevel: "all",
+    session = await ort.InferenceSession.create(bytes, {executionProviders: [EP], graphOptimizationLevel: "all",
                                                          enableCpuMemArena: false, enableMemPattern: false});
     const tCreated = performance.now();
     const first = await infer([1]);  // warm-up
@@ -197,9 +219,9 @@ async function init() {
     loadInfo = {model_mb: +(bytes.length / 1e6).toFixed(2), download_s: +((tDownloaded - t0) / 1000).toFixed(2),
                 session_create_s: +((tCreated - tDownloaded) / 1000).toFixed(2), first_inference_ms: +first.ms.toFixed(1),
                 load_total_s: +secs};
-    report({event: "loaded", seconds: secs, mb: (bytes.length / 1e6).toFixed(0), threads: ort.env.wasm.numThreads});
+    report({event: "loaded", seconds: secs, mb: (bytes.length / 1e6).toFixed(0), threads: ort.env.wasm.numThreads, ep: EP});
     $("progressWrap").classList.add("hidden");
-    setStatus(`Model loaded on this device (${(bytes.length / 1e6).toFixed(0)} MB, WebAssembly, ` +
+    setStatus(`Model loaded on this device (${(bytes.length / 1e6).toFixed(0)} MB, ${EP_LABEL}, ` +
               `${ort.env.wasm.numThreads} thread${ort.env.wasm.numThreads > 1 ? "s" : ""}) in ${secs} s`, "ok");
     document.querySelectorAll(".needs-model").forEach((b) => b.disabled = false);
     $("searchBox").disabled = false;
@@ -319,6 +341,12 @@ $("clearLiked").addEventListener("click", () => { liked = []; renderChips(); });
 
 // ------------------------------------------------------------------ benchmark
 const WARMUP = 20, TIMED = 100;  // the same counts as Config.warmup_runs / timed_runs
+// ?runs=N repeats the whole benchmark N times in one tap (each run saved separately), with
+// ?cool=S seconds of rest between runs so later runs don't start on a hotter chip.
+const QS = new URLSearchParams(location.search);
+const RUNS = Math.max(1, +QS.get("runs") || 1), COOL = Math.max(0, +(QS.get("cool") ?? 30));
+let series = null;  // {id, index, total, cooldown_s} while a repeated benchmark runs
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function stats(xs) {
   const s = xs.slice().sort((a, b) => a - b), n = s.length;
@@ -338,7 +366,7 @@ async function benchmark() {
     const heapBefore = heap();
     const model = [], e2e = [];
     for (let i = 0; i < WARMUP + TIMED; i++) {
-      $("bench").innerHTML = `<div class="hint">${i < WARMUP ? "Warm-up" : "Timed run"} ${i < WARMUP ? i + 1 : i - WARMUP + 1} of ${i < WARMUP ? WARMUP : TIMED}…</div>`;
+      $("bench").innerHTML = `<div class="hint">${series ? `Benchmark ${series.index} of ${series.total} · ` : ""}${i < WARMUP ? "Warm-up" : "Timed run"} ${i < WARMUP ? i + 1 : i - WARMUP + 1} of ${i < WARMUP ? WARMUP : TIMED}…</div>`;
       const u = users[i % users.length];
       const t0 = performance.now();
       const r = await infer(u.history);
@@ -348,9 +376,10 @@ async function benchmark() {
     }
     const result = {
       time: new Date().toISOString(),
+      series,
       device: {ua: navigator.userAgent, cores: navigator.hardwareConcurrency ?? null,
                device_memory_gb: navigator.deviceMemory ?? null, cross_origin_isolated: !!self.crossOriginIsolated},
-      runtime: {library: "onnxruntime-web 1.18.0", backend: "wasm", threads: ort.env.wasm.numThreads},
+      runtime: {library: "onnxruntime-web 1.18.0", backend: EP, threads: ort.env.wasm.numThreads, gpu: gpuInfo},
       model: {...meta, ...loadInfo},
       inference_ms: stats(model),                 // session.run only
       end_to_end_ms: stats(e2e),                  // session.run + top-10 over the catalogue
@@ -371,13 +400,33 @@ async function benchmark() {
         <li><div class="t"><span>Threads · cores · device memory</span><span class="s">${result.runtime.threads} · ${result.device.cores} · ${result.device.device_memory_gb ?? "?"} GB</span></div></li>
       </ul>
       <textarea readonly style="width:100%;height:120px;margin-top:8px;font-size:11px">${esc(JSON.stringify(result, null, 1))}</textarea>`;
+    return result;
   } catch (err) {
     $("bench").innerHTML = `<div class="err">Benchmark failed: ${esc(err.message)}</div>`;
   } finally {
     btn.disabled = false;
   }
 }
-$("goBench").addEventListener("click", benchmark);
+async function benchmarkSeries() {
+  const id = new Date().toISOString(), done = [];
+  const table = () => done.length ? `<ul class="plain">${done.map((r, k) =>
+    `<li><div class="t"><span>Benchmark ${k + 1}</span><span class="s">median ${r.inference_ms.p50} ms · p90 ${r.inference_ms.p90} · p99 ${r.inference_ms.p99}</span></div></li>`).join("")}</ul>` : "";
+  for (let k = 1; k <= RUNS; k++) {
+    series = {id, index: k, total: RUNS, cooldown_s: COOL};
+    for (let s = k > 1 ? COOL : 0; s > 0; s--) {
+      $("bench").innerHTML = `<div class="hint">Benchmark ${k - 1} of ${RUNS} done. Resting ${s} s before the next one…</div>` + table();
+      await sleep(1000);
+    }
+    const r = await benchmark();
+    if (!r) break;
+    done.push(r);
+  }
+  series = null;
+  if (RUNS > 1 && done.length) {
+    $("bench").innerHTML = `<div class="badge">${done.length} of ${RUNS} benchmarks saved (${EP_LABEL}, ${ort.env.wasm.numThreads} thread${ort.env.wasm.numThreads > 1 ? "s" : ""})</div>` + table();
+  }
+}
+$("goBench").addEventListener("click", benchmarkSeries);
 
 // ------------------------------------------------------------------ rendering
 function list(recs, future, fmt) {

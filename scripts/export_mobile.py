@@ -15,6 +15,9 @@ exported model against PyTorch with onnxruntime before it finishes.
 
     uv run python scripts/export_mobile.py
     uv run python scripts/export_mobile.py --checkpoint <path> --num-users 500
+    uv run python scripts/export_mobile.py --dataset beauty      # -> demo/mobile/assets_beauty
+
+The page loads another export with ?assets=DIR (e.g. ?assets=assets_beauty).
 """
 import argparse
 import json
@@ -37,7 +40,33 @@ from demo_recommend import (  # noqa: E402
 )
 from evaluation.metrics import load_item_popularity  # noqa: E402
 
-EXAMPLE_USERS = [13408]  # the prepared example in scripts/run_demo.sh
+EXAMPLE_USERS = [13408]  # the prepared example in scripts/run_demo.sh (MovieLens)
+#: Two top-10 items whose scores differ by less than this may appear in either order.
+TIE_TOL = 1e-3
+
+#: --dataset beauty: the Amazon Beauty 2014 reference model (A:arv_mmoe_gradnorm, seed 42).
+BEAUTY = {
+    "checkpoint": "outputs/h100_beauty_2026-11-07/outputs/checkpoints/ablations/by_fingerprint/"
+                  "7802dd4b7636/t_base/best.pt",
+    "processed_dir": "data/processed_beauty",
+    "out": "demo/mobile/assets_beauty",
+}
+
+
+def load_amazon_titles(cfg, rev_map, num_items):
+    """item id -> (title, category path) from the Amazon metadata file."""
+    import html
+
+    from data.amazon import read_metadata
+
+    meta = read_metadata(cfg, [rev_map[i] for i in range(1, num_items + 1) if i in rev_map])
+    out = {}
+    for i in range(1, num_items + 1):
+        r = meta.get(rev_map.get(i), {})
+        cats = r.get("categories") or [[]]
+        out[i] = (html.unescape(str(r.get("title") or f"<item {i}>")),
+                  " > ".join(str(c) for c in (cats[0] if cats else [])))
+    return out
 
 
 class OnDeviceRecommender(nn.Module):
@@ -95,12 +124,18 @@ class OnDeviceRecommender(nn.Module):
 
 def main():
     p = argparse.ArgumentParser(description="Export the on-device demo assets")
-    p.add_argument("--checkpoint", default=DEFAULT_MODEL)
-    p.add_argument("--processed-dir", default="data/processed_users10pct")
+    p.add_argument("--dataset", choices=["movielens", "beauty"], default="movielens",
+                   help="beauty: Amazon Beauty 2014 defaults for the next three paths")
+    p.add_argument("--checkpoint", default=None)
+    p.add_argument("--processed-dir", default=None)
     p.add_argument("--movies-csv", default="data/raw/movie.csv")
-    p.add_argument("--out", default="demo/mobile/assets")
+    p.add_argument("--out", default=None)
     p.add_argument("--num-users", type=int, default=300, help="sample users to ship")
     args = p.parse_args()
+    beauty = args.dataset == "beauty"
+    args.checkpoint = args.checkpoint or (BEAUTY["checkpoint"] if beauty else DEFAULT_MODEL)
+    args.processed_dir = args.processed_dir or (BEAUTY["processed_dir"] if beauty else "data/processed_users10pct")
+    args.out = args.out or (BEAUTY["out"] if beauty else "demo/mobile/assets")
     os.chdir(ROOT)
     os.makedirs(args.out, exist_ok=True)
 
@@ -131,7 +166,7 @@ def main():
         raise SystemExit("the graph still contains Trilu, which the phone runtime lacks")
     # What the page needs to build the input (seq_len) and what its benchmark reports.
     n_params = sum(p.numel() for p in model.parameters()) + sum(p.numel() for p in moe.parameters())
-    meta = {"seq_len": S, "num_items": N, "params": n_params, "num_experts": cfg.num_experts,
+    meta = {"dataset": args.dataset, "seq_len": S, "num_items": N, "params": n_params, "num_experts": cfg.num_experts,
             "hidden_dim": cfg.hidden_dim, "onnx_mb": round(os.path.getsize(onnx_path) / 1e6, 2),
             "checkpoint": os.path.relpath(os.path.abspath(args.checkpoint), ROOT)}
     with open(os.path.join(args.out, "meta.json"), "w") as f:
@@ -139,12 +174,16 @@ def main():
     print(f"wrote meta.json: {meta}")
 
     # ---------------------------------------------------------------- data
-    titles = load_titles(args.movies_csv)
     rev_map = load_pickle(args.processed_dir, "reverse_item_mapping.pkl")
+    if beauty:
+        by_item = load_amazon_titles(cfg, rev_map, N)
+    else:
+        titles = load_titles(args.movies_csv)
+        by_item = {i: titles.get(int(rev_map.get(i, -1)), (f"<item {i}>", "")) for i in range(1, N + 1)}
     popularity = load_item_popularity(args.processed_dir, N + 2)
     items = {"title": [], "genres": [], "likes": []}
     for i in range(1, N + 1):
-        t, g = titles.get(int(rev_map.get(i, -1)), (f"<item {i}>", ""))
+        t, g = by_item[i]
         items["title"].append(t)
         items["genres"].append(g)
         items["likes"].append(int(popularity[i]))
@@ -152,12 +191,15 @@ def main():
         json.dump(items, f, separators=(",", ":"))
 
     splits = load_pickle(args.processed_dir, "splits.pkl")
-    user_map = {int(k): v for k, v in load_pickle(args.processed_dir, "user_mapping.pkl").items()}
+    # MovieLens user ids are numbers; Amazon reviewer ids are strings.
+    user_map = {(k if beauty else int(k)): v
+                for k, v in load_pickle(args.processed_dir, "user_mapping.pkl").items()}
     orig = {v: k for k, v in user_map.items()}
     # Leave-one-out (protocol v3) gives every user exactly one test item.
     pool = sorted(u for u, t in splits["test"].items() if len(t) >= 1)
-    chosen = EXAMPLE_USERS + [u for u in random.Random(0).sample(pool, args.num_users)
-                              if u not in EXAMPLE_USERS]
+    examples = [] if beauty else EXAMPLE_USERS
+    chosen = examples + [u for u in random.Random(0).sample(pool, args.num_users)
+                         if u not in examples]
     users = []
     for u in chosen:
         history = list(splits["train"].get(u, [])) + list(splits["val"].get(u, []))
@@ -167,7 +209,7 @@ def main():
                           "history": history, "test": list(splits["test"].get(u, []))})
     with open(os.path.join(args.out, "users.json"), "w") as f:
         json.dump(users, f, separators=(",", ":"))
-    print(f"wrote items.json ({N} movies) and users.json ({len(users)} users)")
+    print(f"wrote items.json ({N} items) and users.json ({len(users)} users)")
 
     # ---------------------------------------------------------------- check
     import onnxruntime as ort
@@ -185,10 +227,19 @@ def main():
         top = (np.argsort(-scores)[:10] + 1).tolist()
         ref_items = [i for i, _ in ref]
         diff = max(abs(float(scores[i - 1]) - s) for i, s in ref)
-        status = "OK" if top == ref_items else "MISMATCH"
+        # Near-tied items may swap places under fp32 round-off. Accept a swap only when, at
+        # every position, the two items' scores differ by less than TIE_TOL.
+        gaps = [abs(float(scores[a - 1]) - float(scores[b - 1])) for a, b in zip(top, ref_items)]
+        swaps = sum(a != b for a, b in zip(top, ref_items))
+        if top == ref_items:
+            status = "OK"
+        elif max(gaps) < TIE_TOL:
+            status = f"OK (near-tied items differ at {swaps} of 10 positions, max gap {max(gaps):.1e})"
+        else:
+            status = "MISMATCH"
         print(f"  check len={len(hist):4d}: top-10 {status}, max |score diff| {diff:.2e}, "
               f"routing {np.round(routing[0], 3).tolist()}")
-        if top != ref_items:
+        if status == "MISMATCH":
             raise SystemExit("ONNX and PyTorch disagree")
 
 
