@@ -40,7 +40,7 @@ from data.sequence_generator import (  # noqa: E402
 )
 from evaluation.metrics import load_full_ranking  # noqa: E402
 from training.ablation_runner import (  # noqa: E402
-    STUDY_CONFIGS, _training_fingerprint, resolve_study_configs,
+    DEFAULT_STUDIES, _training_fingerprint, resolve_study_configs,
 )
 
 HAS_MIXED = hasattr(Config(), "mixed_precision")
@@ -256,7 +256,8 @@ class _Null:
 def unique_training_configs(base, exclude):
     """Unique training fingerprints across all studies, with the arms that share each."""
     groups = {}
-    for study in STUDY_CONFIGS:
+    # Our studies only: the external baselines (study X) train a different model.
+    for study in DEFAULT_STUDIES:
         for cfg in resolve_study_configs(study, base):
             label = getattr(cfg, "_study_label", "?")
             if label in exclude:

@@ -1096,7 +1096,16 @@ def run_pretrain(config: Config, model_name: str) -> Dict[str, float]:
 
     non_blocking = device.type == "cuda" and config.pin_memory
 
+    early_stopped = None
     for epoch in range(start_epoch, config.pretrain_epochs):
+        # `early_stop_patience` (0 = off): stop once `patience` completed epochs have
+        # passed without a new best val NDCG@10. Checked before each epoch, so a resumed
+        # run that had already reached it trains nothing more.
+        patience = config.early_stop_patience
+        if patience > 0 and best_epoch >= 0 and (epoch - 1) - best_epoch >= patience:
+            early_stopped = {"patience": patience, "last_completed_epoch": epoch - 1}
+            logger.info("Early stop before epoch %d: best epoch %d", epoch, best_epoch)
+            break
         model.train()
         moe.train()
         epoch_losses: Dict[str, List[float]] = {}
@@ -1266,6 +1275,7 @@ def run_pretrain(config: Config, model_name: str) -> Dict[str, float]:
     result = {
         "best_val_ndcg": best_val_ndcg,
         "best_epoch": best_epoch,
+        "early_stopped": early_stopped,
         "epoch_mean_losses": epoch_mean_losses,
         "epoch_loss_windows": epoch_loss_windows,
         "val_popularity_reference": val_popularity_reference,

@@ -37,6 +37,7 @@ from evaluation.metrics import (
     load_item_popularity,
 )
 from training.ablation_runner import (
+    DEFAULT_STUDIES,
     STUDY_CONFIGS,
     _arm_path,
     _current_revision,
@@ -585,9 +586,12 @@ def run_ablation_rescore(
     from data.preprocessing import check_processed_dir
 
     logger.warning("ablation_rescore: %s", RESCORE_CAVEAT)
-    studies = list(STUDY_CONFIGS) if study == "all" else [study]
+    studies = list(DEFAULT_STUDIES) if study == "all" else [study]
     if any(s not in STUDY_CONFIGS for s in studies):
         raise ValueError(f"Unknown study '{study}'. Choose from {list(STUDY_CONFIGS)} or all")
+    if "X" in studies:
+        raise ValueError("ablation_rescore re-scores our models' snapshots; study X (the "
+                         "external baselines) is scored by the protocol already")
     check_processed_dir(config)
     rescored = rescored_config(config)
     shared = EvalData(config)

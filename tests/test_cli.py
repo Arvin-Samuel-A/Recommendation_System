@@ -81,6 +81,8 @@ class TestAblationConfigResolution:
             # derived from the config rather than asserted as literals.
             "G": len(config.expert_count_grid),
             "H": 4 + len(config.sequence_length_grid),
+            # The five external baselines (2026-11-13).
+            "X": 5,
         }
         assert set(expected) == set(STUDY_CONFIGS), "study E was removed with LoRA"
         for study, count in expected.items():

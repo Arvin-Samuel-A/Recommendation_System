@@ -1,5 +1,7 @@
 """Per-user test metrics for finished ablation arms, for paired significance tests.
 
+Also handles the external baselines (study X, docs/baselines.md).
+
 Re-runs exactly the arm's test evaluation (`_run_single_config`: full ranking over the
 whole test split from best.pt) but keeps the per-user values that `evaluate_model`
 otherwise reduces to a mean. Checks the recomputed mean against the arm JSON.
@@ -47,24 +49,36 @@ for arm_json in sys.argv[2:]:
     store = os.path.join(cfg.checkpoint_dir, "ablations", "by_fingerprint", arm["training_fingerprint"])
     ckpt = os.path.join(store, "t_base", "best.pt")
     device = get_device(cfg)
-    model, moe = build_model(cfg)
-    loss_fns = _build_loss_fns(cfg, device)
-    load_checkpoint(ckpt, model, moe, loss_fns=loss_fns)
-
-    test = load_tensorised(
-        os.path.join(cfg.processed_data_dir, "test_tensorised.pt"), metadata_matrix,
-        max_seq_length=cfg.max_seq_length,
-    )
-    ranking = M.load_full_ranking(cfg.processed_data_dir, "test", test.targets, test.user_ids)
-    model.eval()
-    moe.eval()
     captured.clear()
-    with torch.no_grad():
-        metrics = M.evaluate_model(model, test.sequences, ranking, cfg, moe_layer=moe,
-                                   metadata_matrix=test.metadata_matrix)
+    if cfg.baseline_model:
+        # External baseline (study X): its own model and scorer, the same protocol.
+        from training.baseline_train import evaluate_baseline, load_baseline_checkpoint, load_eval_split
+
+        model, _ = load_baseline_checkpoint(ckpt, cfg, device)
+        seqs, targets, test_users = load_eval_split(cfg.processed_data_dir, "test", cfg.max_seq_length)
+        ranking = M.load_full_ranking(cfg.processed_data_dir, "test", targets, test_users)
+        metrics, per_example = evaluate_baseline(model, seqs, ranking, cfg.eval_k,
+                                                 cfg.eval_batch_size, return_per_example=True)
+        captured.update({k: v.float().numpy() for k, v in per_example.items()})
+    else:
+        model, moe = build_model(cfg)
+        loss_fns = _build_loss_fns(cfg, device)
+        load_checkpoint(ckpt, model, moe, loss_fns=loss_fns)
+
+        test = load_tensorised(
+            os.path.join(cfg.processed_data_dir, "test_tensorised.pt"), metadata_matrix,
+            max_seq_length=cfg.max_seq_length,
+        )
+        test_users = test.user_ids
+        ranking = M.load_full_ranking(cfg.processed_data_dir, "test", test.targets, test.user_ids)
+        model.eval()
+        moe.eval()
+        with torch.no_grad():
+            metrics = M.evaluate_model(model, test.sequences, ranking, cfg, moe_layer=moe,
+                                       metadata_matrix=test.metadata_matrix)
     want = arm["metrics"]["ndcg"]["mean"]
     got = metrics["ndcg"]["mean"]
     tag = f"seed{cfg.seed}_{arm['study']}_{arm['label']}"
-    np.savez(os.path.join(out_dir, f"{tag}.npz"), user_ids=np.asarray(test.user_ids), **captured)
+    np.savez(os.path.join(out_dir, f"{tag}.npz"), user_ids=np.asarray(test_users), **captured)
     print(f"{tag} fp={arm['training_fingerprint']} best_epoch={arm['best_epoch']} "
           f"ndcg={got:.6f} json={want:.6f} diff={got - want:+.2e} n={len(captured['ndcg'])}", flush=True)

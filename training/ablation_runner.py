@@ -64,7 +64,49 @@ STUDY_CONFIGS = {
         {"label": "H4_longtail", "system_eval": "longtail"},
         {"label": "H5_latency", "system_eval": "latency"},
     ],
+    # External baselines (docs/baselines.md): each arm is one published model with its
+    # authors' hyperparameters for this dataset (models/baselines/hparams.py), trained by
+    # `training.baseline_train.run_baseline_pretrain` and scored by the same protocol.
+    "X": [{"_baseline": name} for name in ("sasrec", "bert4rec", "gru4rec", "duorec", "bsarec")],
 }
+
+#: The studies `--study all` runs: our ablations A-H. Study X (the external baselines)
+#: runs only when named, so an existing `--study all` launch is unchanged.
+DEFAULT_STUDIES = tuple(s for s in STUDY_CONFIGS if s != "X")
+
+#: Our protocol's early stopping for the baselines, per dataset format: none on
+#: MovieLens-20M (20 epochs), patience 50 within at most 300 epochs on Beauty -- the rule
+#: the early-stopped Beauty arms ran under (owner decision 2026-11-07).
+BASELINE_EARLY_STOP_PATIENCE = {"movielens": 0, "amazon2014": 50}
+
+
+def baseline_arm(name: str, base_config: Config) -> Dict:
+    """Study X's overrides for baseline `name`: its published hyperparameters for the base
+    config's dataset, mirrored into the shared Config fields the pipeline reads, and our
+    model's components switched off so the resolved config never describes them as used."""
+    from models.baselines.hparams import published_params
+
+    p = published_params(name, base_config.dataset_format, base_config.amazon_category)
+    return {
+        "label": name,
+        "baseline_model": name,
+        "baseline_params": p,
+        "hidden_dim": p["hidden_size"],
+        "num_layers": p["num_layers"],
+        "num_heads": p["num_heads"],
+        "dropout": p["hidden_dropout"],
+        "learning_rate": p["learning_rate"],
+        "weight_decay": p["weight_decay"],
+        "batch_size": p["batch_size"],
+        "max_seq_length": p["max_seq_length"],
+        "use_metadata": False,
+        "use_masked_lm": False,
+        "use_multi_step": False,
+        "use_contrastive": False,
+        "moe_variant": "none",
+        "use_gradnorm": False,
+        "early_stop_patience": BASELINE_EARLY_STOP_PATIENCE[base_config.dataset_format],
+    }
 
 
 #: Grid marker -> (config field holding the grid, arm field to set, label template).
@@ -84,6 +126,9 @@ def _study_entries(study: str, base_config: Config) -> List[Dict]:
     """
     entries: List[Dict] = []
     for entry in STUDY_CONFIGS[study]:
+        if "_baseline" in entry:
+            entries.append(baseline_arm(entry["_baseline"], base_config))
+            continue
         grid_name = entry.get("_grid")
         if grid_name is None:
             entries.append(entry)
@@ -277,6 +322,11 @@ _DEFAULT_OMITTED_FIELDS = {
     "amazon_top_brands": 32,
     "amazon_price_bins": 8,
     "amazon_top_categories": 64,
+    # Early stopping and the external baselines (2026-11-13). Off / our model at these
+    # values, so no existing fingerprint changes.
+    "early_stop_patience": 0,
+    "baseline_model": "",
+    "baseline_params": {},
 }
 
 #: GradNorm fields added after TRAINING_SEMANTICS_VERSION 2 that `run_pretrain` reads only
@@ -404,8 +454,8 @@ def register_backbone(
         "checkpoint_path": os.path.join(trained_cfg.model_checkpoint_dir(), "best.pt"),
         "trained_by": trained_by,
     }
-    for key in ("best_val_ndcg", "best_epoch"):
-        if train_result and key in train_result:
+    for key in ("best_val_ndcg", "best_epoch", "early_stopped"):
+        if train_result and train_result.get(key) is not None:
             entry[key] = train_result[key]
     store = backbone_store_dir(checkpoint_root, fingerprint)
     os.makedirs(store, exist_ok=True)
@@ -666,11 +716,18 @@ def _run_single_config(
                 arm_log_dir = cfg.log_dir
                 cfg.log_dir = train_log_dir
                 try:
-                    train_result = run_pretrain(cfg, model_name)
+                    if cfg.baseline_model:
+                        from training.baseline_train import run_baseline_pretrain
+
+                        train_result = run_baseline_pretrain(cfg, model_name)
+                    else:
+                        train_result = run_pretrain(cfg, model_name)
                 finally:
                     cfg.log_dir = arm_log_dir
                 result["best_val_ndcg"] = train_result["best_val_ndcg"]
                 result["best_epoch"] = train_result["best_epoch"]
+                if train_result.get("early_stopped") is not None:
+                    result["early_stopped"] = train_result["early_stopped"]
                 register_backbone(
                     base_config.checkpoint_dir, fingerprint, cfg, run_tag, train_result,
                 )
@@ -679,7 +736,7 @@ def _run_single_config(
         cfg.checkpoint_dir = shared["checkpoint_dir"]
         ckpt_path = shared["checkpoint_path"]
         result["shared_backbone_with"] = shared["trained_by"]
-        for key in ("best_val_ndcg", "best_epoch"):
+        for key in ("best_val_ndcg", "best_epoch", "early_stopped"):
             if key in shared:
                 result[key] = shared[key]
         logger.info(
@@ -698,6 +755,12 @@ def _run_single_config(
             label, fingerprint,
         )
         return result
+
+    if cfg.baseline_model:
+        # External baseline: its own model class and scoring, the same test protocol.
+        from training.baseline_train import evaluate_baseline_arm
+
+        return evaluate_baseline_arm(cfg, ckpt_path, result)
 
     device = get_device(cfg)
     model, moe = build_model(cfg)
@@ -1097,7 +1160,7 @@ def run_ablation(
     from data.preprocessing import check_processed_dir
     check_processed_dir(config)
 
-    studies = list(STUDY_CONFIGS.keys()) if study == "all" else [study]
+    studies = list(DEFAULT_STUDIES) if study == "all" else [study]
     all_results = {}
 
     for s in studies:

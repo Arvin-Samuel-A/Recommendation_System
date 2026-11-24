@@ -1,6 +1,6 @@
 import copy
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 
 OBJECTIVE_ORDER = ["next_item", "masked_item", "multi_step", "contrastive"]
@@ -205,6 +205,20 @@ class Config:
     # epochs x 14 arms kept 280 snapshots (55 GB); the 300-epoch Beauty preset sets 0.
     # `--stage ablation_rescore` re-scores the kept snapshots, so it needs them.
     epoch_snapshot_interval: int = 1
+    # Stop training once this many epochs have passed without a new best validation
+    # NDCG@10 (the best epoch is still the one evaluated). 0 = off (the previous
+    # behaviour). The external baselines use 50 on Beauty, as the early-stopped Beauty
+    # arms did (owner decision 2026-11-07, applied there from outside the repo).
+    early_stop_patience: int = 0
+
+    # --- External baselines (models/baselines, training/baseline_train.py) ---
+    # "" = our model (the default). Otherwise one of sasrec, bert4rec, gru4rec, duorec,
+    # bsarec, trained by `run_baseline_pretrain` instead of `run_pretrain`. Study X sets it
+    # with the authors' published hyperparameters (models/baselines/hparams.py): the
+    # shared ones in `hidden_dim`, `num_layers`, `num_heads`, `dropout`, `learning_rate`,
+    # `weight_decay`, `batch_size`, `max_seq_length`, and all of them in `baseline_params`.
+    baseline_model: str = ""
+    baseline_params: Dict = field(default_factory=dict)
 
     # --- Negative Sampling ---
     # Pretraining and evaluation use the full catalogue. Preprocessing still builds the
@@ -343,6 +357,23 @@ class Config:
                 f"Unknown dataset_format '{self.dataset_format}'. "
                 f"Choose from {list(self.DATASET_FORMATS)}"
             )
+        if self.early_stop_patience < 0:
+            raise ValueError(
+                f"early_stop_patience must be >= 0 (0 = off), got {self.early_stop_patience}"
+            )
+        if self.baseline_model:
+            from models.baselines.hparams import BASELINE_NAMES
+
+            if self.baseline_model not in BASELINE_NAMES:
+                raise ValueError(
+                    f"Unknown baseline_model '{self.baseline_model}'. "
+                    f"Choose from {list(BASELINE_NAMES)} or '' (our model)"
+                )
+            if not self.baseline_params:
+                raise ValueError(
+                    "baseline_model is set but baseline_params is empty; take them from "
+                    "models.baselines.hparams.published_params (study X does)"
+                )
         if self.epoch_snapshot_interval < 0:
             raise ValueError(
                 f"epoch_snapshot_interval must be >= 0 (0 = keep no per-epoch snapshot), "

@@ -407,13 +407,14 @@ class TestFingerprint:
 
     def test_every_movielens_arm_matches_the_pre_amazon_payload(self):
         from training.ablation_runner import (
-            STUDY_CONFIGS, _training_fingerprint, resolve_study_configs,
+            DEFAULT_STUDIES, _training_fingerprint, resolve_study_configs,
         )
 
+        # Study X (the external baselines, 2026-11-13) is new: it has no legacy payload.
         for model in ("t-small", "t-base"):
             base = Config()
             base.apply_model_config(model)
-            for study in STUDY_CONFIGS:
+            for study in DEFAULT_STUDIES:
                 for arm in resolve_study_configs(study, base):
                     assert _training_fingerprint(arm) == _legacy_fingerprint(arm), (
                         study, arm._study_label,
@@ -519,12 +520,13 @@ class TestEndToEnd:
 
     def test_every_ablation_study_runs_on_the_fixture(self, tiny_amazon_processed_dir, tmp_path):
         """Every study, including H3 (empty cold set) and H5, few steps."""
-        from training.ablation_runner import STUDY_CONFIGS, run_ablation
+        from training.ablation_runner import DEFAULT_STUDIES, run_ablation
 
         cfg = tiny_amazon_config(tiny_amazon_processed_dir(), str(tmp_path),
                                  pretrain_epochs=1, max_steps_per_epoch=2)
         results = run_ablation(cfg, "t-small", "all")
-        assert set(results) == set(STUDY_CONFIGS)
+        # `all` is our studies A-H; study X (the baselines) runs only when named.
+        assert set(results) == set(DEFAULT_STUDIES)
         for study, arms in results.items():
             for arm in arms:
                 assert arm.get("status") == "ok", (study, arm["label"], arm.get("error"))

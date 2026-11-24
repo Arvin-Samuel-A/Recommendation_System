@@ -23,7 +23,7 @@ from collections import defaultdict
 import numpy as np
 
 SEEDS = (42, 43, 44)
-STUDIES = "ABCDEFGH"
+STUDIES = "ABCDEFGHX"   # X = the external baselines (docs/baselines.md)
 REF = ("A", "arv_mmoe_gradnorm")
 REMOVED = {("A", "arv_mmoe_gradnorm_lora"), ("H", "H6_communication")}
 REMOVED_STUDIES = {"E"}
@@ -84,7 +84,8 @@ def ms(vals):
     return v.mean(), (v.std(ddof=1) if len(v) > 1 else float("nan"))
 
 
-ref_mean = ms([res[REF][s]["ndcg"] for s in SEEDS if s in res[REF]])[0]
+ref_vals = [res[REF][s]["ndcg"] for s in SEEDS if s in res[REF]]
+ref_mean = ms(ref_vals)[0] if ref_vals else float("nan")
 head = "| Arm | NDCG s42 | s43 | s44 | NDCG@10 mean ± std | Δ vs ref | Recall@10 | MRR@10 |"
 rule = "|---|---|---|---|---|---|---|---|"
 if args.epochs:
@@ -116,7 +117,9 @@ out = [f"# {args.title}\n",
 for st in STUDIES:
     if st in REMOVED_STUDIES:
         continue
-    out += [f"\n## Study {st}\n", head, rule]
+    if not order[st]:
+        continue
+    out += [f"\n## Study {st}{' (external baselines)' if st == 'X' else ''}\n", head, rule]
     out += [row(lab, res[(st, lab)]) for lab in order[st]]
 if extras:
     out += ["\n## Additional runs\n", head, rule]

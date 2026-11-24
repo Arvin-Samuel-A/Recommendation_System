@@ -35,6 +35,8 @@ NEW_FIELDS = (
 LATER_DATASET_FIELDS = (
     "dataset_format", "amazon_category", "amazon_title_dim", "amazon_top_brands",
     "amazon_price_bins", "amazon_top_categories",
+    # Early stopping and the external baselines (2026-11-13), default-omitted the same way.
+    "early_stop_patience", "baseline_model", "baseline_params",
 )
 
 

@@ -70,7 +70,7 @@ def parse_args(argv=None):
     parser.add_argument("--masked_lm_weight", type=float, default=None)
     parser.add_argument("--multi_step_weight", type=float, default=None)
     parser.add_argument("--contrastive_weight", type=float, default=None)
-    parser.add_argument("--study", default="all", help="Ablation study letter (A-H) or 'all'")
+    parser.add_argument("--study", default="all", help="Ablation study letter (A-H; X = the external baselines) or 'all' (A-H)")
     # REV-115: `run_ablation(train=...)` existed but had no CLI surface, so evaluating
     # already-trained arms meant editing source -- which conventions.md's "Config-Driven
     # Design" forbids ("No ablation requires commenting/uncommenting code or manually
@@ -761,11 +761,11 @@ def run_ablation_collect_stage(config, args):
     arms).
     """
     from training.ablation_runner import (
-        STUDY_CONFIGS, _save_summary, collect_study,
+        DEFAULT_STUDIES, STUDY_CONFIGS, _save_summary, collect_study,
     )
 
     allow = getattr(args, "allow_incomplete", False)
-    studies = list(STUDY_CONFIGS) if args.study == "all" else [args.study]
+    studies = list(DEFAULT_STUDIES) if args.study == "all" else [args.study]
     if any(s not in STUDY_CONFIGS for s in studies):
         raise ValueError(f"Unknown study '{args.study}'. Choose from {list(STUDY_CONFIGS)} or all")
     assembled, incomplete, failed_studies, failed_arms = {}, {}, [], {}
