@@ -1,4 +1,4 @@
-"""Per-user paired tests on MovieLens-20M over seeds 42/43/44 (protocol v3, full ranking, 138,493 users).
+"""Per-user paired tests over seeds 42/43/44 (protocol v3, full ranking): MovieLens-20M or Beauty.
 
 For each arm A and contrast B: per seed, the paired difference of the per-user metric (A - B)
 and its paired-t p. Pooled over seeds: each user's metric averaged over the 3 seeds first, then a
@@ -6,6 +6,8 @@ paired t-test and Wilcoxon signed-rank test over users, a 95% CI of the mean dif
 Holm-adjusted p across all contrasts of that metric. "consistent" = same sign in all 3 seeds.
 
 usage: paired_tests_3seed.py NPZ_DIR [NPZ_DIR ...]   (files seed{42,43,44}_{STUDY}_{ARM}.npz)
+Contrasts whose arms have no files are skipped, so one list serves both datasets. The Beauty
+fixed-weight run is passed as seed{S}_X_fixed_weights.npz.
 """
 import glob
 import os
@@ -44,6 +46,8 @@ def holm(ps):
 pairs = [(t, REF) for t in tags if t != REF] + [
     ("D_none_gradnorm", "A_4obj_no_routing"),
     ("A_arv_mmoe", "A_conv_mmoe"),
+    ("A_arv_mmoe", "A_single_obj_baseline"),
+    ("X_fixed_weights", "A_arv_mmoe"),
     ("G_K6", "G_K2"), ("G_K8", "G_K6"),
     ("H_H2_seq50", "H_H2_seq25"), ("H_H2_seq100", "H_H2_seq50"),
 ]
